@@ -1,7 +1,10 @@
 import { IUser } from '../../interfaces/user.interface';
 
-declare namespace Express {
-  export interface Request {
-    user: IUser;
+// Declare the namespace globally to ensure it's recognized across the application
+declare global {
+  namespace Express {
+    interface Request {
+      user: IUser;
+    }
   }
 }

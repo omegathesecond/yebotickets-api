@@ -4,9 +4,14 @@ import { ApiError } from './error.middleware';
 import User from '../models/user.model';
 import { IUser, UserRole } from '../interfaces/user.interface';
 
-// No need for declaration here since it's in the types/express/index.d.ts file
+// Extend the Request interface to include user property
+interface AuthenticatedRequest extends Request {
+  user: IUser;
+}
 
 export const protect = async (req: Request, res: Response, next: NextFunction) => {
+  // Cast req to AuthenticatedRequest to allow user property
+  const authReq = req as AuthenticatedRequest;
   try {
     let token;
 
@@ -24,9 +29,9 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
       const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
 
       // Attach user to request object
-      req.user = await User.findById(decoded.id).select('-password') as IUser;
+      authReq.user = await User.findById(decoded.id).select('-password') as IUser;
       
-      if (!req.user) {
+      if (!authReq.user) {
         return next(new ApiError('User not found', 404));
       }
 
@@ -41,8 +46,9 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
 export const authorize = (...roles: UserRole[]) => {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (!req.user || !roles.includes(req.user.role as UserRole)) {
-      return next(new ApiError(`Role (${req.user?.role}) is not authorized to access this resource`, 403));
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !roles.includes(authReq.user.role as UserRole)) {
+      return next(new ApiError(`Role (${authReq.user?.role}) is not authorized to access this resource`, 403));
     }
     next();
   };

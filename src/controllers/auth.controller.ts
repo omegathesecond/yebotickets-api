@@ -39,13 +39,12 @@ export const verifyOTPController = async (req: Request, res: Response, next: Nex
 
 export const updateProfileController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Explicitly cast req to include user property
-    const user = (req as Request & { user: IUser }).user;
-    if (!user || !user._id) {
+    // Access user directly from req
+    if (!req.user || !req.user._id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const userId = user._id.toString();
+    const userId = req.user._id.toString();
     const updateData = req.body;
     
     const result = await updateProfile(userId, updateData);
@@ -61,16 +60,14 @@ export const updateProfileController = async (req: Request, res: Response, next:
 
 export const getCurrentUserController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Explicitly cast req to include user property
-    const user = (req as Request & { user: IUser }).user;
-    if (!user) {
+    if (!req.user) {
       return next(new ApiError('User not authenticated', 401));
     }
     
     res.status(200).json({
       success: true,
       data: {
-        user,
+        user: req.user,
       },
     });
   } catch (error) {
