@@ -6,6 +6,7 @@ import {
 } from '../services/auth.service';
 import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
+import { AuthRequest } from '../middleware/auth.middleware';
 
 export const requestOTPController = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -39,12 +40,12 @@ export const verifyOTPController = async (req: Request, res: Response, next: Nex
 
 export const updateProfileController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Access user directly from req
-    if (!req.user || !req.user._id) {
+    const authReq = req as AuthRequest;
+    if (!authReq.user || !authReq.user._id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const userId = req.user._id.toString();
+    const userId = authReq.user._id.toString();
     const updateData = req.body;
     
     const result = await updateProfile(userId, updateData);
@@ -60,14 +61,15 @@ export const updateProfileController = async (req: Request, res: Response, next:
 
 export const getCurrentUserController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    if (!req.user) {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) {
       return next(new ApiError('User not authenticated', 401));
     }
     
     res.status(200).json({
       success: true,
       data: {
-        user: req.user,
+        user: authReq.user,
       },
     });
   } catch (error) {

@@ -1,9 +1,1 @@
-import { IUser } from '../interfaces/user.interface';
-
-declare global {
-  namespace Express {
-    interface Request {
-      user: IUser;
-    }
-  }
-}
+// This file is no longer needed as we're using a custom interface

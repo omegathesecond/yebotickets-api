@@ -4,14 +4,14 @@ import { ApiError } from './error.middleware';
 import User from '../models/user.model';
 import { IUser, UserRole } from '../interfaces/user.interface';
 
-// Extend the Request interface to include user property
-interface AuthenticatedRequest extends Request {
+// Create a custom request interface with the user property
+export interface AuthRequest extends Request {
   user: IUser;
 }
 
 export const protect = async (req: Request, res: Response, next: NextFunction) => {
-  // Cast req to AuthenticatedRequest to allow user property
-  const authReq = req as AuthenticatedRequest;
+  // Cast req to AuthRequest to allow user property
+  const authReq = req as AuthRequest;
   try {
     let token;
 
@@ -46,7 +46,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
 export const authorize = (...roles: UserRole[]) => {
   return (req: Request, res: Response, next: NextFunction) => {
-    const authReq = req as AuthenticatedRequest;
+    const authReq = req as AuthRequest;
     if (!authReq.user || !roles.includes(authReq.user.role as UserRole)) {
       return next(new ApiError(`Role (${authReq.user?.role}) is not authorized to access this resource`, 403));
     }
