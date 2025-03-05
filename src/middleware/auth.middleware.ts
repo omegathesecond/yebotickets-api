@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { ApiError } from './error.middleware';
 import User from '../models/user.model';
 import { IUser, UserRole } from '../interfaces/user.interface';
+import { AuthenticatedRequest } from '../types/auth';
 
 // Create a custom request interface with the user property
 export interface AuthRequest extends Request {
@@ -10,8 +11,8 @@ export interface AuthRequest extends Request {
 }
 
 export const protect = async (req: Request, res: Response, next: NextFunction) => {
-  // Cast req to AuthRequest to allow user property
-  const authReq = req as AuthRequest;
+  // Cast req to AuthenticatedRequest to allow user property
+  const authReq = req as AuthenticatedRequest;
   try {
     let token;
 
@@ -46,7 +47,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
 export const authorize = (...roles: UserRole[]) => {
   return (req: Request, res: Response, next: NextFunction) => {
-    const authReq = req as AuthRequest;
+    const authReq = req as AuthenticatedRequest;
     if (!authReq.user || !roles.includes(authReq.user.role as UserRole)) {
       return next(new ApiError(`Role (${authReq.user?.role}) is not authorized to access this resource`, 403));
     }

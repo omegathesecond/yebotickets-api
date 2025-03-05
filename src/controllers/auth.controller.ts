@@ -6,7 +6,7 @@ import {
 } from '../services/auth.service';
 import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
-import { AuthRequest } from '../middleware/auth.middleware';
+import { AuthenticatedRequest } from '../types/auth';
 
 export const requestOTPController = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -40,7 +40,7 @@ export const verifyOTPController = async (req: Request, res: Response, next: Nex
 
 export const updateProfileController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const authReq = req as AuthRequest;
+    const authReq = req as AuthenticatedRequest;
     if (!authReq.user || !authReq.user._id) {
       return next(new ApiError('User not authenticated', 401));
     }
@@ -61,7 +61,7 @@ export const updateProfileController = async (req: Request, res: Response, next:
 
 export const getCurrentUserController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const authReq = req as AuthRequest;
+    const authReq = req as AuthenticatedRequest;
     if (!authReq.user) {
       return next(new ApiError('User not authenticated', 401));
     }
