@@ -1,15 +1,6 @@
 // Express module enhancements
 import express from 'express';
-import { IUser } from '../interfaces/user.interface';
-
-// Global type declarations
-declare global {
-  namespace Express {
-    interface Request {
-      user?: IUser;
-    }
-  }
-}
+// Import for IUser is in express/index.d.ts
 
 // Add a generic declaration for all route files
 declare module '*.routes' {
