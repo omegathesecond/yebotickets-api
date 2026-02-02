@@ -315,7 +315,7 @@ router.get('/dashboard', getOrganizerDashboardController);
  */
 router.get('/events', (req: Request, res: Response, next: NextFunction) => {
   const authReq = req as AuthenticatedRequest;
-  if (authReq.user && authReq.user._id) {
+  if (authReq.user && authReq.user.id) {
     // If admin, allow viewing all events unless organizer ID is specified
     if (authReq.user.role === UserRole.ADMIN && !req.query.organizer) {
       next();
@@ -324,7 +324,7 @@ router.get('/events', (req: Request, res: Response, next: NextFunction) => {
     // For organizers or when organizer ID is specified
     req.query = {
       ...req.query,
-      organizer: req.query.organizer || authReq.user._id.toString(),
+      organizer: (req.query.organizer as string) || authReq.user.id,
       showUnpublished: 'true'
     };
   }

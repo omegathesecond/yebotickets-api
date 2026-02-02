@@ -1,7 +1,29 @@
-import Event from '../models/event.model';
-import { IEvent } from '../interfaces/event.interface';
+import prisma from '../config/prisma';
+import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
 import { ApiError } from '../middleware/error.middleware';
-import { Types } from 'mongoose';
+
+/**
+ * Transform Prisma event to API response format
+ */
+const transformEvent = (event: any) => ({
+  id: event.id,
+  title: event.title,
+  description: event.description,
+  location: nestEventLocation(event),
+  startDate: event.startDate,
+  endDate: event.endDate,
+  organizer: event.organizer ? {
+    id: event.organizer.id,
+    name: event.organizer.name,
+    email: event.organizer.email,
+  } : { id: event.organizerId },
+  isPublished: event.isPublished,
+  coverImage: event.coverImage,
+  category: event.category,
+  ticketTypes: event.ticketTypes || [],
+  createdAt: event.createdAt,
+  updatedAt: event.updatedAt,
+});
 
 /**
  * Create a new event
@@ -9,14 +31,28 @@ import { Types } from 'mongoose';
  * @param organizerId ID of the organizer creating the event
  * @returns Created event
  */
-export const createEvent = async (eventData: Partial<IEvent>, organizerId: string): Promise<IEvent> => {
+export const createEvent = async (eventData: IEventInput, organizerId: string) => {
   try {
-    const event = await Event.create({
-      ...eventData,
-      organizer: organizerId,
+    const event = await prisma.event.create({
+      data: {
+        title: eventData.title,
+        description: eventData.description,
+        ...flattenEventLocation(eventData.location),
+        startDate: new Date(eventData.startDate),
+        endDate: new Date(eventData.endDate),
+        organizerId,
+        isPublished: eventData.isPublished || false,
+        coverImage: eventData.coverImage || null,
+        category: eventData.category,
+      },
+      include: {
+        organizer: {
+          select: { id: true, name: true, email: true },
+        },
+      },
     });
 
-    return event;
+    return transformEvent(event);
   } catch (error) {
     console.error('Error in createEvent service:', error);
     throw new ApiError('Failed to create event', 500);
@@ -28,45 +64,56 @@ export const createEvent = async (eventData: Partial<IEvent>, organizerId: strin
  * @param query Query parameters for filtering
  * @returns List of events
  */
-export const getEvents = async (query: Record<string, any> = {}): Promise<IEvent[]> => {
+export const getEvents = async (query: Record<string, any> = {}) => {
   try {
-    const filter: Record<string, any> = {};
+    const where: any = {};
     
     // Build filter based on query parameters
-    if (query.category) filter.category = query.category;
-    if (query.city) filter['location.city'] = query.city;
-    if (query.country) filter['location.country'] = query.country;
+    if (query.category) where.category = query.category;
+    if (query.city) where.locationCity = query.city;
+    if (query.country) where.locationCountry = query.country;
     
     // Date filters
-    if (query.startAfter) filter.startDate = { $gte: new Date(query.startAfter) };
+    if (query.startAfter) {
+      where.startDate = { gte: new Date(query.startAfter) };
+    }
     if (query.startBefore) {
-      filter.startDate = { ...filter.startDate, $lte: new Date(query.startBefore) };
+      where.startDate = {
+        ...where.startDate,
+        lte: new Date(query.startBefore),
+      };
     }
     
     // By default, only return published events unless specified
     if (query.showUnpublished !== 'true') {
-      filter.isPublished = true;
+      where.isPublished = true;
     }
     
     // Organizer filter
     if (query.organizer) {
-      filter.organizer = new Types.ObjectId(query.organizer);
+      where.organizerId = query.organizer;
     }
 
     // Search by title or description
     if (query.search) {
-      filter.$or = [
-        { title: { $regex: query.search, $options: 'i' } },
-        { description: { $regex: query.search, $options: 'i' } },
+      where.OR = [
+        { title: { contains: query.search, mode: 'insensitive' } },
+        { description: { contains: query.search, mode: 'insensitive' } },
       ];
     }
 
-    const events = await Event.find(filter)
-      .populate('organizer', 'name email')
-      .sort({ startDate: 1 })
-      .limit(query.limit ? parseInt(query.limit) : 50);
+    const events = await prisma.event.findMany({
+      where,
+      include: {
+        organizer: {
+          select: { id: true, name: true, email: true },
+        },
+      },
+      orderBy: { startDate: 'asc' },
+      take: query.limit ? parseInt(query.limit) : 50,
+    });
 
-    return events;
+    return events.map(transformEvent);
   } catch (error) {
     console.error('Error in getEvents service:', error);
     throw new ApiError('Failed to fetch events', 500);
@@ -78,17 +125,23 @@ export const getEvents = async (query: Record<string, any> = {}): Promise<IEvent
  * @param eventId Event ID
  * @returns Event details
  */
-export const getEventById = async (eventId: string): Promise<IEvent> => {
+export const getEventById = async (eventId: string) => {
   try {
-    const event = await Event.findById(eventId)
-      .populate('organizer', 'name email')
-      .populate('ticketTypes');
+    const event = await prisma.event.findUnique({
+      where: { id: eventId },
+      include: {
+        organizer: {
+          select: { id: true, name: true, email: true },
+        },
+        ticketTypes: true,
+      },
+    });
 
     if (!event) {
       throw new ApiError('Event not found', 404);
     }
 
-    return event;
+    return transformEvent(event);
   } catch (error) {
     console.error('Error in getEventById service:', error);
     if (error instanceof ApiError) throw error;
@@ -105,25 +158,47 @@ export const getEventById = async (eventId: string): Promise<IEvent> => {
  */
 export const updateEvent = async (
   eventId: string,
-  updateData: Partial<IEvent>,
+  updateData: Partial<IEventInput>,
   organizerId: string
-): Promise<IEvent> => {
+) => {
   try {
     // First check if the event exists and belongs to this organizer
-    const event = await Event.findOne({
-      _id: eventId,
-      organizer: organizerId,
+    const existingEvent = await prisma.event.findFirst({
+      where: {
+        id: eventId,
+        organizerId,
+      },
     });
 
-    if (!event) {
+    if (!existingEvent) {
       throw new ApiError('Event not found or you do not have permission to update it', 404);
     }
 
-    // Update the event
-    Object.assign(event, updateData);
-    await event.save();
+    // Build update object
+    const updateObj: any = {};
+    if (updateData.title) updateObj.title = updateData.title;
+    if (updateData.description) updateObj.description = updateData.description;
+    if (updateData.location) {
+      Object.assign(updateObj, flattenEventLocation(updateData.location));
+    }
+    if (updateData.startDate) updateObj.startDate = new Date(updateData.startDate);
+    if (updateData.endDate) updateObj.endDate = new Date(updateData.endDate);
+    if (updateData.isPublished !== undefined) updateObj.isPublished = updateData.isPublished;
+    if (updateData.coverImage !== undefined) updateObj.coverImage = updateData.coverImage;
+    if (updateData.category) updateObj.category = updateData.category;
 
-    return event;
+    // Update the event
+    const event = await prisma.event.update({
+      where: { id: eventId },
+      data: updateObj,
+      include: {
+        organizer: {
+          select: { id: true, name: true, email: true },
+        },
+      },
+    });
+
+    return transformEvent(event);
   } catch (error) {
     console.error('Error in updateEvent service:', error);
     if (error instanceof ApiError) throw error;
@@ -143,17 +218,21 @@ export const deleteEvent = async (
 ): Promise<{ message: string }> => {
   try {
     // Check if the event exists and belongs to this organizer
-    const event = await Event.findOne({
-      _id: eventId,
-      organizer: organizerId,
+    const event = await prisma.event.findFirst({
+      where: {
+        id: eventId,
+        organizerId,
+      },
     });
 
     if (!event) {
       throw new ApiError('Event not found or you do not have permission to delete it', 404);
     }
 
-    // Delete the event
-    await Event.deleteOne({ _id: eventId });
+    // Delete the event (cascade will delete related ticketTypes and tickets)
+    await prisma.event.delete({
+      where: { id: eventId },
+    });
 
     return { message: 'Event deleted successfully' };
   } catch (error) {
@@ -161,4 +240,4 @@ export const deleteEvent = async (
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to delete event', 500);
   }
-}; 
+};

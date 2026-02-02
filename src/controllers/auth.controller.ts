@@ -41,11 +41,11 @@ export const verifyOTPController = async (req: Request, res: Response, next: Nex
 export const updateProfileController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const userId = authReq.user._id.toString();
+    const userId = authReq.user.id;
     const updateData = req.body;
     
     const result = await updateProfile(userId, updateData);

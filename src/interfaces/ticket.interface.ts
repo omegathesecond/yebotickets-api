@@ -1,5 +1,3 @@
-import { Document, Types } from 'mongoose';
-
 export enum TicketStatus {
   AVAILABLE = 'available',
   SOLD = 'sold',
@@ -14,12 +12,13 @@ export enum TicketType {
   GROUP = 'group'
 }
 
-export interface ITicketType extends Document {
+export interface ITicketType {
+  id: string;
   name: string;
-  description: string;
+  description: string | null;
   price: number;
   quantity: number;
-  eventId: Types.ObjectId;
+  eventId: string;
   type: TicketType;
   saleStartDate: Date;
   saleEndDate: Date;
@@ -27,15 +26,16 @@ export interface ITicketType extends Document {
   updatedAt: Date;
 }
 
-export interface ITicket extends Document {
-  ticketTypeId: Types.ObjectId;
-  eventId: Types.ObjectId;
-  userId?: Types.ObjectId;
+export interface ITicket {
+  id: string;
+  ticketTypeId: string;
+  eventId: string;
+  userId?: string | null;
   status: TicketStatus;
-  purchaseDate?: Date;
+  purchaseDate?: Date | null;
   uniqueCode: string;
   isCheckedIn: boolean;
-  checkedInAt?: Date;
+  checkedInAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
-} 
+}

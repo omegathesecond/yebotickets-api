@@ -1,11 +1,23 @@
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
-import User from '../models/user.model';
-import { UserRole } from '../interfaces/user.interface';
+import prisma from '../config/prisma';
+import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { updateProfile } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+
+/**
+ * Generate JWT token for a user
+ */
+const generateAuthToken = (userId: string, role: string): string => {
+  const jwtSecret = process.env.JWT_SECRET || 'fallbacksecret';
+  const payload = { id: userId, role };
+  const options = { expiresIn: process.env.JWT_EXPIRES_IN || '24h' };
+  return jwt.sign(payload, jwtSecret, options as jwt.SignOptions);
+};
 
 /**
  * Upgrade a regular user to an organizer or create a new organizer
@@ -21,11 +33,15 @@ export const becomeOrganizerController = async (req: Request, res: Response, nex
     }
 
     // Check if user already exists
-    let user = await User.findOne({ phoneNumber });
+    let user = await prisma.user.findUnique({
+      where: { phoneNumber },
+    });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     if (user) {
       // If user exists, check if already an organizer
-      if (user.role === UserRole.ORGANIZER || user.role === UserRole.ADMIN) {
+      if (user.role === 'organizer' || user.role === 'admin') {
         res.status(400).json({
           success: false,
           message: 'User is already an organizer or admin',
@@ -34,43 +50,72 @@ export const becomeOrganizerController = async (req: Request, res: Response, nex
       }
 
       // Update existing user to organizer role
-      user.role = UserRole.ORGANIZER;
-      user.name = name;
-      user.password = password; // Will be hashed by the pre-save middleware
-      if (email) user.email = email;
-      if (organizerProfile) user.organizerProfile = organizerProfile;
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          role: 'organizer',
+          name,
+          password: hashedPassword,
+          email: email || user.email,
+          companyName: organizerProfile?.companyName,
+          companyDescription: organizerProfile?.description,
+          website: organizerProfile?.website,
+          socialFacebook: organizerProfile?.socialMedia?.facebook,
+          socialTwitter: organizerProfile?.socialMedia?.twitter,
+          socialInstagram: organizerProfile?.socialMedia?.instagram,
+          socialLinkedin: organizerProfile?.socialMedia?.linkedin,
+          addressStreet: organizerProfile?.address?.street,
+          addressCity: organizerProfile?.address?.city,
+          addressState: organizerProfile?.address?.state,
+          addressZipCode: organizerProfile?.address?.zipCode,
+          addressCountry: organizerProfile?.address?.country,
+        },
+      });
     } else {
       // Create new user with organizer role
-      user = await User.create({
-        name,
-        phoneNumber,
-        email,
-        password,
-        role: UserRole.ORGANIZER,
-        organizerProfile,
+      user = await prisma.user.create({
+        data: {
+          name,
+          phoneNumber,
+          email,
+          password: hashedPassword,
+          role: 'organizer',
+          companyName: organizerProfile?.companyName,
+          companyDescription: organizerProfile?.description,
+          website: organizerProfile?.website,
+          socialFacebook: organizerProfile?.socialMedia?.facebook,
+          socialTwitter: organizerProfile?.socialMedia?.twitter,
+          socialInstagram: organizerProfile?.socialMedia?.instagram,
+          socialLinkedin: organizerProfile?.socialMedia?.linkedin,
+          addressStreet: organizerProfile?.address?.street,
+          addressCity: organizerProfile?.address?.city,
+          addressState: organizerProfile?.address?.state,
+          addressZipCode: organizerProfile?.address?.zipCode,
+          addressCountry: organizerProfile?.address?.country,
+        },
       });
     }
 
-    // Save the user
-    await user.save();
-
     // Generate OTP for verification
-    const otp = user.generateOTP();
-    await user.save();
-
-    // Send OTP via WhatsApp (assuming you have this service)
-    // await sendOTP(phoneNumber, otp);
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        otpCode: otp,
+        otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      },
+    });
 
     res.status(200).json({
       success: true,
       message: 'User created/upgraded to organizer successfully. Please verify your phone number.',
       data: {
-        _id: user._id,
+        id: user.id,
         name: user.name,
         phoneNumber: user.phoneNumber,
         email: user.email,
         role: user.role,
-        organizerProfile: user.organizerProfile,
+        organizerProfile: toOrganizerProfile(user as any),
       },
     });
   } catch (error) {
@@ -84,18 +129,18 @@ export const becomeOrganizerController = async (req: Request, res: Response, nex
 export const updateOrganizerProfileController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       next(new ApiError('User not authenticated', 401));
       return;
     }
     
     // Check if user is an organizer
-    if (authReq.user.role !== UserRole.ORGANIZER && authReq.user.role !== UserRole.ADMIN) {
+    if (authReq.user.role !== 'organizer' && authReq.user.role !== 'admin') {
       next(new ApiError('Only organizers can update organizer profile', 403));
       return;
     }
     
-    const userId = authReq.user._id.toString();
+    const userId = authReq.user.id;
     const updateData = req.body;
     
     // Allow additional fields for organizer profiles
@@ -116,18 +161,18 @@ export const updateOrganizerProfileController = async (req: Request, res: Respon
 export const getOrganizerDashboardController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       next(new ApiError('User not authenticated', 401));
       return;
     }
     
     // Check if user is an organizer
-    if (authReq.user.role !== UserRole.ORGANIZER && authReq.user.role !== UserRole.ADMIN) {
+    if (authReq.user.role !== 'organizer' && authReq.user.role !== 'admin') {
       next(new ApiError('Only organizers can access dashboard', 403));
       return;
     }
     
-    const organizerId = authReq.user._id.toString();
+    const organizerId = authReq.user.id;
     
     // Get organizer's events
     const events = await getEvents({ organizer: organizerId, showUnpublished: 'true' });
@@ -135,9 +180,9 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     // Get event statistics
     const eventStats = {
       total: events.length,
-      published: events.filter(event => event.isPublished).length,
-      upcoming: events.filter(event => new Date(event.startDate) > new Date()).length,
-      past: events.filter(event => new Date(event.endDate) < new Date()).length,
+      published: events.filter((event: any) => event.isPublished).length,
+      upcoming: events.filter((event: any) => new Date(event.startDate) > new Date()).length,
+      past: events.filter((event: any) => new Date(event.endDate) < new Date()).length,
     };
     
     // Get ticket statistics for all events
@@ -148,13 +193,9 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     };
     
     for (const event of events) {
-      // Type assertion to handle the unknown type
-      const eventId = (event as any)._id.toString();
+      const eventId = (event as any).id;
       const ticketTypes = await getTicketTypes(eventId);
       ticketStats.totalTypes += ticketTypes.length;
-      
-      // Additional ticket stats would require more service methods
-      // This is a placeholder for now
     }
     
     res.status(200).json({
@@ -184,14 +225,28 @@ export const getOrganizersController = async (req: Request, res: Response, next:
     }
     
     // Check if user is an admin
-    if (authReq.user.role !== UserRole.ADMIN) {
+    if (authReq.user.role !== 'admin') {
       next(new ApiError('Only admins can access this resource', 403));
       return;
     }
     
-    const organizers = await User.find({ role: UserRole.ORGANIZER })
-      .select('-password -otp')
-      .sort({ createdAt: -1 });
+    const organizers = await prisma.user.findMany({
+      where: { role: 'organizer' },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        phoneNumber: true,
+        email: true,
+        role: true,
+        isVerified: true,
+        companyName: true,
+        companyDescription: true,
+        website: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
     
     res.status(200).json({
       success: true,
@@ -211,21 +266,23 @@ export const loginOrganizerController = async (req: Request, res: Response, next
     const { phoneNumber, email, password } = req.body;
 
     // Find user by phone number or email
-    const user = await User.findOne({
-      $or: [
-        { phoneNumber: phoneNumber || '' },
-        { email: email || '' }
-      ],
-      role: { $in: [UserRole.ORGANIZER, UserRole.ADMIN] }
-    }).select('+password'); // Include password field for comparison
+    const user = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { phoneNumber: phoneNumber || '' },
+          { email: email || '' },
+        ],
+        role: { in: ['organizer', 'admin'] },
+      },
+    });
 
-    if (!user) {
+    if (!user || !user.password) {
       next(new ApiError('Invalid credentials', 401));
       return;
     }
 
     // Check password
-    const isPasswordValid = await user.comparePassword(password);
+    const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       next(new ApiError('Invalid credentials', 401));
       return;
@@ -234,11 +291,14 @@ export const loginOrganizerController = async (req: Request, res: Response, next
     // Check if user is verified
     if (!user.isVerified) {
       // Generate new OTP for unverified users
-      const otp = user.generateOTP();
-      await user.save();
-      
-      // Send OTP via WhatsApp
-      // await sendOTP(user.phoneNumber, otp);
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          otpCode: otp,
+          otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+        },
+      });
       
       res.status(401).json({
         success: false,
@@ -250,18 +310,18 @@ export const loginOrganizerController = async (req: Request, res: Response, next
     }
 
     // Generate token
-    const token = user.generateAuthToken();
+    const token = generateAuthToken(user.id, user.role);
 
     res.status(200).json({
       success: true,
       message: 'Login successful',
       data: {
-        _id: user._id,
+        id: user.id,
         name: user.name,
         phoneNumber: user.phoneNumber,
         email: user.email,
         role: user.role,
-        organizerProfile: user.organizerProfile,
+        organizerProfile: toOrganizerProfile(user as any),
         token
       }
     });
@@ -276,12 +336,36 @@ export const loginOrganizerController = async (req: Request, res: Response, next
 export const getOrganizerProfileController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       next(new ApiError('User not authenticated', 401));
       return;
     }
 
-    const user = await User.findById(authReq.user._id).select('-password -otp');
+    const user = await prisma.user.findUnique({
+      where: { id: authReq.user.id },
+      select: {
+        id: true,
+        name: true,
+        phoneNumber: true,
+        email: true,
+        role: true,
+        isVerified: true,
+        companyName: true,
+        companyDescription: true,
+        website: true,
+        socialFacebook: true,
+        socialTwitter: true,
+        socialInstagram: true,
+        socialLinkedin: true,
+        addressStreet: true,
+        addressCity: true,
+        addressState: true,
+        addressZipCode: true,
+        addressCountry: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
     
     if (!user) {
       next(new ApiError('User not found', 404));
@@ -290,7 +374,10 @@ export const getOrganizerProfileController = async (req: Request, res: Response,
 
     res.status(200).json({
       success: true,
-      data: user,
+      data: {
+        ...user,
+        organizerProfile: toOrganizerProfile(user as any),
+      },
     });
   } catch (error) {
     next(error);
@@ -303,28 +390,36 @@ export const getOrganizerProfileController = async (req: Request, res: Response,
 export const updateOrganizerStatusController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
-    const { isVerified, isActive } = req.body;
+    const { isVerified } = req.body;
 
-    const updates: Record<string, any> = {};
+    const updates: any = {};
     if (typeof isVerified === 'boolean') updates.isVerified = isVerified;
-    if (typeof isActive === 'boolean') updates.isActive = isActive;
 
-    const organizer = await User.findOneAndUpdate(
-      { _id: id, role: UserRole.ORGANIZER },
-      { $set: updates },
-      { new: true, runValidators: true }
-    ).select('-password -otp');
-
-    if (!organizer) {
-      next(new ApiError('Organizer not found', 404));
-      return;
-    }
+    const organizer = await prisma.user.update({
+      where: { id, role: 'organizer' },
+      data: updates,
+      select: {
+        id: true,
+        name: true,
+        phoneNumber: true,
+        email: true,
+        role: true,
+        isVerified: true,
+        companyName: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
 
     res.status(200).json({
       success: true,
       data: organizer,
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      next(new ApiError('Organizer not found', 404));
+      return;
+    }
     next(error);
   }
 };
@@ -336,21 +431,19 @@ export const deleteOrganizerController = async (req: Request, res: Response, nex
   try {
     const { id } = req.params;
 
-    const organizer = await User.findOneAndDelete({
-      _id: id,
-      role: UserRole.ORGANIZER,
+    await prisma.user.delete({
+      where: { id, role: 'organizer' },
     });
-
-    if (!organizer) {
-      next(new ApiError('Organizer not found', 404));
-      return;
-    }
 
     res.status(200).json({
       success: true,
       message: 'Organizer deleted successfully',
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      next(new ApiError('Organizer not found', 404));
+      return;
+    }
     next(error);
   }
-}; 
+};

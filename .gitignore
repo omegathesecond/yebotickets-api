@@ -32,3 +32,5 @@ logs/
 # Coverage
 coverage/ 
 .aider*
+
+/src/generated/prisma

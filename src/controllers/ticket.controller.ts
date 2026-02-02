@@ -15,12 +15,12 @@ import { AuthenticatedRequest } from '../types/auth';
 export const createTicketTypeController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
     const { eventId } = req.params;
-    const organizerId = authReq.user._id.toString();
+    const organizerId = authReq.user.id;
     const ticketTypeData = req.body;
     
     const ticketType = await createTicketType(ticketTypeData, eventId, organizerId);
@@ -53,12 +53,12 @@ export const getTicketTypesController = async (req: Request, res: Response, next
 export const updateTicketTypeController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
     const { id } = req.params;
-    const organizerId = authReq.user._id.toString();
+    const organizerId = authReq.user.id;
     const updateData = req.body;
     
     const ticketType = await updateTicketType(id, updateData, organizerId);
@@ -75,12 +75,12 @@ export const updateTicketTypeController = async (req: Request, res: Response, ne
 export const deleteTicketTypeController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
     const { id } = req.params;
-    const organizerId = authReq.user._id.toString();
+    const organizerId = authReq.user.id;
     
     const result = await deleteTicketType(id, organizerId);
     
@@ -96,13 +96,13 @@ export const deleteTicketTypeController = async (req: Request, res: Response, ne
 export const generateTicketsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
     const { ticketTypeId } = req.params;
     const { quantity } = req.body;
-    const organizerId = authReq.user._id.toString();
+    const organizerId = authReq.user.id;
     
     const result = await generateTickets(ticketTypeId, quantity, organizerId);
     
@@ -118,12 +118,12 @@ export const generateTicketsController = async (req: Request, res: Response, nex
 export const purchaseTicketController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
     const { ticketTypeId } = req.params;
-    const userId = authReq.user._id.toString();
+    const userId = authReq.user.id;
     
     const ticket = await purchaseTicket(ticketTypeId, userId);
     
@@ -139,11 +139,11 @@ export const purchaseTicketController = async (req: Request, res: Response, next
 export const getUserTicketsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user._id) {
+    if (!authReq.user || !authReq.user.id) {
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const userId = authReq.user._id.toString();
+    const userId = authReq.user.id;
     
     const tickets = await getUserTickets(userId);
     
@@ -169,4 +169,4 @@ export const verifyTicketController = async (req: Request, res: Response, next: 
   } catch (error) {
     next(error);
   }
-}; 
+};

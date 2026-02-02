@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { ApiError } from './error.middleware';
-import User from '../models/user.model';
+import prisma from '../config/prisma';
 import { IUser, UserRole } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
 
@@ -29,12 +29,27 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
       // Verify token
       const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
 
-      // Attach user to request object
-      authReq.user = await User.findById(decoded.id).select('-password') as IUser;
+      // Get user from database
+      const user = await prisma.user.findUnique({
+        where: { id: decoded.id },
+        select: {
+          id: true,
+          name: true,
+          phoneNumber: true,
+          email: true,
+          role: true,
+          isVerified: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
       
-      if (!authReq.user) {
+      if (!user) {
         return next(new ApiError('User not found', 404));
       }
+
+      // Attach user to request object
+      authReq.user = user as unknown as IUser;
 
       next();
     } catch (error) {
@@ -53,4 +68,21 @@ export const authorize = (...roles: UserRole[]) => {
     }
     next();
   };
-}; 
+};
+
+/**
+ * Middleware to verify API key for dashboard access
+ */
+export const verifyDashboardApiKey = (req: Request, res: Response, next: NextFunction) => {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (!apiKey) {
+    return next(new ApiError('API key required', 401));
+  }
+  
+  if (apiKey !== process.env.DASHBOARD_API_KEY) {
+    return next(new ApiError('Invalid API key', 401));
+  }
+  
+  next();
+};

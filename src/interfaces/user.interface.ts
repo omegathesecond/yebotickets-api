@@ -1,5 +1,3 @@
-import { Document } from 'mongoose';
-
 export enum UserRole {
   USER = 'user',
   ORGANIZER = 'organizer',
@@ -32,22 +30,54 @@ export interface IOrganizerProfile {
   address?: IAddress;
 }
 
-export interface IUser extends Document {
+export interface IUser {
+  id: string;
   name: string;
   phoneNumber: string;
-  email?: string;
-  password?: string;
+  email?: string | null;
+  password?: string | null;
   role: UserRole;
   isVerified: boolean;
-  otp?: {
-    code: string;
-    expiresAt: Date;
-  };
-  // Organizer-specific fields
-  organizerProfile?: IOrganizerProfile;
+  otpCode?: string | null;
+  otpExpiresAt?: Date | null;
+  // Organizer-specific fields (flattened in DB)
+  companyName?: string | null;
+  companyDescription?: string | null;
+  website?: string | null;
+  socialFacebook?: string | null;
+  socialTwitter?: string | null;
+  socialInstagram?: string | null;
+  socialLinkedin?: string | null;
+  addressStreet?: string | null;
+  addressCity?: string | null;
+  addressState?: string | null;
+  addressZipCode?: string | null;
+  addressCountry?: string | null;
   createdAt: Date;
   updatedAt: Date;
-  comparePassword(enteredPassword: string): Promise<boolean>;
-  generateAuthToken(): string;
-  generateOTP(): string;
-} 
+}
+
+// Helper to convert flat user to nested organizer profile
+export function toOrganizerProfile(user: IUser): IOrganizerProfile | undefined {
+  if (!user.companyName && !user.companyDescription && !user.website) {
+    return undefined;
+  }
+  return {
+    companyName: user.companyName || undefined,
+    description: user.companyDescription || undefined,
+    website: user.website || undefined,
+    socialMedia: {
+      facebook: user.socialFacebook || undefined,
+      twitter: user.socialTwitter || undefined,
+      instagram: user.socialInstagram || undefined,
+      linkedin: user.socialLinkedin || undefined,
+    },
+    address: {
+      street: user.addressStreet || undefined,
+      city: user.addressCity || undefined,
+      state: user.addressState || undefined,
+      zipCode: user.addressZipCode || undefined,
+      country: user.addressCountry || undefined,
+    },
+  };
+}

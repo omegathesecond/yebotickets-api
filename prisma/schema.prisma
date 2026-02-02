@@ -1,0 +1,156 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  user
+  organizer
+  admin
+}
+
+enum TicketStatus {
+  available
+  sold
+  reserved
+  cancelled
+}
+
+enum TicketTypeEnum {
+  standard
+  vip
+  early_bird
+  group
+}
+
+model User {
+  id          String   @id @default(uuid())
+  name        String
+  phoneNumber String   @unique
+  email       String?  @unique
+  password    String?
+  role        UserRole @default(user)
+  isVerified  Boolean  @default(false)
+  
+  // OTP fields
+  otpCode     String?
+  otpExpiresAt DateTime?
+  
+  // Organizer profile (flattened)
+  companyName      String?
+  companyDescription String?
+  website          String?
+  
+  // Social media
+  socialFacebook   String?
+  socialTwitter    String?
+  socialInstagram  String?
+  socialLinkedin   String?
+  
+  // Address
+  addressStreet    String?
+  addressCity      String?
+  addressState     String?
+  addressZipCode   String?
+  addressCountry   String?
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  events      Event[]
+  tickets     Ticket[]
+  
+  @@index([phoneNumber])
+  @@index([email])
+}
+
+model Event {
+  id           String   @id @default(uuid())
+  title        String
+  description  String
+  
+  // Location
+  locationAddress     String
+  locationCity        String
+  locationCountry     String
+  locationLat         Float?
+  locationLng         Float?
+  
+  startDate    DateTime
+  endDate      DateTime
+  
+  organizerId  String
+  organizer    User     @relation(fields: [organizerId], references: [id])
+  
+  isPublished  Boolean  @default(false)
+  coverImage   String?
+  category     String
+  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  
+  // Relations
+  ticketTypes  TicketType[]
+  tickets      Ticket[]
+  
+  @@index([organizerId])
+  @@index([startDate, endDate])
+  @@index([locationCity, locationCountry])
+  @@index([category])
+}
+
+model TicketType {
+  id            String         @id @default(uuid())
+  name          String
+  description   String?
+  price         Float
+  quantity      Int
+  
+  eventId       String
+  event         Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  
+  type          TicketTypeEnum @default(standard)
+  saleStartDate DateTime
+  saleEndDate   DateTime
+  
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  
+  // Relations
+  tickets       Ticket[]
+  
+  @@index([eventId])
+}
+
+model Ticket {
+  id            String       @id @default(uuid())
+  
+  ticketTypeId  String
+  ticketType    TicketType   @relation(fields: [ticketTypeId], references: [id])
+  
+  eventId       String
+  event         Event        @relation(fields: [eventId], references: [id])
+  
+  userId        String?
+  user          User?        @relation(fields: [userId], references: [id])
+  
+  status        TicketStatus @default(available)
+  purchaseDate  DateTime?
+  uniqueCode    String       @unique
+  isCheckedIn   Boolean      @default(false)
+  checkedInAt   DateTime?
+  
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  
+  @@index([eventId, status])
+  @@index([userId])
+  @@index([uniqueCode])
+  @@index([ticketTypeId])
+}
