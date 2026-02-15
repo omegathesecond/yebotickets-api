@@ -1,0 +1,27 @@
+name: Deploy to Cloud Run
+on:
+  push:
+    branches: [main, master]
+env:
+  PROJECT_ID: yebotickets
+  REGION: europe-west1
+  SERVICE: yebotickets-api
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Build & Deploy
+        run: |
+          gcloud auth configure-docker gcr.io --quiet
+          docker build -t gcr.io/$PROJECT_ID/$SERVICE:${{ github.sha }} .
+          docker push gcr.io/$PROJECT_ID/$SERVICE:${{ github.sha }}
+          gcloud run deploy $SERVICE \
+            --image gcr.io/$PROJECT_ID/$SERVICE:${{ github.sha }} \
+            --region $REGION --platform managed --allow-unauthenticated \
+            --project $PROJECT_ID \
+            --set-secrets 'DATABASE_URL=yebotickets-database-url:latest'
