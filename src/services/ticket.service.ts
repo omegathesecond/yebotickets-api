@@ -7,6 +7,12 @@ import {
 } from '../interfaces/ticket.interface';
 import { ApiError } from '../middleware/error.middleware';
 import crypto from 'crypto';
+import {
+  buildTicketQrPayload,
+  generateTicketQrDataUrl,
+  generateTicketQrBuffer,
+} from './qr.service';
+import { sendImageMessage } from './whatsapp.service';
 
 /**
  * Map Prisma enum to interface enum
@@ -296,10 +302,153 @@ export const generateTickets = async (
 };
 
 /**
+ * Prisma include used when issuing a ticket on purchase so we have everything
+ * needed to render the QR and the delivery message: the event (title, date,
+ * venue), the ticket-type label, and the buyer's phone number.
+ */
+const PURCHASE_INCLUDE = {
+  event: {
+    select: {
+      id: true,
+      title: true,
+      startDate: true,
+      endDate: true,
+      locationAddress: true,
+      locationCity: true,
+      locationCountry: true,
+    },
+  },
+  ticketType: {
+    select: {
+      id: true,
+      name: true,
+      type: true,
+    },
+  },
+  user: {
+    select: {
+      id: true,
+      name: true,
+      phoneNumber: true,
+    },
+  },
+} as const;
+
+/**
+ * Outcome of attempting to deliver an issued ticket to the buyer. `status:
+ * 'failed'` is returned (never thrown) so the purchase response can surface the
+ * failure loudly without pretending the message was sent — the buyer still
+ * receives the QR inline in the response.
+ */
+export interface TicketDeliveryResult {
+  channel: 'whatsapp';
+  status: 'sent' | 'failed';
+  error?: string;
+}
+
+/** Normalise an unknown caught value into a readable message. */
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/** Build a single-line venue string from the event location fields. */
+const formatVenue = (event: {
+  locationAddress?: string | null;
+  locationCity?: string | null;
+  locationCountry?: string | null;
+}): string =>
+  [event.locationAddress, event.locationCity, event.locationCountry]
+    .filter(Boolean)
+    .join(', ') || 'Venue to be announced';
+
+/** Format the event start date for the buyer (Eswatini local time). */
+const formatEventDate = (date: Date): string => {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      dateStyle: 'full',
+      timeStyle: 'short',
+      timeZone: 'Africa/Mbabane',
+    }).format(date);
+  } catch {
+    return date.toUTCString();
+  }
+};
+
+/**
+ * Compose the human-readable ticket message that accompanies the QR image,
+ * including event title, date, venue, ticket type and the unique code.
+ */
+const buildTicketMessage = (ticket: any): string => {
+  const lines = [
+    `🎟️ Your ticket for ${ticket.event?.title ?? 'your event'}`,
+    '',
+    `📅 ${ticket.event?.startDate ? formatEventDate(ticket.event.startDate) : 'Date to be announced'}`,
+    `📍 ${formatVenue(ticket.event ?? {})}`,
+  ];
+  if (ticket.ticketType?.name) {
+    lines.push(`🎫 ${ticket.ticketType.name}`);
+  }
+  lines.push(`🔑 Ticket code: ${ticket.uniqueCode}`);
+  lines.push('');
+  lines.push('Show this QR code at the gate for entry.');
+  return lines.join('\n');
+};
+
+/**
+ * Attach the QR (data URL) and the decoded payload to a ticket object so any
+ * client can render it inline. Used by both the purchase response and
+ * GET /api/tickets/my-tickets.
+ */
+const withQrFields = async <T extends { eventId: string; uniqueCode: string }>(
+  ticket: T
+): Promise<T & { qrCode: string; qrPayload: ReturnType<typeof buildTicketQrPayload> }> => ({
+  ...ticket,
+  qrCode: await generateTicketQrDataUrl(ticket.eventId, ticket.uniqueCode),
+  qrPayload: buildTicketQrPayload(ticket.eventId, ticket.uniqueCode),
+});
+
+/**
+ * Deliver the issued ticket QR + details to the buyer's phone via WhatsApp.
+ * Failures are caught and returned as `status: 'failed'` (with the reason) so
+ * the caller can warn the buyer rather than silently pretend delivery worked.
+ */
+const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> => {
+  const phoneNumber = ticket.user?.phoneNumber;
+  if (!phoneNumber) {
+    return {
+      channel: 'whatsapp',
+      status: 'failed',
+      error: 'Buyer has no phone number on file',
+    };
+  }
+
+  try {
+    const qrBuffer = await generateTicketQrBuffer(ticket.eventId, ticket.uniqueCode);
+    await sendImageMessage(phoneNumber, qrBuffer, buildTicketMessage(ticket));
+    return { channel: 'whatsapp', status: 'sent' };
+  } catch (error) {
+    console.error('Failed to deliver ticket via WhatsApp:', error);
+    return {
+      channel: 'whatsapp',
+      status: 'failed',
+      error: errorMessage(error),
+    };
+  }
+};
+
+/**
  * Purchase a ticket
+ *
+ * On success this also: generates a QR encoding the canonical
+ * { eventId, ticketId: uniqueCode } payload the gate scanner parses, delivers
+ * the ticket (QR + event details) to the buyer's phone via WhatsApp, and
+ * returns the QR (data URL) plus an explicit `delivery` status. A failed
+ * delivery does NOT roll back the (paid) purchase and is NOT swallowed — it is
+ * surfaced via `delivery.status: 'failed'` so the client can warn the buyer,
+ * who still has the QR inline in this response.
+ *
  * @param ticketTypeId Ticket type ID
  * @param userId User ID
- * @returns Purchased ticket
+ * @returns Purchased ticket with qrCode, qrPayload and delivery status
  */
 export const purchaseTicket = async (
   ticketTypeId: string,
@@ -310,7 +459,7 @@ export const purchaseTicket = async (
     const ticketType = await prisma.ticketType.findUnique({
       where: { id: ticketTypeId },
     });
-    
+
     if (!ticketType) {
       throw new ApiError('Ticket type not found', 404);
     }
@@ -327,7 +476,7 @@ export const purchaseTicket = async (
       throw new ApiError('No tickets available for this ticket type', 400);
     }
 
-    // Update the ticket
+    // Update the ticket, pulling in event + buyer details needed for delivery.
     const ticket = await prisma.ticket.update({
       where: { id: availableTicket.id },
       data: {
@@ -335,11 +484,21 @@ export const purchaseTicket = async (
         status: 'sold',
         purchaseDate: new Date(),
       },
+      include: PURCHASE_INCLUDE,
     });
 
+    // Deliver QR + details to the buyer; result captures any failure loudly.
+    const delivery = await deliverTicketToBuyer(ticket);
+
+    const withQr = await withQrFields(ticket);
+
     return {
-      ...ticket,
+      ...withQr,
       status: mapTicketStatus(ticket.status),
+      ticketType: ticket.ticketType
+        ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
+        : null,
+      delivery,
     };
   } catch (error) {
     console.error('Error in purchaseTicket service:', error);
@@ -379,14 +538,16 @@ export const getUserTickets = async (userId: string) => {
       },
     });
     
-    return tickets.map(t => ({
-      ...t,
-      status: mapTicketStatus(t.status),
-      ticketType: t.ticketType ? {
-        ...t.ticketType,
-        type: mapTicketType(t.ticketType.type),
-      } : null,
-    }));
+    return Promise.all(
+      tickets.map(async t => ({
+        ...(await withQrFields(t)),
+        status: mapTicketStatus(t.status),
+        ticketType: t.ticketType ? {
+          ...t.ticketType,
+          type: mapTicketType(t.ticketType.type),
+        } : null,
+      }))
+    );
   } catch (error) {
     console.error('Error in getUserTickets service:', error);
     throw new ApiError('Failed to fetch user tickets', 500);
