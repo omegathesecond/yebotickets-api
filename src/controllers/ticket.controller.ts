@@ -7,7 +7,9 @@ import {
   generateTickets,
   purchaseTicket,
   getUserTickets,
-  verifyTicket
+  verifyTicket,
+  getCheckInDetails,
+  confirmCheckIn
 } from '../services/ticket.service';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
@@ -158,10 +160,72 @@ export const getUserTicketsController = async (req: Request, res: Response, next
 
 export const verifyTicketController = async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
     const { ticketCode, eventId } = req.body;
-    
-    const result = await verifyTicket(ticketCode, eventId);
-    
+
+    const result = await verifyTicket(ticketCode, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Preview step: non-mutating lookup of a scanned ticket so gate staff can
+ * confirm the holder before checking them in. Accepts { eventId, ticketId }.
+ */
+export const getCheckInDetailsController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { ticketId, eventId } = req.body;
+
+    const result = await getCheckInDetails(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Commit step: marks a previewed ticket as checked in. Rejects (4xx) when the
+ * ticket is unknown, not sold, or already checked in. Accepts { eventId, ticketId }.
+ */
+export const confirmCheckInController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { ticketId, eventId } = req.body;
+
+    const result = await confirmCheckIn(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
+
     res.status(200).json({
       success: true,
       data: result,
