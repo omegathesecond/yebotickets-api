@@ -1,13 +1,31 @@
-name: Deploy to Cloud Run
+name: CI & Deploy to Cloud Run
 on:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master, dev]
 env:
   PROJECT_ID: yebotickets
   REGION: europe-west1
   SERVICE: yebotickets-api
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Run tests
+        run: npm test
   deploy:
+    # Only deploy on a push to a release branch; PRs run the test job only.
+    if: github.event_name == 'push'
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
