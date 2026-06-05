@@ -394,7 +394,94 @@ export const getUserTickets = async (userId: string) => {
 };
 
 /**
- * Verify ticket (for check-in)
+ * Shared Prisma include used for every check-in lookup so the holder, event,
+ * and ticket-type are always available to render at the gate.
+ */
+const CHECK_IN_INCLUDE = {
+  event: {
+    select: {
+      id: true,
+      title: true,
+      startDate: true,
+      endDate: true,
+    },
+  },
+  ticketType: {
+    select: {
+      id: true,
+      name: true,
+      type: true,
+    },
+  },
+  user: {
+    select: {
+      id: true,
+      name: true,
+      phoneNumber: true,
+    },
+  },
+} as const;
+
+/**
+ * Look up a ticket for check-in scoped to an event. The identifier may be the
+ * ticket's database id (the scanner QR carries `{ ticketId, eventId }`) OR its
+ * uniqueCode (used by the single-step /verify flow), so both are matched.
+ */
+const findTicketForCheckIn = async (ticketIdentifier: string, eventId: string) => {
+  return prisma.ticket.findFirst({
+    where: {
+      eventId,
+      OR: [
+        { id: ticketIdentifier },
+        { uniqueCode: ticketIdentifier },
+      ],
+    },
+    include: CHECK_IN_INCLUDE,
+  });
+};
+
+/**
+ * Single source of truth for the double-check-in guard. Evaluates a ticket
+ * WITHOUT mutating it and returns whether it may be checked in, plus the reason
+ * when it may not. Reused by verifyTicket, getCheckInDetails and confirmCheckIn.
+ */
+const evaluateCheckIn = (
+  ticket: { status: string; isCheckedIn: boolean } | null
+): { valid: boolean; message: string } => {
+  if (!ticket) {
+    return { valid: false, message: 'Invalid ticket code' };
+  }
+  if (ticket.status !== 'sold') {
+    return { valid: false, message: 'Ticket is not valid for check-in' };
+  }
+  if (ticket.isCheckedIn) {
+    return { valid: false, message: 'Ticket has already been used for check-in' };
+  }
+  return { valid: true, message: 'Ticket is valid for check-in' };
+};
+
+/**
+ * Flatten a ticket (with its relations) into the shape the gate scanner UI
+ * reads directly: holder name, event name, ticket-type label and a `status`
+ * where 'used' signals an already-checked-in ticket.
+ */
+const toCheckInTicketDto = (ticket: any) => ({
+  id: ticket.id,
+  uniqueCode: ticket.uniqueCode,
+  name: ticket.user?.name ?? 'Guest',
+  phoneNumber: ticket.user?.phoneNumber ?? null,
+  eventId: ticket.eventId,
+  eventName: ticket.event?.title ?? null,
+  type: ticket.ticketType?.name ?? null,
+  category: ticket.ticketType ? mapTicketType(ticket.ticketType.type) : null,
+  status: ticket.isCheckedIn ? 'used' : mapTicketStatus(ticket.status),
+  isCheckedIn: ticket.isCheckedIn,
+  checkedInAt: ticket.checkedInAt ?? null,
+});
+
+/**
+ * Verify ticket (single-step check-in). Verifies AND marks the ticket checked
+ * in in one call. Preserved for the existing /api/tickets/verify consumer.
  * @param ticketCode Unique ticket code
  * @param eventId Event ID
  * @returns Check-in result
@@ -404,98 +491,25 @@ export const verifyTicket = async (
   eventId: string
 ): Promise<{ ticket: any; valid: boolean; message: string }> => {
   try {
-    const ticket = await prisma.ticket.findFirst({
-      where: {
-        uniqueCode: ticketCode,
-        eventId,
-      },
-      include: {
-        event: {
-          select: {
-            id: true,
-            title: true,
-            startDate: true,
-            endDate: true,
-          },
-        },
-        ticketType: {
-          select: {
-            id: true,
-            name: true,
-            type: true,
-          },
-        },
-        user: {
-          select: {
-            id: true,
-            name: true,
-            phoneNumber: true,
-          },
-        },
-      },
-    });
+    const ticket = await findTicketForCheckIn(ticketCode, eventId);
 
-    if (!ticket) {
+    const evaluation = evaluateCheckIn(ticket);
+    if (!evaluation.valid) {
       return {
-        ticket: {},
+        ticket: ticket ? { ...ticket, status: mapTicketStatus(ticket.status) } : {},
         valid: false,
-        message: 'Invalid ticket code',
-      };
-    }
-
-    if (ticket.status !== 'sold') {
-      return {
-        ticket: {
-          ...ticket,
-          status: mapTicketStatus(ticket.status),
-        },
-        valid: false,
-        message: 'Ticket is not valid for check-in',
-      };
-    }
-
-    if (ticket.isCheckedIn) {
-      return {
-        ticket: {
-          ...ticket,
-          status: mapTicketStatus(ticket.status),
-        },
-        valid: false,
-        message: 'Ticket has already been used for check-in',
+        message: evaluation.message,
       };
     }
 
     // Mark ticket as checked in
     const updatedTicket = await prisma.ticket.update({
-      where: { id: ticket.id },
+      where: { id: ticket!.id },
       data: {
         isCheckedIn: true,
         checkedInAt: new Date(),
       },
-      include: {
-        event: {
-          select: {
-            id: true,
-            title: true,
-            startDate: true,
-            endDate: true,
-          },
-        },
-        ticketType: {
-          select: {
-            id: true,
-            name: true,
-            type: true,
-          },
-        },
-        user: {
-          select: {
-            id: true,
-            name: true,
-            phoneNumber: true,
-          },
-        },
-      },
+      include: CHECK_IN_INCLUDE,
     });
 
     return {
@@ -509,5 +523,83 @@ export const verifyTicket = async (
   } catch (error) {
     console.error('Error in verifyTicket service:', error);
     throw new ApiError('Failed to verify ticket', 500);
+  }
+};
+
+/**
+ * Get check-in details (preview step). Non-mutating lookup that returns the
+ * ticket holder, event and current checked-in status so gate staff can confirm
+ * identity BEFORE committing the check-in. Never marks the ticket as used.
+ * @param ticketIdentifier Ticket database id or uniqueCode
+ * @param eventId Event ID
+ * @returns Holder/event details plus whether the ticket can be checked in now
+ */
+export const getCheckInDetails = async (
+  ticketIdentifier: string,
+  eventId: string
+): Promise<{ ticket: any; canCheckIn: boolean; message: string }> => {
+  try {
+    const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
+    const evaluation = evaluateCheckIn(ticket);
+
+    return {
+      ticket: ticket ? toCheckInTicketDto(ticket) : {},
+      canCheckIn: evaluation.valid,
+      message: evaluation.message,
+    };
+  } catch (error) {
+    console.error('Error in getCheckInDetails service:', error);
+    throw new ApiError('Failed to get check-in details', 500);
+  }
+};
+
+/**
+ * Confirm check-in (commit step). Atomically marks a previewed ticket as
+ * checked in and REJECTS (throws) when the ticket is unknown, not 'sold', or
+ * already checked in — reusing the same guard as verifyTicket. The mutation is
+ * a conditional updateMany so two scanners racing on the same ticket cannot
+ * both succeed.
+ * @param ticketIdentifier Ticket database id or uniqueCode
+ * @param eventId Event ID
+ * @returns Check-in result for the now checked-in ticket
+ */
+export const confirmCheckIn = async (
+  ticketIdentifier: string,
+  eventId: string
+): Promise<{ ticket: any; valid: boolean; message: string }> => {
+  try {
+    const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
+    const evaluation = evaluateCheckIn(ticket);
+
+    if (!evaluation.valid) {
+      // Unknown code -> 404; not sold / already checked in -> 400.
+      throw new ApiError(evaluation.message, ticket ? 400 : 404);
+    }
+
+    // Atomically claim the check-in: only succeeds while still un-checked-in and
+    // sold, guarding against a double check-in race between preview and commit.
+    const claim = await prisma.ticket.updateMany({
+      where: { id: ticket!.id, isCheckedIn: false, status: 'sold' },
+      data: { isCheckedIn: true, checkedInAt: new Date() },
+    });
+
+    if (claim.count === 0) {
+      throw new ApiError('Ticket has already been used for check-in', 400);
+    }
+
+    const updatedTicket = await prisma.ticket.findUnique({
+      where: { id: ticket!.id },
+      include: CHECK_IN_INCLUDE,
+    });
+
+    return {
+      ticket: updatedTicket ? toCheckInTicketDto(updatedTicket) : {},
+      valid: true,
+      message: 'Check-in successful',
+    };
+  } catch (error) {
+    console.error('Error in confirmCheckIn service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to confirm check-in', 500);
   }
 };

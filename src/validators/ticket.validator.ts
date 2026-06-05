@@ -130,10 +130,27 @@ export const verifyTicketValidator = [
     .withMessage('Ticket code is required')
     .isString()
     .withMessage('Ticket code must be a string'),
-  
+
   body('eventId')
     .notEmpty()
     .withMessage('Event ID is required')
-    .isMongoId()
-    .withMessage('Invalid event ID format'),
+    .isString()
+    .withMessage('Event ID must be a string'),
+];
+
+// Used by the two-step gate check-in (/check-in-details and /confirm-check-in).
+// The scanner QR carries { eventId, ticketId } where ticketId is the ticket's
+// id (a UUID). Validate as plain strings — these are UUIDs, not Mongo ids.
+export const checkInLookupValidator = [
+  body('ticketId')
+    .notEmpty()
+    .withMessage('Ticket ID is required')
+    .isString()
+    .withMessage('Ticket ID must be a string'),
+
+  body('eventId')
+    .notEmpty()
+    .withMessage('Event ID is required')
+    .isString()
+    .withMessage('Event ID must be a string'),
 ]; 

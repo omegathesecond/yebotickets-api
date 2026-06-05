@@ -7,14 +7,17 @@ import {
   generateTicketsController,
   purchaseTicketController,
   getUserTicketsController,
-  verifyTicketController
+  verifyTicketController,
+  getCheckInDetailsController,
+  confirmCheckInController
 } from '../controllers/ticket.controller';
-import { 
+import {
   createTicketTypeValidator,
   updateTicketTypeValidator,
   generateTicketsValidator,
   purchaseTicketValidator,
-  verifyTicketValidator
+  verifyTicketValidator,
+  checkInLookupValidator
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
@@ -495,6 +498,92 @@ router.post(
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   validate(verifyTicketValidator),
   verifyTicketController
+);
+
+/**
+ * @swagger
+ * /api/tickets/check-in-details:
+ *   post:
+ *     summary: Preview a scanned ticket (non-mutating)
+ *     tags: [Tickets]
+ *     description: >
+ *       Look up a scanned ticket WITHOUT checking it in, returning the holder,
+ *       event and current checked-in status so gate staff can confirm identity
+ *       before committing. Only accessible by event organizers and admins.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [eventId, ticketId]
+ *             properties:
+ *               eventId:
+ *                 type: string
+ *               ticketId:
+ *                 type: string
+ *                 description: Ticket id (from the QR) or uniqueCode
+ *     responses:
+ *       200:
+ *         description: Ticket details with a canCheckIn flag
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not authorized
+ */
+router.post(
+  '/check-in-details',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  validate(checkInLookupValidator),
+  getCheckInDetailsController
+);
+
+/**
+ * @swagger
+ * /api/tickets/confirm-check-in:
+ *   post:
+ *     summary: Commit a ticket check-in
+ *     tags: [Tickets]
+ *     description: >
+ *       Mark a previewed ticket as checked in. Rejects when the ticket is
+ *       unknown, not sold, or already checked in. Only accessible by event
+ *       organizers and admins.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [eventId, ticketId]
+ *             properties:
+ *               eventId:
+ *                 type: string
+ *               ticketId:
+ *                 type: string
+ *                 description: Ticket id (from the QR) or uniqueCode
+ *     responses:
+ *       200:
+ *         description: Check-in successful
+ *       400:
+ *         description: Ticket not sold or already checked in
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not authorized
+ *       404:
+ *         description: Ticket not found
+ */
+router.post(
+  '/confirm-check-in',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  validate(checkInLookupValidator),
+  confirmCheckInController
 );
 
 export default router; 
