@@ -160,9 +160,17 @@ export const getUserTicketsController = async (req: Request, res: Response, next
 
 export const verifyTicketController = async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
     const { ticketCode, eventId } = req.body;
 
-    const result = await verifyTicket(ticketCode, eventId);
+    const result = await verifyTicket(ticketCode, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
 
     res.status(200).json({
       success: true,
@@ -179,9 +187,17 @@ export const verifyTicketController = async (req: Request, res: Response, next: 
  */
 export const getCheckInDetailsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
     const { ticketId, eventId } = req.body;
 
-    const result = await getCheckInDetails(ticketId, eventId);
+    const result = await getCheckInDetails(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
 
     res.status(200).json({
       success: true,
@@ -198,9 +214,17 @@ export const getCheckInDetailsController = async (req: Request, res: Response, n
  */
 export const confirmCheckInController = async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
     const { ticketId, eventId } = req.body;
 
-    const result = await confirmCheckIn(ticketId, eventId);
+    const result = await confirmCheckIn(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
 
     res.status(200).json({
       success: true,

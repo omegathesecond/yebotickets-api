@@ -423,6 +423,36 @@ const CHECK_IN_INCLUDE = {
 } as const;
 
 /**
+ * Authenticated requester performing a check-in. Used to enforce that an
+ * organizer can only check in tickets for their OWN events (admins may access
+ * any event).
+ */
+type CheckInRequester = { id: string; role: string };
+
+/**
+ * Ensure the requester is allowed to check in tickets for this event. Throws
+ * 404 if the event does not exist and 403 if a non-admin organizer does not own
+ * it. Prevents cross-tenant check-in (IDOR) via a forged eventId in the body.
+ */
+const assertEventAccess = async (
+  eventId: string,
+  requester: CheckInRequester
+): Promise<void> => {
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { id: true, organizerId: true },
+  });
+
+  if (!event) {
+    throw new ApiError('Event not found', 404);
+  }
+
+  if (requester.role !== 'admin' && event.organizerId !== requester.id) {
+    throw new ApiError('You do not have permission to check in tickets for this event', 403);
+  }
+};
+
+/**
  * Look up a ticket for check-in scoped to an event. The identifier may be the
  * ticket's database id (the scanner QR carries `{ ticketId, eventId }`) OR its
  * uniqueCode (used by the single-step /verify flow), so both are matched.
@@ -488,9 +518,12 @@ const toCheckInTicketDto = (ticket: any) => ({
  */
 export const verifyTicket = async (
   ticketCode: string,
-  eventId: string
+  eventId: string,
+  requester: CheckInRequester
 ): Promise<{ ticket: any; valid: boolean; message: string }> => {
   try {
+    await assertEventAccess(eventId, requester);
+
     const ticket = await findTicketForCheckIn(ticketCode, eventId);
 
     const evaluation = evaluateCheckIn(ticket);
@@ -522,6 +555,7 @@ export const verifyTicket = async (
     };
   } catch (error) {
     console.error('Error in verifyTicket service:', error);
+    if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to verify ticket', 500);
   }
 };
@@ -536,9 +570,12 @@ export const verifyTicket = async (
  */
 export const getCheckInDetails = async (
   ticketIdentifier: string,
-  eventId: string
+  eventId: string,
+  requester: CheckInRequester
 ): Promise<{ ticket: any; canCheckIn: boolean; message: string }> => {
   try {
+    await assertEventAccess(eventId, requester);
+
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
     const evaluation = evaluateCheckIn(ticket);
 
@@ -549,6 +586,7 @@ export const getCheckInDetails = async (
     };
   } catch (error) {
     console.error('Error in getCheckInDetails service:', error);
+    if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to get check-in details', 500);
   }
 };
@@ -565,9 +603,12 @@ export const getCheckInDetails = async (
  */
 export const confirmCheckIn = async (
   ticketIdentifier: string,
-  eventId: string
+  eventId: string,
+  requester: CheckInRequester
 ): Promise<{ ticket: any; valid: boolean; message: string }> => {
   try {
+    await assertEventAccess(eventId, requester);
+
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
     const evaluation = evaluateCheckIn(ticket);
 
