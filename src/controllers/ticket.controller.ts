@@ -11,6 +11,8 @@ import {
   verifyTicket,
   getCheckInDetails,
   confirmCheckIn,
+  refundTicket,
+  cancelEvent,
   PurchasePaymentInput
 } from '../services/ticket.service';
 import { ApiError } from '../middleware/error.middleware';
@@ -261,6 +263,66 @@ export const confirmCheckInController = async (req: Request, res: Response, next
     const { ticketId, eventId } = req.body;
 
     const result = await confirmCheckIn(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Refund + cancel a SINGLE ticket. Only the owning organizer or an admin may do
+ * this (enforced in the service via assertEventAccess). Returns the per-ticket
+ * outcome; a failed YeboPay refund surfaces as a 502 (no false "refunded").
+ * POST /api/tickets/refund/:ticketId  body: { reason? }
+ */
+export const refundTicketController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { ticketId } = req.params;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+
+    const result = await refundTicket(
+      ticketId,
+      { id: authReq.user.id, role: authReq.user.role },
+      reason
+    );
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Cancel an EVENT: refund every sold ticket via YeboPay, mark each CANCELLED and
+ * notify the holders. Only the owning organizer or an admin may do this. Returns
+ * a per-ticket summary so any refund/notify failure is visible to the caller.
+ * POST /api/tickets/events/:eventId/cancel
+ */
+export const cancelEventController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { eventId } = req.params;
+
+    const result = await cancelEvent(eventId, {
       id: authReq.user.id,
       role: authReq.user.role,
     });

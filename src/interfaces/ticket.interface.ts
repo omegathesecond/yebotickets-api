@@ -36,6 +36,14 @@ export interface ITicket {
   uniqueCode: string;
   isCheckedIn: boolean;
   checkedInAt?: Date | null;
+  // Payment (set when sold via YeboPay; FREE for price-0 tickets)
+  paymentRef?: string | null;
+  paymentStatus?: string | null;
+  amountPaid?: number | null;
+  // Refund / cancellation outcome (set when refunded or its event is cancelled)
+  refundRef?: string | null;
+  refundedAt?: Date | null;
+  cancelledAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -91,7 +91,14 @@ model Event {
   isPublished  Boolean  @default(false)
   coverImage   String?
   category     String
-  
+
+  // Cancellation: an organizer/admin can cancel an event, which refunds every
+  // sold ticket via YeboPay and marks each CANCELLED. isCancelled gates the
+  // operation idempotently (re-running only picks up tickets not yet handled);
+  // cancelledAt records when the event was cancelled.
+  isCancelled  Boolean  @default(false)
+  cancelledAt  DateTime?
+
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   
@@ -155,9 +162,19 @@ model Ticket {
   paymentStatus String?
   amountPaid    Float?
 
+  // Refund / cancellation outcome, persisted when a sold ticket is refunded
+  // (individually or because its event was cancelled). status flips to
+  // CANCELLED and paymentStatus to REFUNDED ONLY after YeboPay confirms the
+  // money is back. refundRef is the YeboPay refund/charge reference; refundedAt
+  // records when the money was returned; cancelledAt records when the ticket
+  // was voided (set for free tickets too, which are cancelled without a refund).
+  refundRef     String?
+  refundedAt    DateTime?
+  cancelledAt   DateTime?
+
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
-  
+
   @@index([eventId, status])
   @@index([userId])
   @@index([uniqueCode])

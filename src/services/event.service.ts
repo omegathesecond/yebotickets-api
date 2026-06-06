@@ -18,6 +18,10 @@ const transformEvent = (event: any) => ({
     email: event.organizer.email,
   } : { id: event.organizerId },
   isPublished: event.isPublished,
+  // Surface cancellation so a client landing on a cancelled event (e.g. via a
+  // stale link) can show it's off-sale rather than silently offer to buy.
+  isCancelled: event.isCancelled ?? false,
+  cancelledAt: event.cancelledAt ?? null,
   coverImage: event.coverImage,
   category: event.category,
   ticketTypes: event.ticketTypes || [],
@@ -88,7 +92,15 @@ export const getEvents = async (query: Record<string, any> = {}) => {
     if (query.showUnpublished !== 'true') {
       where.isPublished = true;
     }
-    
+
+    // Exclude cancelled events from listings by default. cancelEvent flags
+    // isCancelled; without this filter a cancelled event keeps appearing in the
+    // public buyer listing and selling tickets. An organizer dashboard can opt
+    // in to see its own cancelled events via showCancelled=true.
+    if (query.showCancelled !== 'true') {
+      where.isCancelled = false;
+    }
+
     // Organizer filter
     if (query.organizer) {
       where.organizerId = query.organizer;

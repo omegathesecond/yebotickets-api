@@ -222,3 +222,48 @@ export const createCharge = async (args: CreateChargeArgs): Promise<ChargeResult
   });
   return resp.data;
 };
+
+export interface RefundChargeArgs {
+  /** YeboPay charge id stored on the ticket as `paymentRef`. */
+  chargeId: string;
+  /** Amount to refund. Omit for a full refund of the remaining balance. */
+  amount?: number;
+  /** Human-readable reason, surfaced in YeboPay's records. */
+  reason?: string;
+}
+
+export interface RefundResult {
+  charge_id: string;
+  refunded_amount: string; // YeboPay returns Decimal as a string
+  status: 'PARTIAL_REFUNDED' | 'REFUNDED';
+  processor_ref: string | null;
+  processor_status: string;
+}
+
+/**
+ * POST /v1/refunds — refund a previously-succeeded charge (full or partial).
+ *
+ * Modelled on the yebodash reference (companies/yebodash/api/src/integrations/
+ * yebopay.ts). YeboPay validates that the charge belongs to this merchant and
+ * that its status allows refunding (SUCCEEDED or PARTIAL_REFUNDED) — a charge
+ * already fully REFUNDED yields a 409 (YeboPayHttpError) which the caller can
+ * treat as an idempotent "already refunded". A 501 means the charge was paid via
+ * a path with no refund adapter yet; surface that to the organizer so they know
+ * to refund the holder manually rather than us pretending it worked.
+ *
+ * Throws YeboPayHttpError on any non-2xx — never silently. The caller (the
+ * refund flow in ticket.service) MUST NOT mark a ticket refunded unless this
+ * resolves successfully.
+ */
+export const refundCharge = async (args: RefundChargeArgs): Promise<RefundResult> => {
+  const resp = await dispatch<{ success: true; data: RefundResult }>({
+    method: 'POST',
+    path: '/v1/refunds',
+    body: {
+      charge_id: args.chargeId,
+      amount: args.amount,
+      reason: args.reason,
+    },
+  });
+  return resp.data;
+};
