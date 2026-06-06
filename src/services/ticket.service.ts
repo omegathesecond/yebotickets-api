@@ -619,13 +619,23 @@ export const purchaseTicket = async (
   payment?: PurchasePaymentInput
 ) => {
   try {
-    // Find ticket type
+    // Find ticket type (with just the event's cancellation flag — needed to
+    // reject sales for a cancelled event before any reserve/charge happens).
     const ticketType = await prisma.ticketType.findUnique({
       where: { id: ticketTypeId },
+      include: { event: { select: { isCancelled: true } } },
     });
 
     if (!ticketType) {
       throw new ApiError('Ticket type not found', 404);
+    }
+
+    // A cancelled event is off-sale. Reject BEFORE reserving or charging: a sale
+    // here would take the buyer's money via YeboPay for a dead event whose bulk
+    // refund has already run and will never revisit this new ticket — a silent
+    // failure (CLAUDE.md). cancelEvent flags isCancelled; this is what reads it.
+    if (ticketType.event?.isCancelled) {
+      throw new ApiError('This event has been cancelled — tickets are no longer on sale.', 400);
     }
 
     const price = ticketType.price;
@@ -1322,8 +1332,9 @@ export const cancelEvent = async (
   try {
     await assertEventAccess(eventId, requester);
 
-    // Flag the event cancelled (idempotent) — stops further sales/listing even
-    // if some refunds below need a retry.
+    // Flag the event cancelled (idempotent). This is the flag purchaseTicket
+    // rejects on and getEvents filters out, so sales + public listing stop here
+    // even if some refunds below need a retry.
     const event = await prisma.event.update({
       where: { id: eventId },
       data: { isCancelled: true, cancelledAt: new Date() },

@@ -83,6 +83,9 @@ const buildTicketType = (over: Partial<any> = {}) => ({
   saleEndDate: new Date('2026-12-31T00:00:00Z'),
   createdAt: new Date('2026-01-01T00:00:00Z'),
   updatedAt: new Date('2026-01-01T00:00:00Z'),
+  // Relation loaded by purchaseTicket's `include` to gate sales on a cancelled
+  // event. Default: event is live. Override `event` to simulate a cancellation.
+  event: { isCancelled: false },
   ...over,
 });
 
@@ -415,6 +418,23 @@ describe('purchaseTicket — payment + atomic claim', () => {
       statusCode: 404,
     });
 
+    expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a purchase for a CANCELLED event before reserving or charging', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(
+      buildTicketType({ event: { isCancelled: true } }) as any
+    );
+
+    await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+      message: 'This event has been cancelled — tickets are no longer on sale.',
+      statusCode: 400,
+    });
+
+    // No ticket is reserved and — critically — no money is taken: the guard
+    // runs before any claim or YeboPay charge (no silent pay-for-dead-event).
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
     expect(createChargeMock).not.toHaveBeenCalled();
