@@ -111,22 +111,27 @@ const buildCheckInTicket = (over: Partial<any> = {}) => ({
 });
 
 describe('purchaseTicket', () => {
-  it('sells an available ticket: marks it sold, sets userId and purchaseDate', async () => {
+  it('atomically claims an available ticket: guarded updateMany sets sold/userId/purchaseDate', async () => {
     prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
-    prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
-    prismaMock.ticket.update.mockResolvedValue(buildSoldTicketWithRelations() as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    // count === 1 -> this buyer won the row.
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldTicketWithRelations() as any);
 
     const result = await purchaseTicket('tt-1', 'user-1');
 
-    // The mutation persists the sale with the buyer and a fresh purchaseDate.
-    expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
-    const updateArg = prismaMock.ticket.update.mock.calls[0][0];
-    expect(updateArg.where).toEqual({ id: 'ticket-1' });
-    expect(updateArg.data).toMatchObject({
+    // The claim is a CONDITIONAL update: it only matches while the row is still
+    // available and unowned — this is what makes concurrent claims safe.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(claimArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
+    expect(claimArg.data).toMatchObject({
       userId: 'user-1',
       status: 'sold',
       purchaseDate: expect.any(Date),
     });
+    // A plain unconditional update by id would reintroduce the race — forbid it.
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
 
     // The returned ticket reflects the sale and carries a QR for the buyer.
     expect(result.status).toBe(TicketStatus.SOLD);
@@ -145,8 +150,110 @@ describe('purchaseTicket', () => {
       statusCode: 400,
     });
 
-    // No sale must be attempted when nothing is available.
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    // No claim must be attempted when nothing is available.
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('fails the loser of a concurrent race: a guarded claim on an already-claimed row matches no rows', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    // Buyer reads ticket-1 as available, but by the time the guarded claim runs
+    // another buyer has already taken it, so updateMany matches 0 rows. With no
+    // other ticket free, the retry finds nothing and the buyer is refused.
+    prismaMock.ticket.findFirst
+      .mockResolvedValueOnce({ id: 'ticket-1' } as any) // looked available...
+      .mockResolvedValueOnce(null); // ...but the pool is now exhausted on retry
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 0 } as any);
+
+    await expect(purchaseTicket('tt-1', 'user-2')).rejects.toMatchObject({
+      message: 'No tickets available for this ticket type',
+      statusCode: 400,
+    });
+
+    // It DID attempt the guarded claim and lost (count 0), then never fabricated
+    // a sale — findUnique (the post-win re-fetch) must not run for a loser.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(claimArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
+    expect(prismaMock.ticket.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('retries past a lost row and claims the next available ticket instead of failing', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    // First candidate ticket-1 is stolen mid-claim (count 0); the loop must move
+    // on to ticket-2 and win it rather than wrongly reporting "sold out".
+    prismaMock.ticket.findFirst
+      .mockResolvedValueOnce({ id: 'ticket-1' } as any)
+      .mockResolvedValueOnce({ id: 'ticket-2' } as any);
+    prismaMock.ticket.updateMany
+      .mockResolvedValueOnce({ count: 0 } as any) // lost ticket-1
+      .mockResolvedValueOnce({ count: 1 } as any); // won ticket-2
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildSoldTicketWithRelations({ id: 'ticket-2' }) as any
+    );
+
+    const result = await purchaseTicket('tt-1', 'user-3');
+
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticket.updateMany.mock.calls[1][0].where).toEqual({
+      id: 'ticket-2',
+      status: 'available',
+      userId: null,
+    });
+    expect(result.status).toBe(TicketStatus.SOLD);
+  });
+
+  it('never allocates one ticket row to two concurrent buyers (single-row pool)', async () => {
+    // A real-DB stand-in: an in-memory pool of ONE available row whose
+    // updateMany applies the SAME guard the service relies on. This models the
+    // atomic conditional write — the first matching claim flips the row and
+    // every later guarded claim misses — so two buyers truly contend for it.
+    const rows: any[] = [buildAvailableTicket({ id: 'ticket-1' })];
+
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    prismaMock.ticket.findFirst.mockImplementation(async (args: any) => {
+      const w = args.where;
+      const hit = rows.find(
+        r =>
+          r.ticketTypeId === w.ticketTypeId &&
+          r.status === w.status &&
+          r.userId === w.userId
+      );
+      return hit ? ({ id: hit.id } as any) : null;
+    });
+    prismaMock.ticket.updateMany.mockImplementation(async (args: any) => {
+      const w = args.where;
+      const row = rows.find(
+        r => r.id === w.id && r.status === w.status && r.userId === w.userId
+      );
+      if (!row) return { count: 0 } as any;
+      Object.assign(row, args.data); // atomic flip: available -> sold
+      return { count: 1 } as any;
+    });
+    prismaMock.ticket.findUnique.mockImplementation(async (args: any) => {
+      const row = rows.find(r => r.id === args.where.id);
+      return row ? (buildSoldTicketWithRelations({ ...row }) as any) : null;
+    });
+
+    const outcomes = await Promise.allSettled([
+      purchaseTicket('tt-1', 'user-1'),
+      purchaseTicket('tt-1', 'user-2'),
+    ]);
+
+    const fulfilled = outcomes.filter(o => o.status === 'fulfilled');
+    const rejected = outcomes.filter(o => o.status === 'rejected');
+
+    // Exactly one buyer wins the single row; the other is cleanly refused —
+    // never two winners, never an oversell.
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      message: 'No tickets available for this ticket type',
+      statusCode: 400,
+    });
+
+    // The single row ended up sold to exactly one user, never double-allocated.
+    expect(rows[0].status).toBe('sold');
+    expect(['user-1', 'user-2']).toContain(rows[0].userId);
   });
 
   it('throws on an unknown ticketTypeId', async () => {
@@ -158,7 +265,7 @@ describe('purchaseTicket', () => {
     });
 
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
   });
 });
 

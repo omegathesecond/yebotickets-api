@@ -436,6 +436,63 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
 };
 
 /**
+ * Atomically claim exactly one available ticket of a type for a buyer.
+ *
+ * The race this guards against: two buyers `findFirst` the SAME available row,
+ * then both write it by id — the second write silently steals the first buyer's
+ * ticket and capacity can be exceeded. The fix folds the availability check INTO
+ * the write: a conditional `updateMany` whose WHERE still requires
+ * `status: 'available'` AND `userId: null`. The database evaluates that against
+ * the live row, so for a given row exactly one concurrent writer matches
+ * (`count === 1`) and every other sees `count === 0` — a lock-free
+ * compare-and-set, mirroring the gate check-in guard in `confirmCheckIn`.
+ *
+ * A lost race (`count === 0`) does NOT fail the buyer outright: another row may
+ * still be free, so we loop to the next candidate. The loop is naturally
+ * bounded — each lost race means that row is now `sold`, so the next `findFirst`
+ * (which filters `status: 'available'`) can never return it again; the visible
+ * pool strictly shrinks until we claim a row or it is genuinely empty.
+ *
+ * @returns the claimed ticket (with PURCHASE_INCLUDE relations), or `null` when
+ *   no ticket of this type is available.
+ */
+const claimAvailableTicket = async (ticketTypeId: string, userId: string) => {
+  for (;;) {
+    const candidate = await prisma.ticket.findFirst({
+      where: { ticketTypeId, status: 'available', userId: null },
+      select: { id: true },
+    });
+
+    if (!candidate) {
+      return null;
+    }
+
+    // Conditional claim: only flips the row while it is STILL available and
+    // unowned. count === 1 -> we won; count === 0 -> another buyer beat us to
+    // this exact row between our find and our write.
+    const claim = await prisma.ticket.updateMany({
+      where: { id: candidate.id, status: 'available', userId: null },
+      data: {
+        userId,
+        status: 'sold',
+        purchaseDate: new Date(),
+      },
+    });
+
+    if (claim.count === 0) {
+      continue; // lost this row; try the next available candidate
+    }
+
+    // We own the row; no other writer can match the guard now, so this read
+    // returns our committed sale with the relations needed for delivery.
+    return prisma.ticket.findUnique({
+      where: { id: candidate.id },
+      include: PURCHASE_INCLUDE,
+    });
+  }
+};
+
+/**
  * Purchase a ticket
  *
  * On success this also: generates a QR encoding the canonical
@@ -445,6 +502,9 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
  * delivery does NOT roll back the (paid) purchase and is NOT swallowed — it is
  * surfaced via `delivery.status: 'failed'` so the client can warn the buyer,
  * who still has the QR inline in this response.
+ *
+ * The claim itself is atomic (see `claimAvailableTicket`): concurrent buyers can
+ * never be allocated the same Ticket row and the pool can never be oversold.
  *
  * @param ticketTypeId Ticket type ID
  * @param userId User ID
@@ -464,28 +524,13 @@ export const purchaseTicket = async (
       throw new ApiError('Ticket type not found', 404);
     }
 
-    // Find an available ticket
-    const availableTicket = await prisma.ticket.findFirst({
-      where: {
-        ticketTypeId,
-        status: 'available',
-      },
-    });
+    // Atomically claim one available row (pulling in event + buyer details
+    // needed for delivery). null means the pool is genuinely exhausted.
+    const ticket = await claimAvailableTicket(ticketTypeId, userId);
 
-    if (!availableTicket) {
+    if (!ticket) {
       throw new ApiError('No tickets available for this ticket type', 400);
     }
-
-    // Update the ticket, pulling in event + buyer details needed for delivery.
-    const ticket = await prisma.ticket.update({
-      where: { id: availableTicket.id },
-      data: {
-        userId,
-        status: 'sold',
-        purchaseDate: new Date(),
-      },
-      include: PURCHASE_INCLUDE,
-    });
 
     // Deliver QR + details to the buyer; result captures any failure loudly.
     const delivery = await deliverTicketToBuyer(ticket);
