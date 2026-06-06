@@ -23,6 +23,10 @@ export interface IEvent {
   isPublished: boolean;
   coverImage?: string | null;
   category: string;
+  // Cancellation: set when an organizer/admin cancels the event (refunding all
+  // sold tickets). isCancelled gates the operation idempotently.
+  isCancelled: boolean;
+  cancelledAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

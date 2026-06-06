@@ -10,7 +10,9 @@ import {
   getUserTicketsController,
   verifyTicketController,
   getCheckInDetailsController,
-  confirmCheckInController
+  confirmCheckInController,
+  refundTicketController,
+  cancelEventController
 } from '../controllers/ticket.controller';
 import {
   createTicketTypeValidator,
@@ -18,7 +20,9 @@ import {
   generateTicketsValidator,
   purchaseTicketValidator,
   verifyTicketValidator,
-  checkInLookupValidator
+  checkInLookupValidator,
+  refundTicketValidator,
+  cancelEventValidator
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
@@ -615,6 +619,97 @@ router.post(
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   validate(checkInLookupValidator),
   confirmCheckInController
+);
+
+/**
+ * @swagger
+ * /api/tickets/refund/{ticketId}:
+ *   post:
+ *     summary: Refund and cancel a single ticket
+ *     tags: [Tickets]
+ *     description: >
+ *       Refund a sold ticket via YeboPay (against the stored charge ref) and mark
+ *       it CANCELLED, notifying the holder. Idempotent: an already-cancelled
+ *       ticket is a no-op. Only the owning organizer or an admin may refund. A
+ *       failed YeboPay refund returns 502 and leaves the ticket unchanged (no
+ *       false "refunded").
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: ticketId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID of the ticket to refund
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *                 description: Optional reason recorded on the YeboPay refund
+ *     responses:
+ *       200:
+ *         description: Refund outcome for the ticket
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not the owning organizer / not authorized
+ *       404:
+ *         description: Ticket not found
+ *       502:
+ *         description: YeboPay refund did not succeed (ticket left unchanged)
+ */
+router.post(
+  '/refund/:ticketId',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  validate(refundTicketValidator),
+  refundTicketController
+);
+
+/**
+ * @swagger
+ * /api/tickets/events/{eventId}/cancel:
+ *   post:
+ *     summary: Cancel an event and refund all sold tickets
+ *     tags: [Tickets]
+ *     description: >
+ *       Flag the event cancelled, then for every sold ticket issue a YeboPay
+ *       refund against its stored charge ref, mark it CANCELLED and notify the
+ *       holder. Idempotent + retryable: re-running only re-processes tickets not
+ *       yet cancelled. Only the owning organizer or an admin may cancel. The
+ *       response enumerates each ticket's outcome so refund/notify failures are
+ *       surfaced rather than hidden.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: eventId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID of the event to cancel
+ *     responses:
+ *       200:
+ *         description: Cancellation summary with per-ticket refund outcomes
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not the owning organizer / not authorized
+ *       404:
+ *         description: Event not found
+ */
+router.post(
+  '/events/:eventId/cancel',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  validate(cancelEventValidator),
+  cancelEventController
 );
 
 export default router; 

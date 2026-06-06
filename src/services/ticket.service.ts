@@ -12,10 +12,11 @@ import {
   generateTicketQrDataUrl,
   generateTicketQrBuffer,
 } from './qr.service';
-import { sendImageMessage } from './whatsapp.service';
+import { sendImageMessage, sendTextMessage } from './whatsapp.service';
 import {
   createCharge,
   listPaymentOptions,
+  refundCharge,
   YeboPayHttpError,
   type PaymentOptionsResponse,
 } from './yebopay.service';
@@ -1047,5 +1048,326 @@ export const confirmCheckIn = async (
     console.error('Error in confirmCheckIn service:', error);
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to confirm check-in', 500);
+  }
+};
+
+// ===========================================================================
+// Refunds & event cancellation
+// ===========================================================================
+
+/**
+ * Ticket joined with the holder + event details needed to refund the charge
+ * against YeboPay and notify the holder. Loaded per ticket by the refund flow.
+ */
+const REFUND_INCLUDE = {
+  event: { select: { id: true, title: true, startDate: true } },
+  ticketType: { select: { id: true, name: true } },
+  user: { select: { id: true, name: true, phoneNumber: true } },
+} as const;
+
+/**
+ * Outcome of putting ONE ticket through the refund/cancel flow. Always returned
+ * (never thrown) by the per-ticket worker so a bulk event cancellation can
+ * report a row-by-row summary; the single-ticket endpoint inspects it and throws
+ * on a hard failure so its caller sees a loud error rather than a false success.
+ */
+export interface TicketRefundOutcome {
+  ticketId: string;
+  uniqueCode: string;
+  /**
+   * - `refunded`        money returned via YeboPay, ticket CANCELLED
+   * - `cancelled_free`  free ticket voided, nothing to refund
+   * - `already_handled` idempotent no-op (ticket was already cancelled/refunded)
+   * - `refund_failed`   YeboPay refund did NOT succeed; ticket left untouched
+   */
+  result: 'refunded' | 'cancelled_free' | 'already_handled' | 'refund_failed';
+  amountRefunded?: number;
+  refundRef?: string | null;
+  /** Whether the holder was notified (a notify failure does NOT undo a refund). */
+  notified: boolean;
+  notifyError?: string;
+  error?: string;
+}
+
+/** Compose the cancellation/refund notice sent to the ticket holder. */
+const buildCancellationMessage = (ticket: any, refunded: boolean, amount?: number): string => {
+  const eventTitle = ticket.event?.title ?? 'your event';
+  const lines = [`❌ Your ticket for ${eventTitle} has been cancelled.`];
+  if (refunded) {
+    const amt = typeof amount === 'number' ? ` of ${amount.toFixed(2)} ${TICKET_CURRENCY}` : '';
+    lines.push(`💸 A refund${amt} has been issued to your original payment method.`);
+  }
+  lines.push(`🔑 Ticket code: ${ticket.uniqueCode}`);
+  return lines.join('\n');
+};
+
+/**
+ * Notify the holder that their ticket was cancelled/refunded. Best-effort:
+ * returns the failure rather than throwing, because by this point the money has
+ * ALREADY been returned and we must not roll a successful refund back over a
+ * messaging hiccup — but the failure is surfaced (not swallowed) in the outcome.
+ */
+const notifyHolderOfCancellation = async (
+  ticket: any,
+  refunded: boolean,
+  amount?: number
+): Promise<{ notified: boolean; notifyError?: string }> => {
+  const phone = ticket.user?.phoneNumber;
+  if (!phone) {
+    return { notified: false, notifyError: 'Holder has no phone number on file' };
+  }
+  try {
+    await sendTextMessage(phone, buildCancellationMessage(ticket, refunded, amount));
+    return { notified: true };
+  } catch (error) {
+    console.error('Failed to notify holder of cancellation:', ticket.id, error);
+    return { notified: false, notifyError: errorMessage(error) };
+  }
+};
+
+/**
+ * Refund (if paid) and CANCEL a single sold ticket — idempotently.
+ *
+ * Order matters (CLAUDE.md "no silent fallbacks"): for a PAID ticket we call
+ * YeboPay FIRST and only flip the row to CANCELLED/REFUNDED once the money is
+ * confirmed back. If the refund fails we leave the ticket exactly as it was
+ * (still `sold`) and report `refund_failed` — the holder is never shown as
+ * refunded without the money moving, and a retry (or re-running the event
+ * cancellation) picks the ticket up again.
+ *
+ * Idempotency: a ticket already `cancelled`/`REFUNDED` is a no-op
+ * (`already_handled`); a YeboPay 409 (the charge is no longer in a refundable
+ * state — i.e. it was already refunded) is treated as success so a partial
+ * earlier run can be completed safely. The final write is a guarded updateMany
+ * so two concurrent cancels can never both "win" the same row.
+ *
+ * FREE tickets (no paymentRef / paymentStatus FREE / amountPaid 0) carry no
+ * money, so they are simply voided and the holder notified — no YeboPay call.
+ */
+const refundAndCancelTicket = async (
+  ticket: any,
+  reason: string
+): Promise<TicketRefundOutcome> => {
+  const base = { ticketId: ticket.id, uniqueCode: ticket.uniqueCode };
+
+  // --- Idempotent short-circuit: already cancelled/refunded. ---------------
+  if (ticket.status === 'cancelled' || ticket.paymentStatus === 'REFUNDED') {
+    return { ...base, result: 'already_handled', notified: false };
+  }
+
+  const paid =
+    !!ticket.paymentRef &&
+    ticket.paymentStatus !== 'FREE' &&
+    (ticket.amountPaid ?? 0) > 0;
+
+  // --- Free ticket: nothing to refund, just void + notify. -----------------
+  if (!paid) {
+    const claimed = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { not: 'cancelled' } },
+      data: { status: 'cancelled', cancelledAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      return { ...base, result: 'already_handled', notified: false };
+    }
+    const notify = await notifyHolderOfCancellation(ticket, false);
+    return {
+      ...base,
+      result: 'cancelled_free',
+      notified: notify.notified,
+      notifyError: notify.notifyError,
+    };
+  }
+
+  // --- Paid ticket: refund via YeboPay BEFORE marking cancelled. -----------
+  let refund: { refundRef: string | null; amount: number };
+  try {
+    const res = await refundCharge({ chargeId: ticket.paymentRef, reason });
+    refund = {
+      refundRef: res.processor_ref ?? res.charge_id,
+      amount: Number.parseFloat(res.refunded_amount),
+    };
+  } catch (error) {
+    // A 409 means the charge is no longer refundable; for a charge we previously
+    // SUCCEEDED-charged, that is YeboPay telling us it is ALREADY refunded.
+    // Treat as an idempotent success so a half-finished run can complete.
+    if (error instanceof YeboPayHttpError && error.status === 409) {
+      refund = { refundRef: ticket.paymentRef, amount: ticket.amountPaid ?? 0 };
+    } else {
+      console.error('YeboPay refund failed for ticket', ticket.id, error);
+      const detail =
+        error instanceof YeboPayHttpError ? `YeboPay ${error.status}` : errorMessage(error);
+      return {
+        ...base,
+        result: 'refund_failed',
+        notified: false,
+        error: `Refund failed (${detail}). Ticket left unchanged — no refund recorded.`,
+      };
+    }
+  }
+
+  // Money is back — now (and only now) record CANCELLED + REFUNDED. Guarded on
+  // status so two concurrent cancels cannot both finalize the same row.
+  const claimed = await prisma.ticket.updateMany({
+    where: { id: ticket.id, status: { not: 'cancelled' } },
+    data: {
+      status: 'cancelled',
+      paymentStatus: 'REFUNDED',
+      refundRef: refund.refundRef,
+      refundedAt: new Date(),
+      cancelledAt: new Date(),
+    },
+  });
+  if (claimed.count === 0) {
+    // A concurrent cancel finalized this row first; the YeboPay 409 guard means
+    // the money was only ever returned once.
+    return { ...base, result: 'already_handled', notified: false };
+  }
+
+  const notify = await notifyHolderOfCancellation(ticket, true, refund.amount);
+  return {
+    ...base,
+    result: 'refunded',
+    amountRefunded: refund.amount,
+    refundRef: refund.refundRef,
+    notified: notify.notified,
+    notifyError: notify.notifyError,
+  };
+};
+
+/**
+ * Refund + cancel a SINGLE ticket.
+ *
+ * Authorization: only the owning organizer (assertEventAccess on the ticket's
+ * event) or an admin. Returns the per-ticket outcome; throws loudly (502) when
+ * the YeboPay refund did not succeed so the caller sees the failure rather than
+ * a false "refunded". An already-cancelled ticket returns `already_handled`
+ * (200) — re-calling is safe and never double-refunds.
+ *
+ * @param ticketId Ticket database id
+ * @param requester Authenticated organizer/admin
+ * @param reason Optional human-readable reason recorded on the YeboPay refund
+ */
+export const refundTicket = async (
+  ticketId: string,
+  requester: CheckInRequester,
+  reason?: string
+): Promise<TicketRefundOutcome> => {
+  try {
+    const ticket = await prisma.ticket.findUnique({
+      where: { id: ticketId },
+      include: REFUND_INCLUDE,
+    });
+    if (!ticket) {
+      throw new ApiError('Ticket not found', 404);
+    }
+
+    // Ownership guard — reuse the same check the gate check-in flow uses so an
+    // organizer can only refund tickets for their OWN events (admins: any).
+    await assertEventAccess(ticket.eventId, requester);
+
+    const outcome = await refundAndCancelTicket(
+      ticket,
+      reason || `Ticket ${ticket.uniqueCode} refunded by organizer`
+    );
+
+    if (outcome.result === 'refund_failed') {
+      throw new ApiError(outcome.error || 'Refund failed', 502);
+    }
+    return outcome;
+  } catch (error) {
+    console.error('Error in refundTicket service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to refund ticket', 500);
+  }
+};
+
+/**
+ * Summary returned by cancelEvent: the event is flagged cancelled and every sold
+ * ticket is refunded + voided. Per-ticket outcomes are enumerated so any refund
+ * or notify failure is surfaced loudly (CLAUDE.md) rather than hidden behind an
+ * overall "success".
+ */
+export interface EventCancellationSummary {
+  eventId: string;
+  cancelled: true;
+  totalProcessed: number;
+  refunded: number;
+  cancelledFree: number;
+  alreadyHandled: number;
+  failed: number;
+  notifyFailures: number;
+  outcomes: TicketRefundOutcome[];
+}
+
+/**
+ * Cancel an EVENT: refund every sold ticket via YeboPay and mark each CANCELLED,
+ * notifying each holder.
+ *
+ * Authorization: only the owning organizer (assertEventAccess) or an admin.
+ *
+ * Idempotent + retryable: the event is flagged `isCancelled` up front so it
+ * stops selling/listing even if some refunds need a retry, and re-running only
+ * re-processes tickets that are not yet cancelled (e.g. ones whose refund failed
+ * earlier). Failures are NOT swallowed — each failed refund is reported in
+ * `outcomes` and counted in `failed`, and those tickets stay `sold` (never a
+ * false "refunded") until a successful retry.
+ *
+ * @param eventId Event database id
+ * @param requester Authenticated organizer/admin
+ */
+export const cancelEvent = async (
+  eventId: string,
+  requester: CheckInRequester
+): Promise<EventCancellationSummary> => {
+  try {
+    await assertEventAccess(eventId, requester);
+
+    // Flag the event cancelled (idempotent) — stops further sales/listing even
+    // if some refunds below need a retry.
+    const event = await prisma.event.update({
+      where: { id: eventId },
+      data: { isCancelled: true, cancelledAt: new Date() },
+    });
+
+    // Every ticket that still represents a live sale. Reserved rows are mid
+    // purchase (released/finalized by their own flow), so we target 'sold'.
+    const tickets = await prisma.ticket.findMany({
+      where: { eventId, status: 'sold' },
+      include: REFUND_INCLUDE,
+    });
+
+    const reason = `Event "${event.title}" cancelled by organizer`;
+
+    // Process sequentially: keeps refund ordering deterministic for
+    // reconciliation and avoids hammering the YeboPay gateway in a burst.
+    const outcomes: TicketRefundOutcome[] = [];
+    for (const ticket of tickets) {
+      outcomes.push(await refundAndCancelTicket(ticket, reason));
+    }
+
+    const summary: EventCancellationSummary = {
+      eventId,
+      cancelled: true,
+      totalProcessed: outcomes.length,
+      refunded: outcomes.filter(o => o.result === 'refunded').length,
+      cancelledFree: outcomes.filter(o => o.result === 'cancelled_free').length,
+      alreadyHandled: outcomes.filter(o => o.result === 'already_handled').length,
+      failed: outcomes.filter(o => o.result === 'refund_failed').length,
+      notifyFailures: outcomes.filter(o => o.notifyError).length,
+      outcomes,
+    };
+
+    if (summary.failed > 0) {
+      console.error(
+        `cancelEvent ${eventId}: ${summary.failed}/${summary.totalProcessed} ticket refunds FAILED`,
+        outcomes.filter(o => o.result === 'refund_failed')
+      );
+    }
+
+    return summary;
+  } catch (error) {
+    console.error('Error in cancelEvent service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to cancel event', 500);
   }
 };

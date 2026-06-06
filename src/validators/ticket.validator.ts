@@ -200,4 +200,30 @@ export const checkInLookupValidator = [
     .withMessage('Event ID is required')
     .isString()
     .withMessage('Event ID must be a string'),
-]; 
+];
+
+// Refund a single ticket: POST /api/tickets/refund/:ticketId. ticketId is the
+// ticket's UUID; an optional reason is recorded on the YeboPay refund.
+export const refundTicketValidator = [
+  param('ticketId')
+    .notEmpty()
+    .withMessage('Ticket ID is required')
+    .isUUID()
+    .withMessage('Invalid ticket ID format'),
+
+  body('reason')
+    .optional()
+    .isString()
+    .withMessage('reason must be a string')
+    .isLength({ max: 500 })
+    .withMessage('reason must be at most 500 characters'),
+];
+
+// Cancel an event: POST /api/tickets/events/:eventId/cancel. eventId is a UUID.
+export const cancelEventValidator = [
+  param('eventId')
+    .notEmpty()
+    .withMessage('Event ID is required')
+    .isUUID()
+    .withMessage('Invalid event ID format'),
+];
