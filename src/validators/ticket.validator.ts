@@ -117,10 +117,14 @@ export const generateTicketsValidator = [
 ];
 
 export const purchaseTicketValidator = [
+  // Ticket type ids are Prisma `uuid()` values (see prisma/schema.prisma), NOT
+  // Mongo ObjectIds. Validating with isMongoId() rejected every real id with a
+  // 400 and blocked the public buyer purchase flow end-to-end. Same fix the
+  // check-in lookup validator already applies for its UUID params.
   param('ticketTypeId')
     .notEmpty()
     .withMessage('Ticket type ID is required')
-    .isMongoId()
+    .isUUID()
     .withMessage('Invalid ticket type ID format'),
 ];
 
