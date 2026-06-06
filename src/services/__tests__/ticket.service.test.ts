@@ -12,8 +12,8 @@ jest.mock('../../config/prisma', () => ({
 
 // --- Mock the side-effecting collaborators ---------------------------------
 // purchaseTicket generates a QR and delivers it over WhatsApp. We stub both so
-// the unit under test stays focused on the sell/check-in logic and never makes
-// a network call or renders a real image.
+// the unit under test stays focused on the sell/charge/check-in logic and never
+// makes a network call or renders a real image.
 jest.mock('../qr.service', () => ({
   buildTicketQrPayload: jest.fn((eventId: string, uniqueCode: string) => ({
     eventId,
@@ -27,20 +27,40 @@ jest.mock('../whatsapp.service', () => ({
   sendImageMessage: jest.fn(async () => ({ ok: true })),
 }));
 
+// Mock the YeboPay client so the purchase flow never hits the gateway. The
+// payment outcome (SUCCEEDED / FAILED / PENDING / throw) is driven per-test.
+jest.mock('../yebopay.service', () => ({
+  createCharge: jest.fn(),
+  listPaymentOptions: jest.fn(),
+  YeboPayHttpError: class YeboPayHttpError extends Error {
+    constructor(
+      public readonly status: number,
+      public readonly body: unknown,
+      public readonly path: string
+    ) {
+      super(`YeboPay ${path} failed: ${status}`);
+      this.name = 'YeboPayHttpError';
+    }
+  },
+}));
+
 // Imports must come AFTER the jest.mock calls so the mocked modules are wired in.
 import prisma from '../../config/prisma';
 import { purchaseTicket, verifyTicket } from '../ticket.service';
 import { sendImageMessage } from '../whatsapp.service';
+import { createCharge } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 const sendImageMessageMock = sendImageMessage as jest.MockedFunction<typeof sendImageMessage>;
+const createChargeMock = createCharge as jest.MockedFunction<typeof createCharge>;
 
 beforeEach(() => {
   // Reset return-value stubs between tests (clearMocks in jest.config only
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
   sendImageMessageMock.mockResolvedValue({ ok: true } as any);
+  createChargeMock.mockReset();
 });
 
 // --- Fixtures ---------------------------------------------------------------
@@ -69,13 +89,17 @@ const buildAvailableTicket = (over: Partial<any> = {}) => ({
   uniqueCode: 'ABC123',
   isCheckedIn: false,
   checkedInAt: null,
+  paymentRef: null,
+  paymentStatus: null,
+  amountPaid: null,
   createdAt: new Date('2026-01-01T00:00:00Z'),
   updatedAt: new Date('2026-01-01T00:00:00Z'),
   ...over,
 });
 
-// A ticket as returned by prisma.ticket.update with PURCHASE_INCLUDE relations.
-const buildSoldTicketWithRelations = (over: Partial<any> = {}) => ({
+// A ticket as returned by prisma.ticket.findUnique with PURCHASE_INCLUDE
+// relations (after a claim/reserve/finalize).
+const buildTicketWithRelations = (over: Partial<any> = {}) => ({
   ...buildAvailableTicket({ userId: 'user-1', status: 'sold', purchaseDate: new Date() }),
   event: {
     id: 'event-1',
@@ -110,53 +134,194 @@ const buildCheckInTicket = (over: Partial<any> = {}) => ({
   ...over,
 });
 
-describe('purchaseTicket', () => {
-  it('atomically claims an available ticket: guarded updateMany sets sold/userId/purchaseDate', async () => {
+// A SUCCEEDED YeboPay charge result.
+const buildCharge = (over: Partial<any> = {}) => ({
+  id: 'chg_1',
+  status: 'SUCCEEDED',
+  amount: '100',
+  currency: 'SZL',
+  payment_instrument_id: null,
+  provider_code: 'mtn-momo-sz',
+  external_ref: 'ext-1',
+  failure_reason: null,
+  refunded_amount: '0',
+  description: null,
+  created_at: '2026-06-06T00:00:00Z',
+  ...over,
+});
+
+// A valid one-off mobile-money payment input.
+const PAYMENT = {
+  providerCode: 'mtn-momo-sz',
+  phone: '+26878000000',
+  country: 'SZ',
+  idempotencyKey: 'idem-1',
+};
+
+describe('purchaseTicket — payment + atomic claim', () => {
+  it('reserves a ticket, charges via YeboPay, and finalizes to sold with the charge ref on SUCCEEDED', async () => {
     prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    // Reserve candidate then both reserve + finalize claims win (count 1).
     prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
-    // count === 1 -> this buyer won the row.
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
-    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldTicketWithRelations() as any);
+    prismaMock.ticket.findUnique
+      .mockResolvedValueOnce(buildTicketWithRelations({ status: 'reserved' }) as any) // reserve re-fetch
+      .mockResolvedValueOnce(
+        buildTicketWithRelations({
+          status: 'sold',
+          paymentRef: 'chg_1',
+          paymentStatus: 'SUCCEEDED',
+          amountPaid: 100,
+        }) as any
+      ); // finalize re-fetch
+    createChargeMock.mockResolvedValue(buildCharge() as any);
 
-    const result = await purchaseTicket('tt-1', 'user-1');
+    const result = await purchaseTicket('tt-1', 'user-1', PAYMENT);
 
-    // The claim is a CONDITIONAL update: it only matches while the row is still
-    // available and unowned — this is what makes concurrent claims safe.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
-    const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
-    expect(claimArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
-    expect(claimArg.data).toMatchObject({
-      userId: 'user-1',
+    // Charged BEFORE issuing, for the ticket-type price, against the buyer.
+    expect(createChargeMock).toHaveBeenCalledTimes(1);
+    const chargeArg = createChargeMock.mock.calls[0][0];
+    expect(chargeArg).toMatchObject({
+      amount: 100,
+      currency: 'SZL',
+      yeboidSub: 'user-1',
+      providerCode: 'mtn-momo-sz',
+      phone: '+26878000000',
+      country: 'SZ',
+      idempotencyKey: 'idem-1',
+    });
+
+    // Two guarded writes: first reserves (available -> reserved), then finalizes
+    // (reserved -> sold + payment ref). Both are conditional updateMany — a plain
+    // update by id would reintroduce the oversell race.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(reserveArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
+    expect(reserveArg.data).toMatchObject({ userId: 'user-1', status: 'reserved' });
+    const finalizeArg = prismaMock.ticket.updateMany.mock.calls[1][0];
+    expect(finalizeArg.where).toEqual({ id: 'ticket-1', status: 'reserved', userId: 'user-1' });
+    expect(finalizeArg.data).toMatchObject({
       status: 'sold',
       purchaseDate: expect.any(Date),
+      paymentRef: 'chg_1',
+      paymentStatus: 'SUCCEEDED',
+      amountPaid: 100,
     });
-    // A plain unconditional update by id would reintroduce the race — forbid it.
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
 
-    // The returned ticket reflects the sale and carries a QR for the buyer.
+    // The returned ticket reflects the paid sale and carries a QR for the buyer.
     expect(result.status).toBe(TicketStatus.SOLD);
-    expect(result.userId).toBe('user-1');
-    expect(result.purchaseDate).toBeInstanceOf(Date);
+    expect(result.paymentRef).toBe('chg_1');
+    expect(result.amountPaid).toBe(100);
     expect(result.qrCode).toBe('data:image/png;base64,FAKEQR');
     expect(result.delivery).toEqual({ channel: 'whatsapp', status: 'sent' });
   });
 
-  it('throws when no available ticket exists for the ticket type', async () => {
+  it('rejects a priced purchase with no payment details (400) and never reserves or charges', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+
+    await expect(purchaseTicket('tt-1', 'user-1')).rejects.toMatchObject({
+      statusCode: 400,
+    });
+
+    expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('a FAILED charge issues NO ticket, releases the reservation, and throws (402)', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any); // reserve + release
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildTicketWithRelations({ status: 'reserved' }) as any
+    );
+    createChargeMock.mockResolvedValue(
+      buildCharge({ status: 'FAILED', failure_reason: 'insufficient funds' }) as any
+    );
+
+    await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+      statusCode: 402,
+    });
+
+    // It reserved (updateMany #1) then RELEASED the hold (updateMany #2 back to
+    // available) — it never finalized a sale and never delivered a ticket.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(reserveArg.data).toMatchObject({ status: 'reserved' });
+    const releaseArg = prismaMock.ticket.updateMany.mock.calls[1][0];
+    expect(releaseArg.where).toEqual({ id: 'ticket-1', status: 'reserved', userId: 'user-1' });
+    expect(releaseArg.data).toEqual({ status: 'available', userId: null });
+    // Crucially: no write ever flips the row to 'sold' on a failed charge.
+    const soldWrites = prismaMock.ticket.updateMany.mock.calls.filter(
+      (c: any) => c[0]?.data?.status === 'sold'
+    );
+    expect(soldWrites).toHaveLength(0);
+    expect(sendImageMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('a PENDING charge also issues NO ticket and releases the reservation (402)', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildTicketWithRelations({ status: 'reserved' }) as any
+    );
+    createChargeMock.mockResolvedValue(buildCharge({ status: 'PENDING' }) as any);
+
+    await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+      statusCode: 402,
+    });
+    const soldWrites = prismaMock.ticket.updateMany.mock.calls.filter(
+      (c: any) => c[0]?.data?.status === 'sold'
+    );
+    expect(soldWrites).toHaveLength(0);
+    expect(sendImageMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('a free (price 0) ticket skips the charge and is issued straight to sold', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price: 0 }) as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildTicketWithRelations({ status: 'sold', paymentStatus: 'FREE', amountPaid: 0 }) as any
+    );
+
+    const result = await purchaseTicket('tt-1', 'user-1');
+
+    // No money is moved for a free ticket.
+    expect(createChargeMock).not.toHaveBeenCalled();
+    // One guarded claim straight to sold, tagged FREE.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(claimArg.data).toMatchObject({
+      userId: 'user-1',
+      status: 'sold',
+      purchaseDate: expect.any(Date),
+      paymentStatus: 'FREE',
+      amountPaid: 0,
+    });
+    expect(result.status).toBe(TicketStatus.SOLD);
+    expect(result.paymentStatus).toBe('FREE');
+  });
+
+  it('throws when no available ticket exists for the ticket type (no charge)', async () => {
     prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
     prismaMock.ticket.findFirst.mockResolvedValue(null);
 
-    await expect(purchaseTicket('tt-1', 'user-1')).rejects.toMatchObject({
+    await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
       message: 'No tickets available for this ticket type',
       statusCode: 400,
     });
 
-    // No claim must be attempted when nothing is available.
+    // No reservation, and crucially no charge, when nothing is available.
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
   });
 
-  it('fails the loser of a concurrent race: a guarded claim on an already-claimed row matches no rows', async () => {
+  it('fails the loser of a concurrent race: a guarded reserve on an already-taken row matches no rows', async () => {
     prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
-    // Buyer reads ticket-1 as available, but by the time the guarded claim runs
+    // Buyer reads ticket-1 as available, but by the time the guarded reserve runs
     // another buyer has already taken it, so updateMany matches 0 rows. With no
     // other ticket free, the retry finds nothing and the buyer is refused.
     prismaMock.ticket.findFirst
@@ -164,42 +329,18 @@ describe('purchaseTicket', () => {
       .mockResolvedValueOnce(null); // ...but the pool is now exhausted on retry
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 0 } as any);
 
-    await expect(purchaseTicket('tt-1', 'user-2')).rejects.toMatchObject({
+    await expect(purchaseTicket('tt-1', 'user-2', PAYMENT)).rejects.toMatchObject({
       message: 'No tickets available for this ticket type',
       statusCode: 400,
     });
 
-    // It DID attempt the guarded claim and lost (count 0), then never fabricated
-    // a sale — findUnique (the post-win re-fetch) must not run for a loser.
+    // It attempted the guarded reserve and lost (count 0), then never charged and
+    // never fabricated a sale — findUnique (the post-win re-fetch) must not run.
     expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
-    const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
-    expect(claimArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
+    const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(reserveArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
     expect(prismaMock.ticket.findUnique).not.toHaveBeenCalled();
-  });
-
-  it('retries past a lost row and claims the next available ticket instead of failing', async () => {
-    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
-    // First candidate ticket-1 is stolen mid-claim (count 0); the loop must move
-    // on to ticket-2 and win it rather than wrongly reporting "sold out".
-    prismaMock.ticket.findFirst
-      .mockResolvedValueOnce({ id: 'ticket-1' } as any)
-      .mockResolvedValueOnce({ id: 'ticket-2' } as any);
-    prismaMock.ticket.updateMany
-      .mockResolvedValueOnce({ count: 0 } as any) // lost ticket-1
-      .mockResolvedValueOnce({ count: 1 } as any); // won ticket-2
-    prismaMock.ticket.findUnique.mockResolvedValue(
-      buildSoldTicketWithRelations({ id: 'ticket-2' }) as any
-    );
-
-    const result = await purchaseTicket('tt-1', 'user-3');
-
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
-    expect(prismaMock.ticket.updateMany.mock.calls[1][0].where).toEqual({
-      id: 'ticket-2',
-      status: 'available',
-      userId: null,
-    });
-    expect(result.status).toBe(TicketStatus.SOLD);
+    expect(createChargeMock).not.toHaveBeenCalled();
   });
 
   it('never allocates one ticket row to two concurrent buyers (single-row pool)', async () => {
@@ -226,17 +367,18 @@ describe('purchaseTicket', () => {
         r => r.id === w.id && r.status === w.status && r.userId === w.userId
       );
       if (!row) return { count: 0 } as any;
-      Object.assign(row, args.data); // atomic flip: available -> sold
+      Object.assign(row, args.data); // atomic flip (available->reserved->sold)
       return { count: 1 } as any;
     });
     prismaMock.ticket.findUnique.mockImplementation(async (args: any) => {
       const row = rows.find(r => r.id === args.where.id);
-      return row ? (buildSoldTicketWithRelations({ ...row }) as any) : null;
+      return row ? (buildTicketWithRelations({ ...row }) as any) : null;
     });
+    createChargeMock.mockResolvedValue(buildCharge() as any);
 
     const outcomes = await Promise.allSettled([
-      purchaseTicket('tt-1', 'user-1'),
-      purchaseTicket('tt-1', 'user-2'),
+      purchaseTicket('tt-1', 'user-1', { ...PAYMENT, idempotencyKey: 'k1' }),
+      purchaseTicket('tt-1', 'user-2', { ...PAYMENT, idempotencyKey: 'k2' }),
     ]);
 
     const fulfilled = outcomes.filter(o => o.status === 'fulfilled');
@@ -251,21 +393,24 @@ describe('purchaseTicket', () => {
       statusCode: 400,
     });
 
-    // The single row ended up sold to exactly one user, never double-allocated.
+    // The single row ended up sold to exactly one user, never double-allocated,
+    // and only that one winner was charged.
     expect(rows[0].status).toBe('sold');
     expect(['user-1', 'user-2']).toContain(rows[0].userId);
+    expect(createChargeMock).toHaveBeenCalledTimes(1);
   });
 
   it('throws on an unknown ticketTypeId', async () => {
     prismaMock.ticketType.findUnique.mockResolvedValue(null);
 
-    await expect(purchaseTicket('does-not-exist', 'user-1')).rejects.toMatchObject({
+    await expect(purchaseTicket('does-not-exist', 'user-1', PAYMENT)).rejects.toMatchObject({
       message: 'Ticket type not found',
       statusCode: 404,
     });
 
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
   });
 });
 

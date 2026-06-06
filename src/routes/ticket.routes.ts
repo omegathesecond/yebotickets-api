@@ -6,6 +6,7 @@ import {
   deleteTicketTypeController,
   generateTicketsController,
   purchaseTicketController,
+  getPaymentOptionsController,
   getUserTicketsController,
   verifyTicketController,
   getCheckInDetailsController,
@@ -60,6 +61,36 @@ const router = express.Router();
  *               $ref: '#/components/schemas/Error'
  */
 router.get('/types/event/:eventId', getTicketTypesController);
+
+/**
+ * @swagger
+ * /api/tickets/payment-options:
+ *   get:
+ *     summary: List YeboPay payment options for the buyer
+ *     tags: [Tickets]
+ *     description: >
+ *       Returns the active payment rails for a country (plus the buyer's saved
+ *       methods) so the app can render the payment picker without hardcoding
+ *       providers. Backed by YeboPay GET /v1/payment-options.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: country
+ *         required: false
+ *         schema:
+ *           type: string
+ *           example: SZ
+ *         description: ISO country code (defaults to SZ)
+ *     responses:
+ *       200:
+ *         description: Payment options and saved methods
+ *       401:
+ *         description: Not authenticated
+ *       502:
+ *         description: Payment options could not be loaded from YeboPay
+ */
+router.get('/payment-options', protect, getPaymentOptionsController);
 
 /**
  * @swagger

@@ -6,10 +6,12 @@ import {
   deleteTicketType,
   generateTickets,
   purchaseTicket,
+  getPaymentOptions,
   getUserTickets,
   verifyTicket,
   getCheckInDetails,
-  confirmCheckIn
+  confirmCheckIn,
+  PurchasePaymentInput
 } from '../services/ticket.service';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
@@ -126,12 +128,49 @@ export const purchaseTicketController = async (req: Request, res: Response, next
 
     const { ticketTypeId } = req.params;
     const userId = authReq.user.id;
-    
-    const ticket = await purchaseTicket(ticketTypeId, userId);
-    
+
+    // Payment details forwarded to YeboPay. Optional for free (price 0) tickets;
+    // the service rejects a priced purchase that arrives without them.
+    const { paymentMethodId, providerCode, country, phone, cardToken, idempotencyKey } =
+      req.body ?? {};
+    const payment: PurchasePaymentInput = {
+      paymentMethodId,
+      providerCode,
+      country,
+      phone,
+      cardToken,
+      idempotencyKey,
+    };
+
+    const ticket = await purchaseTicket(ticketTypeId, userId, payment);
+
     res.status(201).json({
       success: true,
       data: ticket,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * List the YeboPay payment options for the buyer (country rails + saved
+ * methods) so the app can render the payment picker without hardcoding
+ * providers. GET /api/tickets/payment-options?country=SZ
+ */
+export const getPaymentOptionsController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const country = typeof req.query.country === 'string' ? req.query.country : undefined;
+    const options = await getPaymentOptions(authReq.user.id, country);
+
+    res.status(200).json({
+      success: true,
+      data: options,
     });
   } catch (error) {
     next(error);
