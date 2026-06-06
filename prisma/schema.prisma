@@ -145,7 +145,16 @@ model Ticket {
   uniqueCode    String       @unique
   isCheckedIn   Boolean      @default(false)
   checkedInAt   DateTime?
-  
+
+  // YeboPay charge reference, persisted when the ticket is sold. Nullable: free
+  // (price 0) and unsold tickets have none. paymentRef is the YeboPay charge id
+  // used for reconciliation/refunds; paymentStatus is its status at sale time
+  // (SUCCEEDED for a paid ticket, FREE for a price-0 ticket); amountPaid is what
+  // was actually charged (0 for free tickets).
+  paymentRef    String?
+  paymentStatus String?
+  amountPaid    Float?
+
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
   

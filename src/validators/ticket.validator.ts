@@ -126,6 +126,49 @@ export const purchaseTicketValidator = [
     .withMessage('Ticket type ID is required')
     .isUUID()
     .withMessage('Invalid ticket type ID format'),
+
+  // Payment details (forwarded to YeboPay). All optional at this layer because
+  // free (price 0) tickets carry no payment; the service enforces that a PRICED
+  // ticket must arrive with a usable instrument. Here we only type-check shape.
+  body('paymentMethodId')
+    .optional()
+    .isString()
+    .withMessage('paymentMethodId must be a string'),
+
+  body('providerCode')
+    .optional()
+    .isString()
+    .withMessage('providerCode must be a string'),
+
+  body('country')
+    .optional()
+    .isISO31661Alpha2()
+    .withMessage('country must be a 2-letter ISO code'),
+
+  body('phone')
+    .optional()
+    .isString()
+    .withMessage('phone must be a string'),
+
+  body('cardToken')
+    .optional()
+    .isString()
+    .withMessage('cardToken must be a string'),
+
+  body('idempotencyKey')
+    .optional()
+    .isString()
+    .withMessage('idempotencyKey must be a string'),
+
+  // Mobile-money rails need a phone; if a one-off providerCode is given without
+  // a saved paymentMethodId and without a card token, require the phone so we
+  // fail fast with a clear 400 instead of a downstream YeboPay error.
+  body('phone')
+    .if(body('providerCode').exists({ checkFalsy: true }))
+    .if(body('paymentMethodId').not().exists({ checkFalsy: true }))
+    .if(body('cardToken').not().exists({ checkFalsy: true }))
+    .notEmpty()
+    .withMessage('phone is required for this payment method'),
 ];
 
 export const verifyTicketValidator = [
