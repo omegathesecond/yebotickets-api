@@ -9,7 +9,8 @@ import {
   getUserTicketsController,
   verifyTicketController,
   getCheckInDetailsController,
-  confirmCheckInController
+  confirmCheckInController,
+  getCheckInManifestController
 } from '../controllers/ticket.controller';
 import {
   createTicketTypeValidator,
@@ -584,6 +585,41 @@ router.post(
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   validate(checkInLookupValidator),
   confirmCheckInController
+);
+
+/**
+ * @swagger
+ * /api/tickets/check-in-manifest/{eventId}:
+ *   get:
+ *     summary: Offline check-in manifest for an event
+ *     tags: [Tickets]
+ *     description: >
+ *       Return every sold ticket for an event (uniqueCode, holder and
+ *       checked-in state) so the gate scanner can validate scans and guard
+ *       against double check-in while offline. Organizer/admin scoped.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: eventId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: The event's sold-ticket manifest
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not authorized
+ *       404:
+ *         description: Event not found
+ */
+router.get(
+  '/check-in-manifest/:eventId',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getCheckInManifestController
 );
 
 export default router; 

@@ -9,7 +9,8 @@ import {
   getUserTickets,
   verifyTicket,
   getCheckInDetails,
-  confirmCheckIn
+  confirmCheckIn,
+  getEventCheckInManifest
 } from '../services/ticket.service';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
@@ -219,9 +220,42 @@ export const confirmCheckInController = async (req: Request, res: Response, next
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const { ticketId, eventId } = req.body;
+    const { ticketId, eventId, checkedInAt } = req.body;
 
-    const result = await confirmCheckIn(ticketId, eventId, {
+    const result = await confirmCheckIn(
+      ticketId,
+      eventId,
+      {
+        id: authReq.user.id,
+        role: authReq.user.role,
+      },
+      checkedInAt,
+    );
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Offline manifest: returns every sold ticket for an event (uniqueCode + holder
+ * + checked-in state) so the gate scanner can validate scans and guard against
+ * double check-in while offline. Organizer/admin scoped.
+ */
+export const getCheckInManifestController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { eventId } = req.params;
+
+    const result = await getEventCheckInManifest(eventId, {
       id: authReq.user.id,
       role: authReq.user.role,
     });

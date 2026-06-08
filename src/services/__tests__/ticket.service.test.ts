@@ -29,7 +29,12 @@ jest.mock('../whatsapp.service', () => ({
 
 // Imports must come AFTER the jest.mock calls so the mocked modules are wired in.
 import prisma from '../../config/prisma';
-import { purchaseTicket, verifyTicket } from '../ticket.service';
+import {
+  purchaseTicket,
+  verifyTicket,
+  confirmCheckIn,
+  getEventCheckInManifest,
+} from '../ticket.service';
 import { sendImageMessage } from '../whatsapp.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
@@ -236,5 +241,105 @@ describe('verifyTicket (gate check-in guard)', () => {
     expect(findArg.where.eventId).toBe('event-99');
     // The code may be matched as either the db id or the uniqueCode.
     expect(findArg.where.OR).toEqual([{ id: 'ABC123' }, { uniqueCode: 'ABC123' }]);
+  });
+});
+
+describe('confirmCheckIn (offline replay + earliest-wins)', () => {
+  const organizer = { id: 'org-1', role: 'organizer' };
+
+  beforeEach(() => {
+    // assertEventAccess: the requester owns the event.
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+  });
+
+  it('records the offline timestamp when one is supplied (earliest wins)', async () => {
+    prismaMock.ticket.findFirst.mockResolvedValue(buildCheckInTicket() as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date('2026-06-08T10:00:00Z') }) as any,
+    );
+
+    const result = await confirmCheckIn('ABC123', 'event-1', organizer, '2026-06-08T10:00:00Z');
+
+    expect(result.valid).toBe(true);
+    const updateArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    // The claim writes the supplied offline time, not "now".
+    expect(updateArg.data.checkedInAt).toEqual(new Date('2026-06-08T10:00:00Z'));
+  });
+
+  it('reconciles (no error, no double check-in) when the server already has it', async () => {
+    // Ticket already checked in on the server (e.g. another gate scanned it).
+    prismaMock.ticket.findFirst.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date('2026-06-08T12:00:00Z') }) as any,
+    );
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date('2026-06-08T10:00:00Z') }) as any,
+    );
+
+    // Our offline check-in was EARLIER -> earliest wins, recorded time moves back.
+    const result = await confirmCheckIn('ABC123', 'event-1', organizer, '2026-06-08T10:00:00Z');
+
+    expect(result.valid).toBe(true);
+    expect(result.message).toMatch(/reconciled/i);
+    // No new claim is attempted; the recorded time is corrected earlier.
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    const updateArg = prismaMock.ticket.update.mock.calls[0][0];
+    expect(updateArg.data.checkedInAt).toEqual(new Date('2026-06-08T10:00:00Z'));
+  });
+
+  it('does NOT move the recorded time later when offline scan was after', async () => {
+    prismaMock.ticket.findFirst.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date('2026-06-08T12:00:00Z') }) as any,
+    );
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date('2026-06-08T12:00:00Z') }) as any,
+    );
+
+    const result = await confirmCheckIn('ABC123', 'event-1', organizer, '2026-06-08T14:00:00Z');
+
+    expect(result.valid).toBe(true);
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it('still rejects an already-checked-in ticket on the interactive path (no timestamp)', async () => {
+    prismaMock.ticket.findFirst.mockResolvedValue(
+      buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date() }) as any,
+    );
+
+    await expect(confirmCheckIn('ABC123', 'event-1', organizer)).rejects.toThrow(
+      /already been used/i,
+    );
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('getEventCheckInManifest', () => {
+  it('returns the sold-ticket manifest for an event the organizer owns', async () => {
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+    prismaMock.ticket.findMany.mockResolvedValue([
+      buildCheckInTicket(),
+      buildCheckInTicket({ id: 'ticket-2', uniqueCode: 'XYZ789', isCheckedIn: true }),
+    ] as any);
+
+    const result = await getEventCheckInManifest('event-1', { id: 'org-1', role: 'organizer' });
+
+    expect(result.eventId).toBe('event-1');
+    expect(result.tickets).toHaveLength(2);
+    expect(result.tickets[0].uniqueCode).toBe('ABC123');
+    // Already-checked-in tickets surface as status 'used' so the cache knows.
+    expect(result.tickets[1].status).toBe('used');
+    expect(result.tickets[1].isCheckedIn).toBe(true);
+    // Only sold tickets are pulled (the admissible set).
+    const findArg = prismaMock.ticket.findMany.mock.calls[0][0];
+    expect(findArg.where).toEqual({ eventId: 'event-1', status: 'sold' });
+  });
+
+  it('refuses a non-owner organizer (cross-event access)', async () => {
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'someone-else' } as any);
+
+    await expect(
+      getEventCheckInManifest('event-1', { id: 'org-1', role: 'organizer' }),
+    ).rejects.toThrow(/permission/i);
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
   });
 });

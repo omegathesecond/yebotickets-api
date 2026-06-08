@@ -765,7 +765,8 @@ export const getCheckInDetails = async (
 export const confirmCheckIn = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester,
+  checkedInAt?: string
 ): Promise<{ ticket: any; valid: boolean; message: string }> => {
   try {
     await assertEventAccess(eventId, requester);
@@ -773,7 +774,19 @@ export const confirmCheckIn = async (
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
     const evaluation = evaluateCheckIn(ticket);
 
+    // A replayed OFFLINE check-in carries the real (earlier) moment it happened.
+    // Recording that instead of "now" is what lets "earliest check-in wins"
+    // resolve when two gates both scanned the same ticket while offline.
+    const offlineAt = parseOfflineCheckedInAt(checkedInAt);
+
     if (!evaluation.valid) {
+      // Offline-sync reconciliation: replaying a check-in for a ticket the
+      // server already marked checked in is NOT an error — the guest was
+      // admitted exactly once. Apply earliest-wins and report success so the
+      // client can drop the queued item (no double check-in).
+      if (offlineAt && ticket && ticket.isCheckedIn) {
+        return reconcileCheckIn(ticket.id, ticket.checkedInAt, offlineAt);
+      }
       // Unknown code -> 404; not sold / already checked in -> 400.
       throw new ApiError(evaluation.message, ticket ? 400 : 404);
     }
@@ -782,10 +795,21 @@ export const confirmCheckIn = async (
     // sold, guarding against a double check-in race between preview and commit.
     const claim = await prisma.ticket.updateMany({
       where: { id: ticket!.id, isCheckedIn: false, status: 'sold' },
-      data: { isCheckedIn: true, checkedInAt: new Date() },
+      data: { isCheckedIn: true, checkedInAt: offlineAt ?? new Date() },
     });
 
     if (claim.count === 0) {
+      // Lost the race to a concurrent check-in between evaluate and claim. For
+      // an offline replay, reconcile (earliest-wins) rather than failing.
+      if (offlineAt) {
+        const current = await prisma.ticket.findUnique({
+          where: { id: ticket!.id },
+          select: { isCheckedIn: true, checkedInAt: true },
+        });
+        if (current?.isCheckedIn) {
+          return reconcileCheckIn(ticket!.id, current.checkedInAt, offlineAt);
+        }
+      }
       throw new ApiError('Ticket has already been used for check-in', 400);
     }
 
@@ -803,5 +827,72 @@ export const confirmCheckIn = async (
     console.error('Error in confirmCheckIn service:', error);
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to confirm check-in', 500);
+  }
+};
+
+/**
+ * Parse an optional client-supplied check-in timestamp (ISO-8601). Returns
+ * undefined for a missing or unparseable value so callers fall back to "now".
+ */
+const parseOfflineCheckedInAt = (value?: string): Date | undefined => {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+};
+
+/**
+ * Earliest-check-in-wins reconciliation. If the replayed offline check-in
+ * predates the already-recorded time, move the recorded time earlier (it is
+ * never pushed later). Returns the reconciled ticket as a success result.
+ */
+const reconcileCheckIn = async (
+  ticketId: string,
+  currentCheckedInAt: Date | null,
+  offlineAt: Date
+): Promise<{ ticket: any; valid: boolean; message: string }> => {
+  if (!currentCheckedInAt || offlineAt < currentCheckedInAt) {
+    await prisma.ticket.update({
+      where: { id: ticketId },
+      data: { checkedInAt: offlineAt },
+    });
+  }
+  const reconciled = await prisma.ticket.findUnique({
+    where: { id: ticketId },
+    include: CHECK_IN_INCLUDE,
+  });
+  return {
+    ticket: reconciled ? toCheckInTicketDto(reconciled) : {},
+    valid: true,
+    message: 'Check-in reconciled (already recorded)',
+  };
+};
+
+/**
+ * Build the offline check-in manifest for an event: every sold ticket with its
+ * uniqueCode, holder, type and current checked-in state. The gate scanner
+ * pre-fetches this so it can validate scans (valid / already-checked-in /
+ * unknown) and guard against double check-in while offline. Access is scoped to
+ * the event's organizer (or an admin) exactly like the check-in endpoints.
+ */
+export const getEventCheckInManifest = async (
+  eventId: string,
+  requester: CheckInRequester
+): Promise<{ eventId: string; tickets: any[] }> => {
+  try {
+    await assertEventAccess(eventId, requester);
+
+    const tickets = await prisma.ticket.findMany({
+      where: { eventId, status: 'sold' },
+      include: CHECK_IN_INCLUDE,
+    });
+
+    return {
+      eventId,
+      tickets: tickets.map(toCheckInTicketDto),
+    };
+  } catch (error) {
+    console.error('Error in getEventCheckInManifest service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to build check-in manifest', 500);
   }
 };

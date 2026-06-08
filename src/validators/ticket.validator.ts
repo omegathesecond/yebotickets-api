@@ -157,4 +157,11 @@ export const checkInLookupValidator = [
     .withMessage('Event ID is required')
     .isString()
     .withMessage('Event ID must be a string'),
-]; 
+
+  // Optional offline check-in timestamp, sent when a queued (offline) check-in
+  // is replayed so the server records the real, earlier moment (earliest wins).
+  body('checkedInAt')
+    .optional()
+    .isISO8601()
+    .withMessage('checkedInAt must be an ISO-8601 date string'),
+];
