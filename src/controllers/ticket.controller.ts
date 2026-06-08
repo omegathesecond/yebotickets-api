@@ -146,7 +146,12 @@ export const purchaseTicketController = async (req: Request, res: Response, next
 
     const ticket = await purchaseTicket(ticketTypeId, userId, payment);
 
-    res.status(201).json({
+    // An asynchronous (mobile-money) charge comes back PENDING: the seat is held
+    // and the ticket will be issued once payment confirms via webhook. Signal
+    // this with 202 Accepted (not 201 Created) so the client shows "pending"
+    // rather than treating a not-yet-issued ticket as bought.
+    const isPending = (ticket as { pending?: boolean }).pending === true;
+    res.status(isPending ? 202 : 201).json({
       success: true,
       data: ticket,
     });
