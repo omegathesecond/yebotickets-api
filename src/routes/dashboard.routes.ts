@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import prisma from '../config/prisma';
-import { verifyDashboardApiKey } from '../middleware/auth.middleware';
+import { protectAdminOrApiKey } from '../middleware/auth.middleware';
 
 const router = Router();
 
@@ -16,7 +16,7 @@ const router = Router();
  *       200:
  *         description: Dashboard metrics
  */
-router.get('/metrics', verifyDashboardApiKey, async (req: Request, res: Response) => {
+router.get('/metrics', protectAdminOrApiKey, async (req: Request, res: Response) => {
   try {
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);

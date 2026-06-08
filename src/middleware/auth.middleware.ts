@@ -75,14 +75,67 @@ export const authorize = (...roles: UserRole[]) => {
  */
 export const verifyDashboardApiKey = (req: Request, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] || req.query.apiKey;
-  
+
   if (!apiKey) {
     return next(new ApiError('API key required', 401));
   }
-  
+
   if (apiKey !== process.env.DASHBOARD_API_KEY) {
     return next(new ApiError('Invalid API key', 401));
   }
-  
+
   next();
+};
+
+/**
+ * Dashboard metrics access guard.
+ *
+ * Accepts EITHER:
+ *  - an admin Bearer JWT (used by the admin dashboard frontend, which can't
+ *    safely embed a static API key in browser JS), OR
+ *  - the DASHBOARD_API_KEY via x-api-key (used by the server-to-server CEO
+ *    dashboard integration).
+ *
+ * This is additive to verifyDashboardApiKey — neither path is removed.
+ */
+export const protectAdminOrApiKey = async (req: Request, res: Response, next: NextFunction) => {
+  const authReq = req as AuthenticatedRequest;
+  const authHeader = req.headers.authorization;
+
+  // Path 1: admin Bearer JWT
+  if (authHeader && authHeader.startsWith('Bearer')) {
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+      return next(new ApiError('Not authorized, no token provided', 401));
+    }
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
+      const user = await prisma.user.findUnique({
+        where: { id: decoded.id },
+        select: {
+          id: true,
+          name: true,
+          phoneNumber: true,
+          email: true,
+          role: true,
+          isVerified: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      if (!user) {
+        return next(new ApiError('User not found', 404));
+      }
+      if (user.role !== UserRole.ADMIN) {
+        return next(new ApiError(`Role (${user.role}) is not authorized to access this resource`, 403));
+      }
+      authReq.user = user as unknown as IUser;
+      return next();
+    } catch (error) {
+      return next(new ApiError('Not authorized, invalid token', 401));
+    }
+  }
+
+  // Path 2: server-to-server API key
+  return verifyDashboardApiKey(req, res, next);
 };

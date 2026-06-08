@@ -68,8 +68,9 @@ export const updateEventController = async (req: Request, res: Response, next: N
     const { id } = req.params;
     const organizerId = authReq.user.id;
     const updateData = req.body;
-    
-    const event = await updateEvent(id, updateData, organizerId);
+    const isAdmin = authReq.user.role === 'admin';
+
+    const event = await updateEvent(id, updateData, organizerId, isAdmin);
     
     res.status(200).json({
       success: true,
@@ -89,8 +90,9 @@ export const deleteEventController = async (req: Request, res: Response, next: N
 
     const { id } = req.params;
     const organizerId = authReq.user.id;
-    
-    const result = await deleteEvent(id, organizerId);
+    const isAdmin = authReq.user.role === 'admin';
+
+    const result = await deleteEvent(id, organizerId, isAdmin);
     
     res.status(200).json({
       success: true,

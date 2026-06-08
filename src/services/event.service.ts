@@ -159,15 +159,13 @@ export const getEventById = async (eventId: string) => {
 export const updateEvent = async (
   eventId: string,
   updateData: Partial<IEventInput>,
-  organizerId: string
+  organizerId: string,
+  isAdmin = false
 ) => {
   try {
-    // First check if the event exists and belongs to this organizer
+    // Admins can moderate any event; organizers are scoped to their own.
     const existingEvent = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
+      where: isAdmin ? { id: eventId } : { id: eventId, organizerId },
     });
 
     if (!existingEvent) {
@@ -214,15 +212,13 @@ export const updateEvent = async (
  */
 export const deleteEvent = async (
   eventId: string,
-  organizerId: string
+  organizerId: string,
+  isAdmin = false
 ): Promise<{ message: string }> => {
   try {
-    // Check if the event exists and belongs to this organizer
+    // Admins can delete any event; organizers are scoped to their own.
     const event = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
+      where: isAdmin ? { id: eventId } : { id: eventId, organizerId },
     });
 
     if (!event) {
