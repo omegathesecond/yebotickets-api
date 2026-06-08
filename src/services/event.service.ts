@@ -72,10 +72,12 @@ export const getEvents = async (query: Record<string, any> = {}) => {
   try {
     const where: any = {};
     
-    // Build filter based on query parameters
+    // Build filter based on query parameters. City/country use case-insensitive
+    // contains so the buyer app's city pills ("Mbabane") and country dropdown
+    // ("Eswatini") match regardless of how the value was stored/cased.
     if (query.category) where.category = query.category;
-    if (query.city) where.locationCity = query.city;
-    if (query.country) where.locationCountry = query.country;
+    if (query.city) where.locationCity = { contains: query.city, mode: 'insensitive' };
+    if (query.country) where.locationCountry = { contains: query.country, mode: 'insensitive' };
     
     // Date filters
     if (query.startAfter) {
@@ -106,11 +108,15 @@ export const getEvents = async (query: Record<string, any> = {}) => {
       where.organizerId = query.organizer;
     }
 
-    // Search by title or description
+    // Free-text search across title, description, category and city so the
+    // home-page search bar (which only sends a single term) matches by
+    // title/category/city as the buyer expects, not just the title.
     if (query.search) {
       where.OR = [
         { title: { contains: query.search, mode: 'insensitive' } },
         { description: { contains: query.search, mode: 'insensitive' } },
+        { category: { contains: query.search, mode: 'insensitive' } },
+        { locationCity: { contains: query.search, mode: 'insensitive' } },
       ];
     }
 
