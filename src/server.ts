@@ -8,6 +8,7 @@ import eventRoutes from './routes/event.routes';
 import ticketRoutes from './routes/ticket.routes';
 import organizerRoutes from './routes/organizer.routes';
 import dashboardRoutes from './routes/dashboard.routes';
+import paymentRoutes from './routes/payment.routes';
 import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
@@ -21,11 +22,17 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 app.use(helmet());
 app.use(morgan('dev'));
+
+// YeboPay webhook MUST be mounted BEFORE the global JSON body parser: its HMAC
+// signature is computed over the raw request bytes, so express.json() must not
+// consume/normalise the body first. The route applies express.raw() itself.
+app.use('/api/payments', paymentRoutes);
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Routes
 //add swagger ui

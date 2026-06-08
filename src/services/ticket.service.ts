@@ -15,6 +15,7 @@ import {
 import { sendImageMessage, sendTextMessage } from './whatsapp.service';
 import {
   createCharge,
+  getCharge,
   listPaymentOptions,
   refundCharge,
   YeboPayHttpError,
@@ -24,6 +25,30 @@ import {
 /** Currency + default country tickets are priced/charged in (Eswatini). */
 const TICKET_CURRENCY = 'SZL';
 const DEFAULT_COUNTRY = 'SZ';
+
+/**
+ * How long a reservation may sit unconfirmed before the reclaim sweep asks
+ * YeboPay what really happened to its charge. Mobile-money (the dominant rail
+ * here) is asynchronous: `createCharge` returns PENDING and the buyer approves a
+ * USSD prompt seconds-to-minutes later, settling via a `charge.succeeded`
+ * webhook. We must NOT reclaim a still-live PENDING hold (the money could still
+ * land — that is the exact silent-failure this task fixes), so the sweep is
+ * authoritative: it polls `GET /v1/charges/:id` and only reclaims a hold whose
+ * charge YeboPay reports FAILED, finalizes one reported SUCCEEDED (reconciling a
+ * missed webhook), and leaves a still-PENDING hold alone until the HARD cutoff.
+ *
+ * TTL (default 15 min) gates when we first poll; the HARD cutoff (default 60
+ * min) is the only point at which a charge YeboPay STILL reports PENDING is
+ * treated as dead and reclaimed — comfortably beyond any real USSD prompt
+ * lifetime, which protects against overselling while preventing inventory from
+ * being stranded reserved forever (e.g. against YeboPay's current stub MoMo
+ * adapter, which leaves charges PENDING indefinitely).
+ */
+const RESERVATION_TTL_MS = Number.parseInt(process.env['RESERVATION_TTL_MS'] || '', 10) || 15 * 60 * 1000;
+const RESERVATION_HARD_EXPIRY_MS =
+  Number.parseInt(process.env['RESERVATION_HARD_EXPIRY_MS'] || '', 10) || 60 * 60 * 1000;
+/** Cap how many stale holds one lazy sweep resolves, to bound purchase latency. */
+const RECLAIM_BATCH = 20;
 
 /**
  * How the buyer is paying, forwarded to YeboPay. Either a saved
@@ -540,6 +565,7 @@ const finalizeReservedTicket = async (
     data: {
       status: 'sold',
       purchaseDate: new Date(),
+      reservedAt: null, // hold consumed — drop it out of the reclaim sweep
       paymentRef: payment.paymentRef,
       paymentStatus: payment.paymentStatus,
       amountPaid: payment.amountPaid,
@@ -562,11 +588,267 @@ const releaseReservedTicket = async (ticketId: string, userId: string): Promise<
   try {
     await prisma.ticket.updateMany({
       where: { id: ticketId, status: 'reserved', userId },
-      data: { status: 'available', userId: null },
+      data: {
+        status: 'available',
+        userId: null,
+        reservedAt: null,
+        // Clear the payment trail so the freed row is pristine for the next
+        // buyer. Safe because a charge that FAILED is terminal — YeboPay will
+        // not later settle it (and an unmatched stray webhook is logged loudly).
+        paymentRef: null,
+        paymentStatus: null,
+        amountPaid: null,
+      },
     });
   } catch (error) {
     console.error('Failed to release reserved ticket after payment failure:', ticketId, error);
   }
+};
+
+/**
+ * Persist a PENDING (async) charge onto the row WE reserved, KEEPING it
+ * reserved. Guarded on `status: 'reserved', userId` so only the holder writes
+ * it. Records `paymentRef` (the YeboPay charge id) so the later
+ * `charge.succeeded` webhook — whose payload carries the charge id but no
+ * ticket metadata — can reverse-look-up exactly this row, plus `amountPaid` and
+ * `paymentStatus: 'PENDING'`. The hold (`reservedAt`) is left in place so the
+ * reclaim sweep still owns it if the charge never confirms.
+ */
+const markReservationPending = async (
+  ticketId: string,
+  userId: string,
+  payment: { paymentRef: string; amountPaid: number }
+) => {
+  await prisma.ticket.updateMany({
+    where: { id: ticketId, status: 'reserved', userId },
+    data: {
+      paymentRef: payment.paymentRef,
+      paymentStatus: 'PENDING',
+      amountPaid: payment.amountPaid,
+    },
+  });
+  return prisma.ticket.findUnique({
+    where: { id: ticketId },
+    include: PURCHASE_INCLUDE,
+  });
+};
+
+/**
+ * Shape the response for a held (payment-pending) purchase. There is NO ticket
+ * to deliver yet — no QR — so this deliberately omits the QR fields and carries
+ * `pending: true` + a clear buyer-facing message. The controller returns 202
+ * Accepted (not 201) so the client knows the seat is held and the ticket will
+ * arrive once payment confirms.
+ */
+const buildPendingResult = (ticket: any, paymentRef: string) => ({
+  pending: true as const,
+  id: ticket.id,
+  status: mapTicketStatus('reserved'),
+  paymentRef,
+  paymentStatus: 'PENDING' as const,
+  amountPaid: ticket.amountPaid ?? null,
+  uniqueCode: ticket.uniqueCode,
+  event: ticket.event ?? null,
+  ticketType: ticket.ticketType
+    ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
+    : null,
+  message:
+    'Payment pending — approve the prompt on your phone. Your ticket will be issued automatically once payment is confirmed.',
+});
+
+// ===========================================================================
+// Asynchronous settlement: YeboPay charge webhooks + reservation reclaim
+// ===========================================================================
+
+/** Outcome of settling one YeboPay charge event (webhook or reconcile poll). */
+export type WebhookChargeOutcome =
+  | { result: 'issued'; ticketId: string; delivery: TicketDeliveryResult }
+  | { result: 'released'; ticketId: string }
+  | { result: 'already_final'; ticketId: string; status: string }
+  | { result: 'unmatched' };
+
+/** The single ticket holding a given YeboPay charge ref (1:1 — one charge per ticket). */
+const findTicketByPaymentRef = (paymentRef: string) =>
+  prisma.ticket.findFirst({ where: { paymentRef }, include: PURCHASE_INCLUDE });
+
+/**
+ * Settle a SUCCEEDED charge: finalize the reserved row holding it into a sold
+ * ticket and deliver the QR.
+ *
+ * Idempotent (webhooks may be redelivered, and the reclaim poll can race the
+ * webhook): the flip is a guarded `updateMany` requiring `status: 'reserved'`,
+ * so a row already sold matches 0 rows and the QR is delivered EXACTLY once. An
+ * unmatched charge is logged loudly (money moved with no ticket to attach) — a
+ * reconciliation signal, never a silent swallow.
+ */
+export const settleSucceededCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
+  const ticket = await findTicketByPaymentRef(chargeId);
+  if (!ticket) {
+    console.error('YeboPay charge.succeeded matched no ticket — needs reconciliation:', chargeId);
+    return { result: 'unmatched' };
+  }
+  if (ticket.status === 'sold') {
+    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+  }
+  if (ticket.status !== 'reserved') {
+    // The hold was reclaimed/cancelled before this arrived — do NOT resurrect a
+    // dead row; flag it instead (buyer may have been debited late).
+    console.error(
+      `YeboPay charge.succeeded for ticket ${ticket.id} in '${ticket.status}' (not reserved) — needs reconciliation:`,
+      chargeId
+    );
+    return { result: 'already_final', ticketId: ticket.id, status: ticket.status };
+  }
+
+  const claimed = await prisma.ticket.updateMany({
+    where: { id: ticket.id, status: 'reserved', paymentRef: chargeId },
+    data: { status: 'sold', purchaseDate: new Date(), reservedAt: null, paymentStatus: 'SUCCEEDED' },
+  });
+  if (claimed.count === 0) {
+    // A concurrent webhook/poll finalized first — exactly-once preserved.
+    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+  }
+
+  const sold = await prisma.ticket.findUnique({ where: { id: ticket.id }, include: PURCHASE_INCLUDE });
+  const delivery = await deliverTicketToBuyer(sold);
+  return { result: 'issued', ticketId: ticket.id, delivery };
+};
+
+/**
+ * Settle a FAILED charge: release the reserved row holding it back to the pool.
+ * Idempotent — a row already released/sold matches no reserved guard (no-op). A
+ * FAILED arriving for an already-SOLD ticket is a contradiction we refuse to act
+ * on (we never unwind a delivered ticket); it is logged for a human.
+ */
+export const settleFailedCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
+  const ticket = await findTicketByPaymentRef(chargeId);
+  if (!ticket) return { result: 'unmatched' };
+  if (ticket.status === 'sold') {
+    console.error(
+      `YeboPay charge.failed for an already-SOLD ticket ${ticket.id} — conflict, needs reconciliation:`,
+      chargeId
+    );
+    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+  }
+  if (ticket.status !== 'reserved') {
+    return { result: 'already_final', ticketId: ticket.id, status: ticket.status };
+  }
+  await releaseReservedTicket(ticket.id, ticket.userId!);
+  return { result: 'released', ticketId: ticket.id };
+};
+
+/**
+ * Route a VERIFIED YeboPay charge webhook event to its settlement. Unknown /
+ * non-charge events are acknowledged no-ops (logged) so YeboPay marks them
+ * delivered rather than treating our 'unhandled' as a failure. Signature
+ * verification happens in the webhook service BEFORE this is ever called.
+ */
+export const handleChargeWebhookEvent = async (
+  eventType: string,
+  charge: { id: string }
+): Promise<WebhookChargeOutcome | { result: 'ignored' }> => {
+  switch (eventType) {
+    case 'charge.succeeded':
+      return settleSucceededCharge(charge.id);
+    case 'charge.failed':
+      return settleFailedCharge(charge.id);
+    default:
+      console.warn('Ignoring unhandled YeboPay webhook event type:', eventType);
+      return { result: 'ignored' };
+  }
+};
+
+/** Per-sweep tally returned by reclaimExpiredReservations (observability/tests). */
+export interface ReclaimSummary {
+  scanned: number;
+  finalized: number;
+  released: number;
+  stillPending: number;
+  errors: number;
+}
+
+/**
+ * Resolve reservations sitting unconfirmed past the TTL — AUTHORITATIVELY, by
+ * asking YeboPay the true charge status, never by guessing from the clock. This
+ * both reclaims dead holds (so inventory is never stranded) AND reconciles a
+ * settlement whose webhook we missed (the skill notes deliveries are
+ * fire-and-forget with no retry, so polling is the documented backstop).
+ *
+ * Per stale reserved row (optionally scoped to one ticket type):
+ *   - no paymentRef                    → never reached a charge; release at HARD expiry.
+ *   - YeboPay SUCCEEDED                → finalize → sold + deliver (missed webhook).
+ *   - YeboPay FAILED                   → release the hold.
+ *   - PENDING & past HARD expiry       → release (charge is dead; USSD long gone).
+ *   - PENDING within HARD expiry       → leave held (money may STILL land — never
+ *                                        reclaim a live PENDING; that would oversell
+ *                                        and orphan a real payment).
+ *
+ * Best-effort per row: a YeboPay error on one row is logged and the row left
+ * held, never thrown — one bad charge can't wedge the sweep (or a purchase that
+ * lazily triggers it).
+ */
+export const reclaimExpiredReservations = async (
+  ticketTypeId?: string
+): Promise<ReclaimSummary> => {
+  const now = Date.now();
+  const ttlCutoff = new Date(now - RESERVATION_TTL_MS);
+  const stale = await prisma.ticket.findMany({
+    where: {
+      status: 'reserved',
+      reservedAt: { lt: ttlCutoff },
+      ...(ticketTypeId ? { ticketTypeId } : {}),
+    },
+    include: PURCHASE_INCLUDE,
+    take: RECLAIM_BATCH,
+  });
+
+  const summary: ReclaimSummary = {
+    scanned: stale.length,
+    finalized: 0,
+    released: 0,
+    stillPending: 0,
+    errors: 0,
+  };
+
+  for (const ticket of stale) {
+    try {
+      const pastHardExpiry =
+        !ticket.reservedAt || now - ticket.reservedAt.getTime() > RESERVATION_HARD_EXPIRY_MS;
+
+      // No charge ref: the hold never reached a charge — nothing to reconcile
+      // against YeboPay. Reclaim only once it is genuinely abandoned (hard expiry).
+      if (!ticket.paymentRef) {
+        if (pastHardExpiry) {
+          await releaseReservedTicket(ticket.id, ticket.userId!);
+          summary.released++;
+        } else {
+          summary.stillPending++;
+        }
+        continue;
+      }
+
+      const charge = await getCharge(ticket.paymentRef);
+      if (charge.status === 'SUCCEEDED') {
+        const outcome = await settleSucceededCharge(ticket.paymentRef);
+        if (outcome.result === 'issued' || outcome.result === 'already_final') summary.finalized++;
+      } else if (charge.status === 'FAILED') {
+        await releaseReservedTicket(ticket.id, ticket.userId!);
+        summary.released++;
+      } else if (pastHardExpiry) {
+        // Still PENDING (or a refund state) long past any real USSD lifetime —
+        // treat as dead and reclaim so the seat isn't stranded forever.
+        await releaseReservedTicket(ticket.id, ticket.userId!);
+        summary.released++;
+      } else {
+        summary.stillPending++;
+      }
+    } catch (error) {
+      summary.errors++;
+      console.error('Reclaim failed for reserved ticket (left held):', ticket.id, error);
+    }
+  }
+
+  return summary;
 };
 
 /** Throw a 400 unless the buyer supplied a usable YeboPay payment instrument. */
@@ -654,12 +936,22 @@ export const purchaseTicket = async (
       return finishIssuedTicket(freeTicket);
     }
 
-    // --- Paid tickets: reserve -> charge -> finalize / release. --------------
+    // --- Paid tickets: reserve -> charge -> finalize / hold / release. -------
     const validPayment = assertPaymentProvided(payment);
 
-    // 1. Reserve one available row atomically (held, not yet sold).
+    // 0. Reclaim any stale holds for this type FIRST so an abandoned async
+    //    PENDING charge can't make this type look sold-out. Best-effort: a
+    //    YeboPay outage here is logged, never thrown (it must not block a sale).
+    await reclaimExpiredReservations(ticketTypeId).catch((error) =>
+      console.error('Reservation reclaim sweep failed (continuing):', ticketTypeId, error)
+    );
+
+    // 1. Reserve one available row atomically (held, not yet sold). reservedAt
+    //    stamps the hold so the reclaim sweep can later resolve it if the async
+    //    charge never confirms.
     const reserved = await claimAvailableTicket(ticketTypeId, userId, {
       status: 'reserved',
+      reservedAt: new Date(),
     });
     if (!reserved) {
       throw new ApiError('No tickets available for this ticket type', 400);
@@ -690,16 +982,32 @@ export const purchaseTicket = async (
       throw error;
     }
 
-    // 3. Only a SUCCEEDED charge issues the ticket. PENDING/FAILED/anything
-    //    else releases the hold and fails the buyer loudly — no free issue.
+    // 3a. PENDING (asynchronous rail — mobile money). The buyer has NOT paid yet
+    //     but WILL be debited once they approve the USSD prompt; the money then
+    //     settles via a `charge.succeeded` webhook (handled in handleChargeEvent).
+    //     We must KEEP the reservation (releasing it would let the seat resell
+    //     while the buyer is mid-approval, then their settled payment would have
+    //     no ticket — the exact silent failure CLAUDE.md forbids). Persist the
+    //     charge ref so the webhook can find this row, and tell the buyer their
+    //     ticket will be issued on confirmation — NOT a hard failure.
+    if (charge.status === 'PENDING') {
+      const held = await markReservationPending(reserved.id, userId, {
+        paymentRef: charge.id,
+        amountPaid: Number.parseFloat(charge.amount),
+      });
+      return buildPendingResult(held ?? reserved, charge.id);
+    }
+
+    // 3b. Any non-SUCCEEDED, non-PENDING status (FAILED/REFUNDED/…) is a hard
+    //     failure: release the hold and surface it loudly — no ticket issued.
     if (charge.status !== 'SUCCEEDED') {
       await releaseReservedTicket(reserved.id, userId);
       const reason = charge.failure_reason ? `: ${charge.failure_reason}` : '';
       throw new ApiError(`Payment ${charge.status.toLowerCase()}${reason}. No ticket was issued.`, 402);
     }
 
-    // 4. Payment confirmed — finalize the reservation into a sold ticket and
-    //    persist the charge reference for reconciliation/refunds.
+    // 4. Payment confirmed synchronously — finalize the reservation into a sold
+    //    ticket and persist the charge reference for reconciliation/refunds.
     const sold = await finalizeReservedTicket(reserved.id, userId, {
       paymentRef: charge.id,
       paymentStatus: charge.status,

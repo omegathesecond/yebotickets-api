@@ -223,6 +223,24 @@ export const createCharge = async (args: CreateChargeArgs): Promise<ChargeResult
   return resp.data;
 };
 
+/**
+ * GET /v1/charges/:id — fetch a single charge for reconciliation.
+ *
+ * Used to authoritatively resolve a reservation whose charge is still PENDING:
+ * we ask YeboPay the truth rather than guessing from a timer. A SUCCEEDED here
+ * lets us finalize a ticket whose `charge.succeeded` webhook we missed (the
+ * skill notes deliveries are fire-and-forget with no auto-retry, so polling is
+ * the documented backstop); a FAILED lets us safely reclaim the held row.
+ * Throws YeboPayHttpError on any non-2xx — never silently (CLAUDE.md).
+ */
+export const getCharge = async (chargeId: string): Promise<ChargeResult> => {
+  const resp = await dispatch<{ success: true; data: ChargeResult }>({
+    method: 'GET',
+    path: `/v1/charges/${encodeURIComponent(chargeId)}`,
+  });
+  return resp.data;
+};
+
 export interface RefundChargeArgs {
   /** YeboPay charge id stored on the ticket as `paymentRef`. */
   chargeId: string;

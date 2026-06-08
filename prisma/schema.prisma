@@ -153,6 +153,12 @@ model Ticket {
   isCheckedIn   Boolean      @default(false)
   checkedInAt   DateTime?
 
+  // When the row was put into the 'reserved' hold (set on every reserve, cleared
+  // back to null on release/finalize). Used to find reservations that have sat
+  // unconfirmed past the TTL so an async (mobile-money PENDING) charge that never
+  // settles cannot strand inventory forever. Nullable: only reserved rows have it.
+  reservedAt    DateTime?
+
   // YeboPay charge reference, persisted when the ticket is sold. Nullable: free
   // (price 0) and unsold tickets have none. paymentRef is the YeboPay charge id
   // used for reconciliation/refunds; paymentStatus is its status at sale time
