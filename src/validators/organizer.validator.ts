@@ -1,5 +1,21 @@
 import { body, oneOf, ValidationChain } from 'express-validator';
 
+export const changePasswordValidator: ValidationChain[] = [
+  body('currentPassword')
+    .isString()
+    .withMessage('Current password must be a string')
+    .notEmpty()
+    .withMessage('Current password is required'),
+
+  body('newPassword')
+    .isString()
+    .withMessage('New password must be a string')
+    .isLength({ min: 6 })
+    .withMessage('New password must be at least 6 characters long')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('New password must contain at least one uppercase letter, one lowercase letter, and one number'),
+];
+
 export const organizerSignupValidator = [
   body('name')
     .isString()

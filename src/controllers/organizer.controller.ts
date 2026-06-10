@@ -3,7 +3,7 @@ import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
-import { updateProfile } from '../services/auth.service';
+import { updateProfile, changePassword } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
 import bcrypt from 'bcryptjs';
@@ -149,6 +149,30 @@ export const updateOrganizerProfileController = async (req: Request, res: Respon
     res.status(200).json({
       success: true,
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Change the authenticated organizer's password.
+ * Validates the current password against the stored hash before updating.
+ */
+export const changePasswordController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      next(new ApiError('User not authenticated', 401));
+      return;
+    }
+
+    const { currentPassword, newPassword } = req.body;
+    await changePassword(authReq.user.id, currentPassword, newPassword);
+
+    res.status(200).json({
+      success: true,
+      message: 'Password updated successfully',
     });
   } catch (error) {
     next(error);

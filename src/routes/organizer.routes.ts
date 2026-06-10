@@ -82,14 +82,16 @@ import {
   getOrganizersController,
   loginOrganizerController,
   updateOrganizerStatusController,
-  deleteOrganizerController
+  deleteOrganizerController,
+  changePasswordController
 } from '../controllers/organizer.controller';
 import { validate } from '../middleware/validate.middleware';
-import { 
-  organizerProfileValidator, 
+import {
+  organizerProfileValidator,
   organizerSignupValidator,
   organizerLoginValidator,
-  organizerStatusValidator
+  organizerStatusValidator,
+  changePasswordValidator
 } from '../validators/organizer.validator';
 
 const router = express.Router();
@@ -266,6 +268,36 @@ router.use(authorize(UserRole.ORGANIZER, UserRole.ADMIN));
  */
 router.get('/profile', getOrganizerProfileController);
 router.put('/profile', validate(organizerProfileValidator), updateOrganizerProfileController);
+
+/**
+ * @swagger
+ * /organizers/change-password:
+ *   post:
+ *     summary: Change the authenticated organizer's password
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - currentPassword
+ *               - newPassword
+ *             properties:
+ *               currentPassword:
+ *                 type: string
+ *               newPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password updated successfully
+ *       401:
+ *         description: Current password is incorrect
+ */
+router.post('/change-password', validate(changePasswordValidator), changePasswordController);
 
 /**
  * @swagger
