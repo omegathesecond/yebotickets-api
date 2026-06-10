@@ -227,6 +227,41 @@ export const updateProfile = async (userId: string, updateData: any): Promise<an
 };
 
 /**
+ * Change a user's password.
+ * Verifies the supplied current password against the stored bcrypt hash, then
+ * replaces it with a freshly hashed newPassword. Fails loudly (no silent
+ * fallback) when the account has no password set or the current password is
+ * wrong.
+ */
+export const changePassword = async (
+  userId: string,
+  currentPassword: string,
+  newPassword: string
+): Promise<{ success: true }> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+
+  if (!user) {
+    throw new ApiError('User not found', 404);
+  }
+  if (!user.password) {
+    throw new ApiError('No password is set for this account', 400);
+  }
+
+  const isCurrentValid = await comparePassword(currentPassword, user.password);
+  if (!isCurrentValid) {
+    throw new ApiError('Current password is incorrect', 401);
+  }
+
+  const hashed = await hashPassword(newPassword);
+  await prisma.user.update({
+    where: { id: userId },
+    data: { password: hashed },
+  });
+
+  return { success: true };
+};
+
+/**
  * Get user by ID
  */
 export const getUserById = async (userId: string) => {
