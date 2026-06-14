@@ -40,7 +40,14 @@ model User {
   // OTP fields
   otpCode     String?
   otpExpiresAt DateTime?
-  
+
+  // Password-reset fields (organizer/staff email+password recovery).
+  // Kept separate from the OTP columns so a phone-login OTP and an email
+  // password-reset can be in flight at the same time without clobbering each
+  // other. The code is single-use: it is cleared once a reset succeeds.
+  resetCode          String?
+  resetCodeExpiresAt DateTime?
+
   // Organizer profile (flattened)
   companyName      String?
   companyDescription String?

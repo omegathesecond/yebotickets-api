@@ -31,9 +31,41 @@ export const updateProfileValidator = [
     .withMessage('Name must be a string')
     .isLength({ min: 2, max: 100 })
     .withMessage('Name must be between 2 and 100 characters'),
-  
+
   body('email')
     .optional()
     .isEmail()
     .withMessage('Please provide a valid email address'),
+];
+
+export const requestPasswordResetValidator = [
+  body('email')
+    .notEmpty()
+    .withMessage('Email is required')
+    .isEmail()
+    .withMessage('Please provide a valid email address'),
+];
+
+export const resetPasswordValidator = [
+  body('email')
+    .notEmpty()
+    .withMessage('Email is required')
+    .isEmail()
+    .withMessage('Please provide a valid email address'),
+
+  body('resetCode')
+    .notEmpty()
+    .withMessage('Reset code is required')
+    .isLength({ min: 6, max: 6 })
+    .withMessage('Reset code must be 6 digits')
+    .isNumeric()
+    .withMessage('Reset code must contain only numbers'),
+
+  body('newPassword')
+    .isString()
+    .withMessage('New password must be a string')
+    .isLength({ min: 6 })
+    .withMessage('New password must be at least 6 characters long')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('New password must contain at least one uppercase letter, one lowercase letter, and one number'),
 ]; 

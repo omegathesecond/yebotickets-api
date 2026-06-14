@@ -2,8 +2,12 @@ import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { sendOTP } from './whatsapp.service';
+import { YeboLinkClient } from './yebolink.client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+
+/** How long an issued password-reset code stays valid (minutes). */
+const RESET_CODE_TTL_MINUTES = 15;
 
 /**
  * Generate a 6-digit OTP
@@ -256,6 +260,89 @@ export const changePassword = async (
   await prisma.user.update({
     where: { id: userId },
     data: { password: hashed },
+  });
+
+  return { success: true };
+};
+
+/**
+ * Request a password reset for an organizer/staff account.
+ *
+ * Looks the account up by email, mints a 6-digit single-use code with a short
+ * TTL, persists it, and delivers it over YeboLink SMS to the account's
+ * registered phone number (per the Omevision comms standard — no direct
+ * provider here). Fails loudly (404) when no matching account exists and lets a
+ * YeboLink delivery failure propagate rather than pretending the code was sent.
+ *
+ * @param email Email address tied to the organizer/staff account
+ */
+export const requestPasswordReset = async (
+  email: string
+): Promise<{ message: string }> => {
+  const user = await prisma.user.findFirst({
+    where: { email, role: { in: ['organizer', 'admin'] } },
+  });
+
+  if (!user) {
+    throw new ApiError('No organizer account found for that email', 404);
+  }
+
+  const resetCode = generateOTPCode();
+  const resetCodeExpiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { resetCode, resetCodeExpiresAt },
+  });
+
+  // Deliver via YeboLink SMS to the account's registered phone. A failure here
+  // throws and surfaces to the caller — we never claim success on a failed send.
+  await YeboLinkClient.sendSMS({
+    to: user.phoneNumber,
+    text: `Your YeboTickets password reset code is ${resetCode}. It expires in ${RESET_CODE_TTL_MINUTES} minutes. If you didn't request this, ignore this message.`,
+  });
+
+  return { message: 'A password reset code has been sent to the phone number on file.' };
+};
+
+/**
+ * Reset an organizer/staff password using a previously issued reset code.
+ *
+ * Verifies the code is present, unexpired and matches, then stores a fresh
+ * bcrypt hash and clears the code so it can't be reused (single-use). Every
+ * failure mode throws a loud ApiError — there is no silent fallback.
+ *
+ * @param email Email address tied to the account
+ * @param resetCode The code delivered via requestPasswordReset
+ * @param newPassword The new plaintext password to hash and store
+ */
+export const resetPassword = async (
+  email: string,
+  resetCode: string,
+  newPassword: string
+): Promise<{ success: true }> => {
+  const user = await prisma.user.findFirst({
+    where: { email, role: { in: ['organizer', 'admin'] } },
+  });
+
+  if (!user) {
+    throw new ApiError('No organizer account found for that email', 404);
+  }
+  if (!user.resetCode || !user.resetCodeExpiresAt) {
+    throw new ApiError('No password reset was requested for this account', 400);
+  }
+  if (new Date() > user.resetCodeExpiresAt) {
+    throw new ApiError('Reset code has expired', 400);
+  }
+  if (user.resetCode !== resetCode) {
+    throw new ApiError('Invalid reset code', 400);
+  }
+
+  const hashed = await hashPassword(newPassword);
+  await prisma.user.update({
+    where: { id: user.id },
+    // Clearing the code is what enforces single-use.
+    data: { password: hashed, resetCode: null, resetCodeExpiresAt: null },
   });
 
   return { success: true };
