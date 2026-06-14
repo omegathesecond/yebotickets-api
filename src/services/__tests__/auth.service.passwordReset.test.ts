@@ -43,6 +43,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
   otpExpiresAt: null,
   resetCode: null,
   resetCodeExpiresAt: null,
+  resetCodeAttempts: 0,
   createdAt: new Date('2026-01-01T00:00:00Z'),
   updatedAt: new Date('2026-01-01T00:00:00Z'),
   ...over,
@@ -78,12 +79,13 @@ describe('requestPasswordReset', () => {
     expect(smsArg.text).toContain(updateArg.data.resetCode);
   });
 
-  it('rejects with 404 when no organizer account matches the email', async () => {
+  it('returns the same generic message for an unknown email and does no work (anti-enumeration)', async () => {
     prismaMock.user.findFirst.mockResolvedValue(null as any);
 
-    await expect(requestPasswordReset('nobody@example.com')).rejects.toMatchObject({
-      statusCode: 404,
-    });
+    const result = await requestPasswordReset('nobody@example.com');
+
+    // Identical shape to the success case — a caller can't tell them apart.
+    expect(result.message).toMatch(/reset code/i);
     expect(prismaMock.user.update).not.toHaveBeenCalled();
     expect(sendSMSMock).not.toHaveBeenCalled();
   });
@@ -118,24 +120,45 @@ describe('resetPassword', () => {
     expect(updateArg.data.resetCodeExpiresAt).toBeNull();
   });
 
-  it('rejects with 400 for an invalid (mismatched) code', async () => {
-    const user = await buildUser({ resetCode: '123456', resetCodeExpiresAt: future() });
+  it('rejects with 400 for an invalid (mismatched) code and counts the failed attempt', async () => {
+    const user = await buildUser({ resetCode: '123456', resetCodeExpiresAt: future(), resetCodeAttempts: 0 });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     await expect(resetPassword('owner@example.com', '000000', 'NewPass1')).rejects.toMatchObject({
       statusCode: 400,
     });
-    expect(prismaMock.user.update).not.toHaveBeenCalled();
+    // The miss is recorded but the (still-valid) code is NOT burned yet.
+    const updateArg = prismaMock.user.update.mock.calls[0][0] as any;
+    expect(updateArg.data.resetCodeAttempts).toBe(1);
+    expect(updateArg.data.password).toBeUndefined();
   });
 
-  it('rejects with 400 for an expired code', async () => {
+  it('burns the code after too many wrong attempts (brute-force cap)', async () => {
+    const user = await buildUser({ resetCode: '123456', resetCodeExpiresAt: future(), resetCodeAttempts: 4 });
+    prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.update.mockResolvedValue({ ...user } as any);
+
+    await expect(resetPassword('owner@example.com', '000000', 'NewPass1')).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    // 5th miss: the code is cleared so it can no longer be guessed.
+    const updateArg = prismaMock.user.update.mock.calls[0][0] as any;
+    expect(updateArg.data.resetCode).toBeNull();
+    expect(updateArg.data.resetCodeExpiresAt).toBeNull();
+  });
+
+  it('rejects with 400 for an expired code and burns it', async () => {
     const user = await buildUser({ resetCode: '123456', resetCodeExpiresAt: past() });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     await expect(resetPassword('owner@example.com', '123456', 'NewPass1')).rejects.toMatchObject({
       statusCode: 400,
     });
-    expect(prismaMock.user.update).not.toHaveBeenCalled();
+    const updateArg = prismaMock.user.update.mock.calls[0][0] as any;
+    expect(updateArg.data.resetCode).toBeNull();
+    expect(updateArg.data.password).toBeUndefined();
   });
 
   it('rejects with 400 for an already-used code (cleared after first use)', async () => {
@@ -149,9 +172,12 @@ describe('resetPassword', () => {
     expect(prismaMock.user.update).not.toHaveBeenCalled();
   });
 
-  it('rejects with 404 when no organizer account matches the email', async () => {
+  it('rejects with a generic 400 when no account matches the email (anti-enumeration)', async () => {
     prismaMock.user.findFirst.mockResolvedValue(null as any);
 
+    await expect(resetPassword('nobody@example.com', '123456', 'NewPass1')).rejects.toMatchObject({
+      statusCode: 400,
+    });
     await expect(resetPassword('nobody@example.com', '123456', 'NewPass1')).rejects.toBeInstanceOf(ApiError);
     expect(prismaMock.user.update).not.toHaveBeenCalled();
   });

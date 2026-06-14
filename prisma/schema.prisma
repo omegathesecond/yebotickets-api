@@ -45,8 +45,11 @@ model User {
   // Kept separate from the OTP columns so a phone-login OTP and an email
   // password-reset can be in flight at the same time without clobbering each
   // other. The code is single-use: it is cleared once a reset succeeds.
+  // resetCodeAttempts caps brute-force guessing — the code is burned after a
+  // small number of wrong attempts.
   resetCode          String?
   resetCodeExpiresAt DateTime?
+  resetCodeAttempts  Int       @default(0)
 
   // Organizer profile (flattened)
   companyName      String?
