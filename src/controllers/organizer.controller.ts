@@ -6,18 +6,8 @@ import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { updateProfile, changePassword } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
+import { generateAuthTokens } from '../services/token.service';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-
-/**
- * Generate JWT token for a user
- */
-const generateAuthToken = (userId: string, role: string): string => {
-  const jwtSecret = process.env.JWT_SECRET || 'fallbacksecret';
-  const payload = { id: userId, role };
-  const options = { expiresIn: process.env.JWT_EXPIRES_IN || '24h' };
-  return jwt.sign(payload, jwtSecret, options as jwt.SignOptions);
-};
 
 /**
  * Upgrade a regular user to an organizer or create a new organizer
@@ -333,8 +323,8 @@ export const loginOrganizerController = async (req: Request, res: Response, next
       return;
     }
 
-    // Generate token
-    const token = generateAuthToken(user.id, user.role);
+    // Generate access + refresh tokens
+    const { token, refreshToken } = generateAuthTokens(user.id, user.role);
 
     res.status(200).json({
       success: true,
@@ -346,7 +336,8 @@ export const loginOrganizerController = async (req: Request, res: Response, next
         email: user.email,
         role: user.role,
         organizerProfile: toOrganizerProfile(user as any),
-        token
+        token,
+        refreshToken
       }
     });
   } catch (error) {

@@ -2,25 +2,14 @@ import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { sendOTP } from './whatsapp.service';
+import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 
 /**
  * Generate a 6-digit OTP
  */
 const generateOTPCode = (): string => {
   return Math.floor(100000 + Math.random() * 900000).toString();
-};
-
-/**
- * Generate JWT token for a user
- */
-const generateAuthToken = (userId: string, role: string): string => {
-  const jwtSecret = process.env.JWT_SECRET || 'fallbacksecret';
-  const payload = { id: userId, role };
-  const options = { expiresIn: process.env.JWT_EXPIRES_IN || '24h' };
-  
-  return jwt.sign(payload, jwtSecret, options as jwt.SignOptions);
 };
 
 /**
@@ -95,7 +84,10 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
  * @param otp OTP entered by user
  * @returns Object containing user information and token
  */
-export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ user: any; token: string }> => {
+export const verifyOTP = async (
+  phoneNumber: string,
+  otp: string
+): Promise<{ user: any; token: string; refreshToken: string }> => {
   try {
     // Find user with the phone number
     const user = await prisma.user.findUnique({
@@ -131,10 +123,10 @@ export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ use
       },
     });
 
-    // Generate JWT token
-    const token = generateAuthToken(updatedUser.id, updatedUser.role);
+    // Generate access + refresh tokens
+    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role);
 
-    // Return user info (without sensitive data) and token
+    // Return user info (without sensitive data) and tokens
     const userToReturn = {
       id: updatedUser.id,
       name: updatedUser.name,
@@ -147,6 +139,7 @@ export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ use
     return {
       user: userToReturn,
       token,
+      refreshToken,
     };
   } catch (error) {
     console.error('Error in verifyOTP service:', error);
