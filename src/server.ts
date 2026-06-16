@@ -9,6 +9,7 @@ import ticketRoutes from './routes/ticket.routes';
 import organizerRoutes from './routes/organizer.routes';
 import dashboardRoutes from './routes/dashboard.routes';
 import paymentRoutes from './routes/payment.routes';
+import userRoutes from './routes/user.routes';
 import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
@@ -41,6 +42,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/events', eventRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/organizers', organizerRoutes);
+app.use('/api/user', userRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
 // Health check endpoint

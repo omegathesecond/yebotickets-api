@@ -24,6 +24,14 @@ export const verifyOTPValidator = [
     .withMessage('OTP must contain only numbers'),
 ];
 
+export const refreshTokenValidator = [
+  body('refreshToken')
+    .notEmpty()
+    .withMessage('Refresh token is required')
+    .isString()
+    .withMessage('Refresh token must be a string'),
+];
+
 export const updateProfileValidator = [
   body('name')
     .optional()
