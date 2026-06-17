@@ -17,7 +17,7 @@ import {
   getEventTicketsController,
 } from '../controllers/organizer-event.controller';
 import { validate } from '../middleware/validate.middleware';
-import { protect, authorize } from '../middleware/auth.middleware';
+import { protect, optionalAuth, authorize } from '../middleware/auth.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
@@ -100,7 +100,10 @@ router.get(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/', getEventsController);
+// optionalAuth attaches req.user when a valid token is present so the controller
+// can decide whether to honour the showUnpublished flag (admins only).
+// Anonymous callers still get the public, published-only list.
+router.get('/', optionalAuth, getEventsController);
 
 /**
  * @swagger

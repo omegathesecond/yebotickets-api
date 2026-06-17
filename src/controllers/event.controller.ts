@@ -32,8 +32,19 @@ export const createEventController = async (req: Request, res: Response, next: N
 
 export const getEventsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const events = await getEvents(req.query);
-    
+    const authReq = req as AuthenticatedRequest;
+    const isAdmin = authReq.user?.role === 'admin';
+
+    // The showUnpublished flag exposes draft/unpublished events. It must never be
+    // honoured from untrusted query input — only admins may list unpublished
+    // events. Strip it for everyone else so the public list stays published-only.
+    const query = { ...req.query };
+    if (!isAdmin) {
+      delete query.showUnpublished;
+    }
+
+    const events = await getEvents(query);
+
     res.status(200).json({
       success: true,
       count: events.length,
