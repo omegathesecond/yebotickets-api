@@ -6,6 +6,14 @@ import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 
 /**
+ * Maximum number of consecutive wrong guesses allowed against a single OTP
+ * before it is invalidated and the user is forced to request a fresh code.
+ * This is the hard brute-force lock: it holds even if an attacker spreads
+ * guesses across IPs to dodge the request-level rate limiter.
+ */
+const MAX_OTP_ATTEMPTS = 5;
+
+/**
  * Generate a 6-digit OTP
  */
 const generateOTPCode = (): string => {
@@ -56,12 +64,14 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     const otp = generateOTPCode();
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Update user with OTP
+    // Update user with OTP. Reset the failed-attempt counter so a fresh code
+    // always starts with a full allowance of verify attempts.
     await prisma.user.update({
       where: { id: user.id },
       data: {
         otpCode: otp,
         otpExpiresAt,
+        otpAttempts: 0,
       },
     });
 
@@ -110,15 +120,42 @@ export const verifyOTP = async (
 
     // Check if OTP matches
     if (user.otpCode !== otp) {
-      throw new ApiError('Invalid OTP', 400);
+      // Wrong guess: bump the attempt counter. Once the threshold is reached,
+      // invalidate the code entirely (clear it + reset the counter) so the
+      // attacker can't keep guessing and the user is forced to request a new
+      // one. Returns 429 so the client surfaces the lockout distinctly.
+      const attempts = (user.otpAttempts ?? 0) + 1;
+
+      if (attempts >= MAX_OTP_ATTEMPTS) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            otpCode: null,
+            otpExpiresAt: null,
+            otpAttempts: 0,
+          },
+        });
+        throw new ApiError(
+          'Too many incorrect attempts. This code has been disabled — please request a new OTP.',
+          429
+        );
+      }
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { otpAttempts: attempts },
+      });
+      const remaining = MAX_OTP_ATTEMPTS - attempts;
+      throw new ApiError(`Invalid OTP. ${remaining} attempt(s) remaining.`, 400);
     }
 
-    // OTP verified, clear it and mark user as verified
+    // OTP verified, clear it, reset the attempt counter, and mark user verified
     const updatedUser = await prisma.user.update({
       where: { id: user.id },
       data: {
         otpCode: null,
         otpExpiresAt: null,
+        otpAttempts: 0,
         isVerified: true,
       },
     });
