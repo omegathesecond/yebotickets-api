@@ -13,6 +13,14 @@ import { Request } from 'express';
  * The per-OTP failed-attempt lockout in auth.service is the real brute-force
  * defense (it dies after N wrong guesses even across IPs); these limiters are
  * the coarse volume throttle that sits in front of it.
+ *
+ * `request-otp` is guarded by TWO layered limiters: a precise phone+IP one (5
+ * per number) and a coarser IP-only one (20 per network). The phone+IP key
+ * alone is bypassable by phone rotation — every distinct number is a fresh
+ * bucket worth another 5 sends — so a single host can fan out unlimited SMS and
+ * spawn a User row per number (requestOTP auto-creates users). The IP-only cap
+ * closes that hole by bounding total issuance per source IP regardless of which
+ * number is targeted.
  */
 
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
@@ -34,6 +42,14 @@ const phoneAndIpKey = (req: Request): string => {
 };
 
 /**
+ * Build a rate-limit key from the caller's IP alone (IPv6-normalised). This is
+ * deliberately phone-agnostic so that rotating the `phoneNumber` in the body
+ * cannot mint a fresh budget — every OTP request from a given source IP counts
+ * against the same bucket.
+ */
+const ipOnlyKey = (req: Request): string => ipKeyGenerator(req.ip ?? '');
+
+/**
  * Throttle OTP issuance: max 5 requests per phone+IP per 15 minutes.
  * Protects against SMS/WhatsApp spam (cost + abuse of YeboLink).
  */
@@ -46,6 +62,27 @@ export const requestOtpLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many OTP requests. Please wait 15 minutes before requesting another code.',
+  },
+});
+
+/**
+ * Coarse per-network throttle for OTP issuance: max 20 requests per IP per 15
+ * minutes, keyed on IP ONLY. Layered in front of `requestOtpLimiter` to stop
+ * the phone-rotation bypass — one host can no longer request OTPs for an
+ * unlimited number of distinct phone numbers (which would otherwise each get a
+ * fresh phone+IP bucket of 5 sends AND auto-create a User row). A legitimate
+ * caller on a shared/NAT'd network is very unlikely to need 20 codes in 15
+ * minutes, so this leaves real users untouched while capping abuse + cost.
+ */
+export const requestOtpIpLimiter = rateLimit({
+  windowMs: FIFTEEN_MINUTES_MS,
+  max: 20,
+  keyGenerator: ipOnlyKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many OTP requests from this network. Please wait 15 minutes before trying again.',
   },
 });
 

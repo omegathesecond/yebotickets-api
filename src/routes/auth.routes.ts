@@ -14,14 +14,17 @@ import {
 } from '../validators/auth.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect } from '../middleware/auth.middleware';
-import { requestOtpLimiter, verifyOtpLimiter } from '../middleware/rateLimit.middleware';
+import { requestOtpLimiter, requestOtpIpLimiter, verifyOtpLimiter } from '../middleware/rateLimit.middleware';
 
 const router = express.Router();
 
 // Public routes
 // Rate limiters run BEFORE validation so abusive volume is rejected with 429
 // before we touch the DB or fan out an SMS via YeboLink.
-router.post('/request-otp', requestOtpLimiter, validate(requestOTPValidator), requestOTPController);
+// `request-otp` is double-throttled: the IP-only limiter (coarse, 20/IP) runs
+// first to stop phone-rotation SMS spam, then the precise phone+IP limiter
+// (5/number) caps per-recipient abuse.
+router.post('/request-otp', requestOtpIpLimiter, requestOtpLimiter, validate(requestOTPValidator), requestOTPController);
 router.post('/verify-otp', verifyOtpLimiter, validate(verifyOTPValidator), verifyOTPController);
 
 /**
