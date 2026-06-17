@@ -29,6 +29,17 @@ jest.mock('../comms.service', () => ({
   sendEmailMessage: jest.fn(async () => ({ ok: true })),
 }));
 
+// Mock the R2 storage. deliverTicketToBuyer uploads the ticket QR PNG to R2 and
+// passes its public URL to WhatsApp; the unit test must not touch Cloudflare, so
+// upload() returns a fake public URL. Tests that exercise the R2-failure
+// fallback override this per-test.
+jest.mock('../storage.service', () => ({
+  r2Storage: {
+    upload: jest.fn(async () => 'https://cdn.yebotickets.test/ticket-qr/event-1/ABC123.png'),
+    isConfigured: jest.fn(() => true),
+  },
+}));
+
 // Mock the YeboPay client so the purchase flow never hits the gateway. The
 // payment outcome (SUCCEEDED / FAILED / PENDING / throw) is driven per-test.
 jest.mock('../yebopay.service', () => ({
@@ -61,12 +72,14 @@ import {
   reclaimExpiredReservations,
 } from '../ticket.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
+import { r2Storage } from '../storage.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 const sendTextMessageMock = sendTextMessage as jest.MockedFunction<typeof sendTextMessage>;
 const sendEmailMessageMock = sendEmailMessage as jest.MockedFunction<typeof sendEmailMessage>;
+const r2UploadMock = r2Storage.upload as jest.MockedFunction<typeof r2Storage.upload>;
 const createChargeMock = createCharge as jest.MockedFunction<typeof createCharge>;
 const getChargeMock = getCharge as jest.MockedFunction<typeof getCharge>;
 const refundChargeMock = refundCharge as jest.MockedFunction<typeof refundCharge>;
@@ -83,6 +96,8 @@ beforeEach(() => {
   sendTextMessageMock.mockResolvedValue({ ok: true } as any);
   sendEmailMessageMock.mockReset();
   sendEmailMessageMock.mockResolvedValue({ ok: true } as any);
+  r2UploadMock.mockReset();
+  r2UploadMock.mockResolvedValue('https://cdn.yebotickets.test/ticket-qr/event-1/ABC123.png');
   createChargeMock.mockReset();
   getChargeMock.mockReset();
   refundChargeMock.mockReset();
@@ -243,6 +258,17 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(result.amountPaid).toBe(100);
     expect(result.qrCode).toBe('data:image/png;base64,FAKEQR');
     expect(result.delivery).toEqual({ channel: 'whatsapp', status: 'sent' });
+
+    // The scannable QR is hosted on R2 and attached to the WhatsApp message as a
+    // public media URL (YeboLink media_urls takes URLs, not buffers).
+    expect(r2UploadMock).toHaveBeenCalledTimes(1);
+    expect(r2UploadMock.mock.calls[0][0]).toMatchObject({
+      mimeType: 'image/png',
+      key: 'ticket-qr/event-1/ABC123.png',
+    });
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    const [, , mediaUrls] = sendTextMessageMock.mock.calls[0];
+    expect(mediaUrls).toEqual(['https://cdn.yebotickets.test/ticket-qr/event-1/ABC123.png']);
   });
 
   it('rejects a priced purchase with no payment details (400) and never reserves or charges', async () => {
@@ -487,6 +513,65 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
     expect(createChargeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('ticket delivery — scannable QR over WhatsApp (R2 media)', () => {
+  // Drive a free-ticket purchase (simplest issue path) and inspect how the QR is
+  // delivered. The buyer fixture decides which channels are available.
+  const buyFreeTicket = (over: Partial<any> = {}) => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price: 0 }) as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildTicketWithRelations({ status: 'sold', paymentStatus: 'FREE', amountPaid: 0, ...over }) as any
+    );
+    return purchaseTicket('tt-1', 'user-1');
+  };
+
+  it('uploads the QR PNG to R2 and attaches its public URL to the WhatsApp message', async () => {
+    const result: any = await buyFreeTicket();
+
+    expect(result.delivery).toEqual({ channel: 'whatsapp', status: 'sent' });
+    expect(r2UploadMock).toHaveBeenCalledTimes(1);
+    expect(r2UploadMock.mock.calls[0][0]).toMatchObject({
+      mimeType: 'image/png',
+      key: 'ticket-qr/event-1/ABC123.png',
+    });
+    // sendTextMessage(phone, text, mediaUrls) — the QR rides as a public media URL.
+    const [, , mediaUrls] = sendTextMessageMock.mock.calls[0];
+    expect(mediaUrls).toEqual(['https://cdn.yebotickets.test/ticket-qr/event-1/ABC123.png']);
+    expect(sendEmailMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to email (QR inline) and surfaces the error when the R2 upload fails — never a silent QR-less WhatsApp', async () => {
+    r2UploadMock.mockRejectedValueOnce(new Error('R2_ACCESS_KEY_ID env var is not set'));
+
+    const result: any = await buyFreeTicket({
+      user: { id: 'user-1', name: 'Buyer', phoneNumber: '+26878000000', email: 'buyer@example.com' },
+    });
+
+    // WhatsApp-with-QR failed; we did NOT send a QR-less WhatsApp text instead.
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+    // Email fallback carried the ticket (its body renders the QR inline).
+    expect(sendEmailMessageMock).toHaveBeenCalledTimes(1);
+    expect(result.delivery.channel).toBe('email');
+    expect(result.delivery.status).toBe('sent');
+  });
+
+  it('reports delivery FAILED (surfaced, not swallowed) when R2 fails and the buyer has no email', async () => {
+    r2UploadMock.mockRejectedValueOnce(new Error('R2 down'));
+
+    const result: any = await buyFreeTicket({
+      user: { id: 'user-1', name: 'Buyer', phoneNumber: '+26878000000' }, // no email
+    });
+
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+    expect(sendEmailMessageMock).not.toHaveBeenCalled();
+    expect(result.delivery.status).toBe('failed');
+    expect(result.delivery.error).toContain('whatsapp:');
+    // The QR is still returned inline in the response so the buyer is never stranded.
+    expect(result.qrCode).toBe('data:image/png;base64,FAKEQR');
   });
 });
 

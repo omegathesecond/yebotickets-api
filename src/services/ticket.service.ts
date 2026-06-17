@@ -10,8 +10,10 @@ import crypto from 'crypto';
 import {
   buildTicketQrPayload,
   generateTicketQrDataUrl,
+  generateTicketQrBuffer,
 } from './qr.service';
 import { sendTextMessage, sendEmailMessage } from './comms.service';
+import { r2Storage } from './storage.service';
 import {
   createCharge,
   getCharge,
@@ -487,16 +489,38 @@ const buildTicketEmailHtml = (ticket: any, qrDataUrl: string): string => {
  * paid purchase is never rolled back over a comms hiccup, but the failure is
  * surfaced, not swallowed.
  */
+/**
+ * Render the ticket QR and host it at a PUBLIC URL on the product's Cloudflare
+ * R2 bucket so it can be attached to the WhatsApp message (YeboLink's WhatsApp
+ * `media_urls` takes public URLs, not buffers). The object key is deterministic
+ * per (event, ticket) so a redelivered webhook just overwrites the same object
+ * rather than accumulating duplicates. Throws on any R2 failure so the caller
+ * treats the WhatsApp-with-QR attempt as failed (and falls back to email)
+ * instead of silently sending a QR-less message.
+ */
+const uploadTicketQr = async (ticket: any): Promise<string> => {
+  const qrBuffer = await generateTicketQrBuffer(ticket.eventId, ticket.uniqueCode);
+  return r2Storage.upload({
+    buffer: qrBuffer,
+    mimeType: 'image/png',
+    key: `ticket-qr/${ticket.eventId}/${ticket.uniqueCode}.png`,
+  });
+};
+
 const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> => {
   const phoneNumber = ticket.user?.phoneNumber;
   const email = ticket.user?.email;
   const text = buildTicketMessage(ticket);
   const errors: string[] = [];
 
-  // Primary channel: WhatsApp via YeboLink.
+  // Primary channel: WhatsApp via YeboLink, with the scannable QR attached as a
+  // PUBLIC R2 image so the buyer can scan it at the gate from the chat. If the
+  // QR upload OR the send fails, we surface it and fall through to email (whose
+  // body renders the same QR inline) — never a silent QR-less WhatsApp.
   if (phoneNumber) {
     try {
-      await sendTextMessage(phoneNumber, text);
+      const qrUrl = await uploadTicketQr(ticket);
+      await sendTextMessage(phoneNumber, text, [qrUrl]);
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver ticket via WhatsApp:', error);

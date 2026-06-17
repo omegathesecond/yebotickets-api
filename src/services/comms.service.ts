@@ -26,15 +26,24 @@ export const sendOTP = async (phoneNumber: string, otp: string): Promise<YeboLin
   });
 
 /**
- * Send a plain text message to the user over WhatsApp via YeboLink.
+ * Send a text message to the user over WhatsApp via YeboLink, optionally with
+ * public media attached. YeboLink's WhatsApp `media_urls` takes PUBLIC URLs
+ * (not buffers), so callers that want to attach an image (e.g. the scannable
+ * ticket QR) must host it first and pass its public URL here.
  * @param phoneNumber Recipient phone number (with country code)
  * @param messageText The message body
+ * @param mediaUrls Optional public URLs to attach (e.g. the ticket QR PNG)
  */
 export const sendTextMessage = async (
   phoneNumber: string,
-  messageText: string
+  messageText: string,
+  mediaUrls?: string[]
 ): Promise<YeboLinkMessageResult> =>
-  YeboLinkClient.sendWhatsApp({ to: formatPhone(phoneNumber), text: messageText });
+  YeboLinkClient.sendWhatsApp({
+    to: formatPhone(phoneNumber),
+    text: messageText,
+    ...(mediaUrls && mediaUrls.length ? { mediaUrls } : {}),
+  });
 
 /**
  * Send an email to the user via YeboLink. Used as a fallback delivery channel
