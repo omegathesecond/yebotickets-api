@@ -1,7 +1,7 @@
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
-import { sendOTP } from './whatsapp.service';
+import { sendOTP } from './comms.service';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 
