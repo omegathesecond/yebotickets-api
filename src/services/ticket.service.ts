@@ -10,8 +10,10 @@ import crypto from 'crypto';
 import {
   buildTicketQrPayload,
   generateTicketQrDataUrl,
+  generateTicketQrBuffer,
 } from './qr.service';
 import { sendTextMessage, sendEmailMessage } from './comms.service';
+import { r2Storage } from './storage.service';
 import {
   createCharge,
   getCharge,
@@ -493,10 +495,21 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
   const text = buildTicketMessage(ticket);
   const errors: string[] = [];
 
-  // Primary channel: WhatsApp via YeboLink.
+  // Primary channel: WhatsApp via YeboLink. When R2 is configured we host the QR
+  // PNG and attach it as a scannable image (YeboLink media_urls takes public URLs,
+  // not buffers). R2 is an enhancement, not a hard requirement: the QR is also
+  // returned inline in the purchase response and embedded in the email fallback,
+  // so an unconfigured R2 (surfaced loudly on /health as r2.configured=false)
+  // degrades to a text+code WhatsApp message rather than failing the delivery.
   if (phoneNumber) {
     try {
-      await sendTextMessage(phoneNumber, text);
+      let mediaUrls: string[] | undefined;
+      if (r2Storage.isConfigured()) {
+        const qrPng = await generateTicketQrBuffer(ticket.eventId, ticket.uniqueCode);
+        // Throws on upload failure → caught below and surfaced, never swallowed.
+        mediaUrls = [await r2Storage.uploadTicketQr(ticket.uniqueCode, qrPng)];
+      }
+      await sendTextMessage(phoneNumber, text, mediaUrls);
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver ticket via WhatsApp:', error);

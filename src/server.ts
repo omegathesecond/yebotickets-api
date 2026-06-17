@@ -14,6 +14,7 @@ import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
 import prisma from './config/prisma';
+import { r2Storage } from './services/storage.service';
 
 // Load environment variables
 dotenv.config();
@@ -45,14 +46,18 @@ app.use('/api/organizers', organizerRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
-// Health check endpoint
+// Health check endpoint. `r2.configured` reflects whether the R2 media-storage
+// secrets (used to host ticket QR images for WhatsApp delivery) are actually
+// bound on this revision — so a deploy can be verified to have R2 wired without
+// triggering a real upload.
 app.get('/health', async (_, res) => {
+  const r2 = { configured: r2Storage.isConfigured() };
   try {
     // Check database connection
     await prisma.$queryRaw`SELECT 1`;
-    res.status(200).json({ status: 'ok', database: 'connected' });
+    res.status(200).json({ status: 'ok', database: 'connected', r2 });
   } catch (error) {
-    res.status(500).json({ status: 'error', database: 'disconnected' });
+    res.status(500).json({ status: 'error', database: 'disconnected', r2 });
   }
 });
 

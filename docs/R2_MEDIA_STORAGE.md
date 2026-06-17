@@ -2,8 +2,20 @@
 
 `src/services/storage.service.ts` (`r2Storage`) uploads the ticket QR PNG to a
 public Cloudflare R2 URL so it can be attached to the WhatsApp ticket message via
-YeboLink `media_urls` (which takes public URLs, not buffers). If R2 is not
-configured, delivery degrades loudly to email — never a silent no-op.
+YeboLink `media_urls` (which takes public URLs, not buffers). It signs S3 requests
+with SigV4 via `aws4fetch` (zero-dep, over native `fetch`) — no AWS SDK.
+
+`r2Storage.isConfigured()` is true only when all five env vars below are present
+and non-empty, and is surfaced on `GET /health` as `r2.configured` so a deployed
+revision can be verified to have R2 wired without triggering a real upload.
+
+The QR-over-WhatsApp delivery path (`ticket.service.deliverTicketToBuyer`)
+feature-detects with `isConfigured()`: when R2 is configured it uploads the QR
+PNG and attaches the public URL as a WhatsApp image; when it is not, it sends the
+text+ticket-code WhatsApp message without the image (the scannable QR is still
+returned inline in the purchase response and embedded in the email fallback).
+`r2Storage.upload*` itself throws if called while unconfigured — it never returns
+a fake/placeholder URL or silently no-ops (per CLAUDE.md, no silent fallbacks).
 
 This document records the provisioned infrastructure so the wiring is
 reproducible and so a future deploy does not silently drop it.
