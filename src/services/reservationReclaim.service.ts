@@ -1,3 +1,4 @@
+import prisma from '../config/prisma';
 import {
   reclaimExpiredReservations,
   RECLAIM_BATCH,
@@ -21,12 +22,46 @@ import {
 // is fully idempotent and safe to run concurrently from multiple Cloud Run
 // instances or to retry — no oversell, no double-release, no double-delivery.
 //
+// CROSS-INSTANCE SINGLE-FLIGHT: the in-process timer runs in EVERY Cloud Run
+// instance, so when the service scales to N instances all N would otherwise
+// sweep every ~5 min at once — safe (see above) but wastefully redundant (each
+// instance re-asks YeboPay getCharge for the same stale rows). Each sweep
+// therefore first tries to grab a Postgres TRANSACTION-scoped advisory lock
+// (pg_try_advisory_xact_lock); only the instance that wins runs the drain, the
+// rest skip this tick. The lock auto-releases when the wrapping transaction
+// ends (commit/rollback/connection drop), so a crashed leader never wedges the
+// sweep — and it works through a PgBouncer pooler because the whole acquire +
+// drain runs inside ONE interactive transaction pinned to one backend. This is
+// pure cost/efficiency hardening; correctness never depended on it.
+//
 // Failures are surfaced LOUDLY (logged at error level; the HTTP path rethrows
 // to a 5xx) — never swallowed and never replaced with a fake "ok" (CLAUDE.md:
 // no silent fallbacks).
 // ===========================================================================
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Default ceiling on how long the advisory-lock-holding transaction may stay
+ * open (i.e. how long one drain may run). Generously above any realistic sweep
+ * — a full 1000-row backlog at even ~0.5s/row finishes well inside this — so it
+ * only ever trips on a genuinely stuck sweep, which SHOULD surface as an error.
+ * Overridable via RESERVATION_RECLAIM_LOCK_TIMEOUT_MS.
+ */
+const DEFAULT_LOCK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Two 32-bit keys identifying the reclaim advisory lock (pg_advisory_xact_lock
+ * takes int4, int4). Arbitrary but FIXED + namespaced to YeboTickets so the
+ * pair is effectively unique within this database. 'YT' / 'RC'.
+ */
+const ADVISORY_LOCK_KEY_1 = 0x5954; // 'YT'
+const ADVISORY_LOCK_KEY_2 = 0x5243; // 'RC'
+
+/** True unless RESERVATION_RECLAIM_SINGLE_FLIGHT=false (default on). */
+const singleFlightEnabled = (): boolean =>
+  (process.env.RESERVATION_RECLAIM_SINGLE_FLIGHT ?? 'true').toLowerCase() !==
+  'false';
 /**
  * Cap on batches drained per sweep tick (50 * RECLAIM_BATCH = 1000 rows). A
  * single tick keeps clearing actionable backlog up to this ceiling; whatever is
@@ -58,7 +93,7 @@ const emptyResult = (skipped: boolean): SweepResult => ({
 });
 
 /**
- * Run the global reclaim across ALL ticket types, draining successive batches
+ * Drain the global reclaim across ALL ticket types, running successive batches
  * while each full batch still makes progress (finalized + released > 0).
  *
  * The progress guard is deliberate: reclaimExpiredReservations() takes only
@@ -73,6 +108,75 @@ const emptyResult = (skipped: boolean): SweepResult => ({
  * itself failing — DOES propagate so the caller (timer logs it; HTTP returns
  * 5xx) sees the outage loudly.
  */
+const drainSweep = async (): Promise<SweepResult> => {
+  const totals = emptyResult(false);
+  for (let i = 0; i < MAX_SWEEP_ITERATIONS; i++) {
+    const batch = await reclaimExpiredReservations(); // global: every ticket type
+    totals.scanned += batch.scanned;
+    totals.finalized += batch.finalized;
+    totals.released += batch.released;
+    totals.errors += batch.errors;
+    totals.stillPending = batch.stillPending; // residual held by the final batch
+    totals.iterations++;
+
+    const fullBatch = batch.scanned >= RECLAIM_BATCH;
+    const madeProgress = batch.finalized + batch.released > 0;
+    if (!fullBatch || !madeProgress) break;
+  }
+  return totals;
+};
+
+/**
+ * Run `drain` under a cluster-wide Postgres transaction advisory lock so only
+ * ONE Cloud Run instance sweeps per tick. If another instance already holds the
+ * lock, returns a skipped result instead of duplicating its work.
+ *
+ * The advisory lock is TRANSACTION-scoped: it is held for the lifetime of the
+ * wrapping interactive transaction and released automatically on commit (or on
+ * rollback / connection loss), so a leader that crashes mid-sweep can never
+ * wedge the lock. The drain runs INSIDE the transaction callback — the locking
+ * connection just sits idle holding the lock while the drain's own writes use
+ * the normal pooled client; advisory locks contend with nothing else, so there
+ * is no deadlock and no table/row is held.
+ *
+ * Disable with RESERVATION_RECLAIM_SINGLE_FLIGHT=false (e.g. single-instance
+ * dev, or when a single external Cloud Scheduler is the only driver) to run the
+ * drain directly without touching the lock.
+ */
+const withCrossInstanceLock = async (
+  drain: () => Promise<SweepResult>
+): Promise<SweepResult> => {
+  if (!singleFlightEnabled()) {
+    return drain();
+  }
+
+  const timeout =
+    Number.parseInt(process.env.RESERVATION_RECLAIM_LOCK_TIMEOUT_MS || '', 10) ||
+    DEFAULT_LOCK_TIMEOUT_MS;
+
+  return prisma.$transaction(
+    async (tx) => {
+      const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`
+        SELECT pg_try_advisory_xact_lock(${ADVISORY_LOCK_KEY_1}, ${ADVISORY_LOCK_KEY_2}) AS locked`;
+      if (!rows[0]?.locked) {
+        console.log(
+          '[reclaim] another instance holds the sweep lock — skipping this tick'
+        );
+        return emptyResult(true);
+      }
+      return drain();
+    },
+    { timeout, maxWait: 10_000 }
+  );
+};
+
+/**
+ * Run the global reclaim sweep, gated so it runs at most once at a time per
+ * instance (`sweepInFlight`) AND at most once across the whole cluster per tick
+ * (Postgres advisory lock — see withCrossInstanceLock). Returns the aggregated
+ * tally; `skipped: true` means this call did no work because another sweep (in
+ * this process or another instance) was already running.
+ */
 export const runReclaimSweep = async (): Promise<SweepResult> => {
   if (sweepInFlight) {
     console.warn('[reclaim] previous sweep still in flight — skipping this tick');
@@ -80,21 +184,9 @@ export const runReclaimSweep = async (): Promise<SweepResult> => {
   }
 
   sweepInFlight = true;
-  const totals = emptyResult(false);
+  let totals: SweepResult;
   try {
-    for (let i = 0; i < MAX_SWEEP_ITERATIONS; i++) {
-      const batch = await reclaimExpiredReservations(); // global: every ticket type
-      totals.scanned += batch.scanned;
-      totals.finalized += batch.finalized;
-      totals.released += batch.released;
-      totals.errors += batch.errors;
-      totals.stillPending = batch.stillPending; // residual held by the final batch
-      totals.iterations++;
-
-      const fullBatch = batch.scanned >= RECLAIM_BATCH;
-      const madeProgress = batch.finalized + batch.released > 0;
-      if (!fullBatch || !madeProgress) break;
-    }
+    totals = await withCrossInstanceLock(drainSweep);
   } finally {
     sweepInFlight = false;
   }

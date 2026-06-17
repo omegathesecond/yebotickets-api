@@ -11,6 +11,20 @@ jest.mock('../ticket.service', () => ({
   reclaimExpiredReservations: jest.fn(),
 }));
 
+// Mock the Prisma client so the cross-instance advisory lock is exercised
+// without a real database. `$transaction` runs the callback with a tx client
+// whose `$queryRaw` reports whether pg_try_advisory_xact_lock was granted —
+// flip `mockLockState.granted` to simulate another instance holding the lock.
+const mockLockState = { granted: true };
+const mockQueryRaw = jest.fn(async () => [{ locked: mockLockState.granted }]);
+const mockTransaction = jest.fn(async (cb: (tx: any) => unknown) =>
+  cb({ $queryRaw: mockQueryRaw })
+);
+jest.mock('../../config/prisma', () => ({
+  __esModule: true,
+  default: { $transaction: (...args: any[]) => mockTransaction(...(args as [any])) },
+}));
+
 import { reclaimExpiredReservations, RECLAIM_BATCH } from '../ticket.service';
 import {
   runReclaimSweep,
@@ -35,6 +49,7 @@ afterEach(() => {
   stopReservationReclaimScheduler();
   jest.clearAllMocks();
   jest.useRealTimers();
+  mockLockState.granted = true; // restore: lock granted by default
 });
 
 describe('runReclaimSweep', () => {
@@ -46,6 +61,45 @@ describe('runReclaimSweep', () => {
     expect(reclaimMock).toHaveBeenCalledTimes(1);
     expect(reclaimMock).toHaveBeenCalledWith(); // no argument => all ticket types
     expect(result).toMatchObject({ scanned: 3, released: 2, iterations: 1, skipped: false });
+  });
+
+  it('takes the cross-instance advisory lock before sweeping (single-flight)', async () => {
+    reclaimMock.mockResolvedValueOnce(summary({ scanned: 1, released: 1 }) as any);
+
+    const result = await runReclaimSweep();
+
+    // The drain ran inside one advisory-lock transaction.
+    expect(mockTransaction).toHaveBeenCalledTimes(1);
+    expect(mockQueryRaw).toHaveBeenCalledTimes(1);
+    expect(reclaimMock).toHaveBeenCalledTimes(1);
+    expect(result.skipped).toBe(false);
+  });
+
+  it('skips the drain when another instance already holds the advisory lock', async () => {
+    mockLockState.granted = false; // pg_try_advisory_xact_lock -> false elsewhere
+
+    const result = await runReclaimSweep();
+
+    expect(mockTransaction).toHaveBeenCalledTimes(1); // we DID attempt the lock
+    expect(reclaimMock).not.toHaveBeenCalled(); // ...but did NOT duplicate the work
+    expect(result).toMatchObject({ skipped: true, iterations: 0 });
+  });
+
+  it('runs the drain directly (no lock) when RESERVATION_RECLAIM_SINGLE_FLIGHT=false', async () => {
+    const prev = process.env.RESERVATION_RECLAIM_SINGLE_FLIGHT;
+    process.env.RESERVATION_RECLAIM_SINGLE_FLIGHT = 'false';
+    reclaimMock.mockResolvedValueOnce(summary({ scanned: 2, released: 2 }) as any);
+
+    try {
+      const result = await runReclaimSweep();
+
+      expect(mockTransaction).not.toHaveBeenCalled(); // lock bypassed
+      expect(reclaimMock).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ released: 2, iterations: 1, skipped: false });
+    } finally {
+      if (prev === undefined) delete process.env.RESERVATION_RECLAIM_SINGLE_FLIGHT;
+      else process.env.RESERVATION_RECLAIM_SINGLE_FLIGHT = prev;
+    }
   });
 
   it('drains successive FULL batches while each makes progress, then stops on a partial batch', async () => {
