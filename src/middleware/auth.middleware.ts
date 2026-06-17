@@ -83,6 +83,32 @@ export const verifyDashboardApiKey = (req: Request, res: Response, next: NextFun
   if (apiKey !== process.env.DASHBOARD_API_KEY) {
     return next(new ApiError('Invalid API key', 401));
   }
-  
+
+  next();
+};
+
+/**
+ * Guard for internal machine-to-machine endpoints (e.g. the Cloud Scheduler
+ * driven reservation-reclaim sweep). Authenticates the `x-internal-key` header
+ * against INTERNAL_API_KEY.
+ *
+ * Fails CLOSED: if INTERNAL_API_KEY is not configured the endpoint is rejected
+ * with 503 rather than silently accepting every caller — a misconfiguration is
+ * surfaced loudly, never treated as "open" (CLAUDE.md: no silent fallbacks).
+ */
+export const verifyInternalApiKey = (req: Request, res: Response, next: NextFunction) => {
+  const expected = process.env.INTERNAL_API_KEY;
+  if (!expected) {
+    return next(new ApiError('Internal API key not configured', 503));
+  }
+
+  const apiKey = req.headers['x-internal-key'] || req.query.internalKey;
+  if (!apiKey) {
+    return next(new ApiError('Internal API key required', 401));
+  }
+  if (apiKey !== expected) {
+    return next(new ApiError('Invalid internal API key', 401));
+  }
+
   next();
 };

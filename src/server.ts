@@ -10,6 +10,11 @@ import organizerRoutes from './routes/organizer.routes';
 import dashboardRoutes from './routes/dashboard.routes';
 import paymentRoutes from './routes/payment.routes';
 import userRoutes from './routes/user.routes';
+import internalRoutes from './routes/internal.routes';
+import {
+  startReservationReclaimScheduler,
+  stopReservationReclaimScheduler,
+} from './services/reservationReclaim.service';
 import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
@@ -50,6 +55,7 @@ app.use('/api/tickets', ticketRoutes);
 app.use('/api/organizers', organizerRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/internal', internalRoutes);
 
 // Health check endpoint
 app.get('/health', async (_, res) => {
@@ -71,6 +77,7 @@ app.use(errorHandler);
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Shutting down gracefully...');
+  stopReservationReclaimScheduler();
   await prisma.$disconnect();
   process.exit(0);
 });
@@ -86,6 +93,11 @@ const startServer = async () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`API Documentation available at http://localhost:${PORT}/api-docs`);
     });
+
+    // Periodically free seats held by expired/abandoned PENDING reservations
+    // across ALL ticket types (otherwise a hold is only ever reclaimed lazily
+    // when another buyer happens to hit the same ticket type).
+    startReservationReclaimScheduler();
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);

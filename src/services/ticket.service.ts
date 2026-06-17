@@ -47,7 +47,7 @@ const RESERVATION_TTL_MS = Number.parseInt(process.env['RESERVATION_TTL_MS'] || 
 const RESERVATION_HARD_EXPIRY_MS =
   Number.parseInt(process.env['RESERVATION_HARD_EXPIRY_MS'] || '', 10) || 60 * 60 * 1000;
 /** Cap how many stale holds one lazy sweep resolves, to bound purchase latency. */
-const RECLAIM_BATCH = 20;
+export const RECLAIM_BATCH = 20;
 
 /**
  * How the buyer is paying, forwarded to YeboPay. Either a saved
