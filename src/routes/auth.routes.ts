@@ -14,12 +14,15 @@ import {
 } from '../validators/auth.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect } from '../middleware/auth.middleware';
+import { requestOtpLimiter, verifyOtpLimiter } from '../middleware/rateLimit.middleware';
 
 const router = express.Router();
 
 // Public routes
-router.post('/request-otp', validate(requestOTPValidator), requestOTPController);
-router.post('/verify-otp', validate(verifyOTPValidator), verifyOTPController);
+// Rate limiters run BEFORE validation so abusive volume is rejected with 429
+// before we touch the DB or fan out an SMS via YeboLink.
+router.post('/request-otp', requestOtpLimiter, validate(requestOTPValidator), requestOTPController);
+router.post('/verify-otp', verifyOtpLimiter, validate(verifyOTPValidator), verifyOTPController);
 
 /**
  * @swagger

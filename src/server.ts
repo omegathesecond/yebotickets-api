@@ -22,6 +22,12 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5001;
 
+// Trust the single Cloud Run / GCLB front-end proxy so req.ip reflects the real
+// client (X-Forwarded-For) rather than the proxy. Required for the OTP rate
+// limiters to key on the actual caller; without it express-rate-limit also
+// refuses to start when it detects a forwarded header it can't trust.
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors());
 app.use(helmet());
