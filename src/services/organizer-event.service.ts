@@ -224,6 +224,160 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
   };
 };
 
+/** Money a single sold ticket actually brought in: what YeboPay charged
+ *  (`amountPaid`) when present, else the ticket type's list price. Mirrors the
+ *  per-purchase amount in {@link getEventPurchases} so every revenue figure on
+ *  the dashboard is derived the same way. */
+const ticketRevenue = (t: { amountPaid?: number | null; ticketType?: { price: number } | null }) =>
+  t.amountPaid ?? t.ticketType?.price ?? 0;
+
+/**
+ * Headline KPIs for the organizer dashboard landing page
+ * (GET /api/user/dashboard-stats). All figures are scoped to the caller's own
+ * events and computed from real ticket rows — never stored/mocked totals:
+ *  - totalRevenue: sum of what was actually charged over the organizer's SOLD
+ *    tickets (amountPaid, falling back to the type price for legacy rows),
+ *  - ticketsSold: count of those sold tickets,
+ *  - averageTicketPrice: totalRevenue / ticketsSold (0 when nothing is sold),
+ *  - activeEvents: published, non-cancelled events that have not yet ended.
+ *
+ * Returns the BARE object the dashboard's KpiCards read directly.
+ */
+export const getOrganizerDashboardStats = async (requester: Requester) => {
+  const events = await prisma.event.findMany({
+    where: { organizerId: requester.id },
+    select: { id: true, isPublished: true, isCancelled: true, endDate: true },
+  });
+
+  const now = new Date();
+  const activeEvents = events.filter(
+    (e) => e.isPublished && !e.isCancelled && e.endDate >= now
+  ).length;
+
+  const eventIds = events.map((e) => e.id);
+  let totalRevenue = 0;
+  let ticketsSold = 0;
+
+  if (eventIds.length > 0) {
+    const soldTickets = await prisma.ticket.findMany({
+      where: { eventId: { in: eventIds }, status: 'sold' },
+      select: { amountPaid: true, ticketType: { select: { price: true } } },
+    });
+    ticketsSold = soldTickets.length;
+    totalRevenue = soldTickets.reduce((sum, t) => sum + ticketRevenue(t), 0);
+  }
+
+  const averageTicketPrice = ticketsSold > 0 ? totalRevenue / ticketsSold : 0;
+
+  return { totalRevenue, ticketsSold, activeEvents, averageTicketPrice };
+};
+
+/** How many trailing calendar months the sales chart spans. */
+const MONTHLY_STATS_WINDOW = 6;
+
+/** Short "MMM YYYY" bucket label (e.g. "Jan 2026") for a given year/month. */
+const monthLabel = (year: number, monthIndex: number) =>
+  new Date(Date.UTC(year, monthIndex, 1)).toLocaleString('en-US', {
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC',
+  });
+
+/**
+ * Per-month sold-ticket count and revenue for the organizer's events over the
+ * trailing {@link MONTHLY_STATS_WINDOW} months (GET /api/user/monthly-stats),
+ * oldest month first. Every month in the window is present (zero-filled) so the
+ * chart renders a continuous line rather than collapsing gaps. Scoped to the
+ * caller's own events; revenue derived from real sold rows.
+ */
+export const getOrganizerMonthlyStats = async (requester: Requester) => {
+  // Pre-seed the trailing window so months with no sales still appear as zeros.
+  const now = new Date();
+  const buckets: { key: string; date: string; tickets: number; revenue: number }[] = [];
+  const indexByKey = new Map<string, number>();
+  for (let i = MONTHLY_STATS_WINDOW - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const key = `${d.getUTCFullYear()}-${d.getUTCMonth()}`;
+    indexByKey.set(key, buckets.length);
+    buckets.push({ key, date: monthLabel(d.getUTCFullYear(), d.getUTCMonth()), tickets: 0, revenue: 0 });
+  }
+
+  const events = await prisma.event.findMany({
+    where: { organizerId: requester.id },
+    select: { id: true },
+  });
+  const eventIds = events.map((e) => e.id);
+
+  if (eventIds.length > 0) {
+    // Lower bound = first day of the oldest month in the window.
+    const windowStart = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (MONTHLY_STATS_WINDOW - 1), 1)
+    );
+    const soldTickets = await prisma.ticket.findMany({
+      where: {
+        eventId: { in: eventIds },
+        status: 'sold',
+        purchaseDate: { gte: windowStart },
+      },
+      select: { purchaseDate: true, amountPaid: true, ticketType: { select: { price: true } } },
+    });
+
+    for (const t of soldTickets) {
+      if (!t.purchaseDate) continue;
+      const key = `${t.purchaseDate.getUTCFullYear()}-${t.purchaseDate.getUTCMonth()}`;
+      const idx = indexByKey.get(key);
+      if (idx === undefined) continue;
+      buckets[idx].tickets += 1;
+      buckets[idx].revenue += ticketRevenue(t);
+    }
+  }
+
+  return buckets.map(({ date, tickets, revenue }) => ({ date, tickets, revenue }));
+};
+
+/** How many recent sales the activity feed returns. */
+const RECENT_ACTIVITY_LIMIT = 10;
+
+/**
+ * Most recent ticket sales across the organizer's events
+ * (GET /api/user/recent-activity), newest first, as a real activity feed —
+ * NOT the hardcoded notification array the dashboard used to fake. Each item's
+ * `time` is an ISO timestamp the client formats into a relative label. Scoped
+ * to the caller's own events.
+ */
+export const getOrganizerRecentActivity = async (requester: Requester) => {
+  const events = await prisma.event.findMany({
+    where: { organizerId: requester.id },
+    select: { id: true },
+  });
+  const eventIds = events.map((e) => e.id);
+  if (eventIds.length === 0) return [];
+
+  const tickets = await prisma.ticket.findMany({
+    where: { eventId: { in: eventIds }, status: 'sold' },
+    include: {
+      user: { select: { name: true } },
+      ticketType: { select: { name: true, price: true } },
+      event: { select: { title: true } },
+    },
+    orderBy: [{ purchaseDate: 'desc' }, { createdAt: 'desc' }],
+    take: RECENT_ACTIVITY_LIMIT,
+  });
+
+  return tickets.map((t) => {
+    const customerName = t.user?.name || 'A customer';
+    const typeName = t.ticketType?.name || 'ticket';
+    const eventTitle = t.event?.title || 'your event';
+    const amount = ticketRevenue(t);
+    return {
+      id: t.id,
+      title: `Ticket sold — ${eventTitle}`,
+      message: `${customerName} bought a ${typeName} ticket for ${CURRENCY} ${amount.toLocaleString()}`,
+      time: (t.purchaseDate ?? t.createdAt).toISOString(),
+    };
+  });
+};
+
 /** Parse + clamp pagination query params to sane bounds. */
 const parsePagination = (page?: any, limit?: any) => {
   const parsedPage = Math.max(1, parseInt(page as string, 10) || 1);
