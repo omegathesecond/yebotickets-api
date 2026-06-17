@@ -44,20 +44,40 @@ Secrets follow the existing `YEBOTICKETS__*` convention (cf. `YEBOTICKETS__DATAB
 The credential token is scoped to both buckets, so the `_DEV` credential
 secrets hold the same value; they are kept separate for clean per-env rotation.
 
-Runtime SA for both services: `yebotickets-runtime@hiyebo.iam.gserviceaccount.com`
-(granted `roles/secretmanager.secretAccessor` on all nine secrets). Bound
-additively with `gcloud run services update --update-secrets`, preserving
-`DATABASE_URL`.
+`DATABASE_URL` follows the same per-env split:
 
-## ⚠ Deploy-pipeline caveat (pre-existing, not introduced here)
+| Cloud Run env  | `yebotickets-api-prod` secret  | `yebotickets-api-dev` secret        |
+|----------------|---------------------------------|--------------------------------------|
+| `DATABASE_URL` | `YEBOTICKETS__DATABASE_URL`     | `YEBOTICKETS__DATABASE_URL_DEV`      |
+
+(The dev DB URL was previously an inline plaintext env var on `yebotickets-api-dev`;
+it is now stored in `YEBOTICKETS__DATABASE_URL_DEV` so the pipeline can bind it
+as a secret just like prod.)
+
+Runtime SA for both services: `yebotickets-runtime@hiyebo.iam.gserviceaccount.com`
+(granted `roles/secretmanager.secretAccessor` on all ten secrets — the nine R2
+secrets plus `YEBOTICKETS__DATABASE_URL_DEV`). Bound additively with
+`gcloud run services update --update-secrets`.
+
+## Deploy-pipeline (reconciled)
 
 `api.yebotickets.com` maps to Cloud Run service **`yebotickets-api-prod`** and
-`dev-api.yebotickets.com` to **`yebotickets-api-dev`**. But the Cloud Build
-triggers (`yebotickets-api-prod` on `main`, `yebotickets-api-dev` on `dev`) both
-run this repo's `cloudbuild.yaml`, which deploys a *third* service named
-**`yebotickets-api`** (default compute SA, no custom domain). So pushes do not
-currently redeploy the domain-mapped services — `yebotickets-api-prod` is frozen
-at its manually-created revision. Until that mismatch is fixed (point the deploy
-step at `yebotickets-api-prod` / `-dev`, ideally per-env), the R2 env above was
-bound directly to the live services out of band, which is why `cloudbuild.yaml`
-now uses `--update-secrets` (additive) rather than `--set-secrets` (destructive).
+`dev-api.yebotickets.com` to **`yebotickets-api-dev`**. This repo's
+`cloudbuild.yaml` now deploys those domain-mapped services directly (it used to
+deploy a *third*, orphan service named `yebotickets-api`). One file serves both
+environments via substitutions:
+
+- File-level defaults target **prod** (`_SERVICE=yebotickets-api-prod`, prod
+  secret names).
+- The `yebotickets-api-dev` Cloud Build trigger (branch `^dev$`) overrides
+  `_SERVICE` and the `*_SECRET` substitutions to the `_DEV` variants. The
+  `yebotickets-api-prod` trigger (branch `^main$`) pins the prod values
+  explicitly for symmetry.
+- `R2_ENDPOINT` is the account-level Cloudflare S3 endpoint shared by both
+  buckets, so it has no `_DEV` variant — both envs read `YEBOTICKETS__R2_ENDPOINT`.
+
+Secret bindings still use `--update-secrets` (additive, per CLAUDE.md) so a
+deploy never wipes a binding applied out of band and preserves plain env vars
+(e.g. `_MIGRATION_MARKER`). The build runs as `yebotickets-runtime@hiyebo`,
+which holds project-level `roles/run.admin` + `roles/iam.serviceAccountUser`
+(actAs on the runtime SA) — sufficient to deploy both services.

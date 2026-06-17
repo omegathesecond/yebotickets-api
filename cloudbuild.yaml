@@ -1,3 +1,29 @@
+# Cloud Build pipeline for yebotickets-api.
+#
+# ONE cloudbuild.yaml serves BOTH environments through the _SERVICE / *_SECRET
+# substitutions below. Branch -> trigger -> environment:
+#   main -> trigger `yebotickets-api-prod` -> defaults (prod secrets) -> api.yebotickets.com
+#   dev  -> trigger `yebotickets-api-dev`  -> *_DEV overrides          -> dev-api.yebotickets.com
+#
+# The dev trigger overrides _SERVICE and the *_SECRET substitutions to the _DEV
+# secret variants via its trigger-level substitutions (trigger subs win over the
+# file-level defaults here). R2_ENDPOINT is the account-level Cloudflare S3
+# endpoint shared by both buckets, so it has no _DEV variant — both envs read
+# YEBOTICKETS__R2_ENDPOINT. See docs/R2_MEDIA_STORAGE.md for the full inventory.
+#
+# Secret bindings use --update-secrets (ADDITIVE, per CLAUDE.md) so a deploy
+# never silently wipes a binding applied out of band, and plain env vars set on
+# the service (e.g. _MIGRATION_MARKER) are preserved.
+
+substitutions:
+  _SERVICE: yebotickets-api-prod
+  _DATABASE_URL_SECRET: YEBOTICKETS__DATABASE_URL
+  _R2_ACCESS_KEY_ID_SECRET: YEBOTICKETS__R2_ACCESS_KEY_ID
+  _R2_SECRET_ACCESS_KEY_SECRET: YEBOTICKETS__R2_SECRET_ACCESS_KEY
+  _R2_ENDPOINT_SECRET: YEBOTICKETS__R2_ENDPOINT
+  _R2_BUCKET_NAME_SECRET: YEBOTICKETS__R2_BUCKET_NAME
+  _R2_PUBLIC_URL_SECRET: YEBOTICKETS__R2_PUBLIC_URL
+
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
@@ -23,7 +49,7 @@ steps:
     args:
       - 'run'
       - 'deploy'
-      - 'yebotickets-api'
+      - '${_SERVICE}'
       - '--image'
       - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
       - '--region'
@@ -32,10 +58,11 @@ steps:
       - 'managed'
       - '--allow-unauthenticated'
       # ADDITIVE secret binding (per CLAUDE.md: --update-secrets, never
-      # --set-secrets, so a deploy never silently wipes bindings applied out
-      # of band — e.g. the R2_* media creds bound to yebotickets-api-prod).
+      # --set-secrets, so a deploy never silently wipes bindings applied out of
+      # band). Secret names come from the substitutions above so the dev trigger
+      # can point each binding at its _DEV variant. R2_ENDPOINT is shared.
       - '--update-secrets'
-      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest'
+      - 'DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
