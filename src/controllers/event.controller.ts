@@ -35,11 +35,19 @@ export const getEventsController = async (req: Request, res: Response, next: Nex
     const authReq = req as AuthenticatedRequest;
     const isAdmin = authReq.user?.role === 'admin';
 
-    // The showUnpublished flag exposes draft/unpublished events. It must never be
-    // honoured from untrusted query input — only admins may list unpublished
-    // events. Strip it for everyone else so the public list stays published-only.
+    // The showUnpublished flag exposes draft/unpublished events, so it must never
+    // be honoured from untrusted query input. It is only safe when the caller is
+    // entitled to see those events:
+    //   - admins may list every unpublished event; or
+    //   - an authenticated caller whose request is scoped to their OWN events
+    //     (query.organizer === their user id) — this is how /organizers/events
+    //     and the scanner-app legitimately read their own drafts.
+    // Anonymous/public callers have no req.user, so they can never satisfy this
+    // and the public list stays published-only.
+    const ownerId = authReq.user?.id;
+    const isOwnScopedRequest = !!ownerId && req.query.organizer === ownerId;
     const query = { ...req.query };
-    if (!isAdmin) {
+    if (!isAdmin && !isOwnScopedRequest) {
       delete query.showUnpublished;
     }
 

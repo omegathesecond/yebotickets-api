@@ -36,10 +36,50 @@ describe('getEventsController — showUnpublished is admin-only', () => {
     expect(passed.category).toBe('music');
   });
 
-  it('strips showUnpublished for a non-admin (e.g. organizer) request', async () => {
+  it('strips showUnpublished for a non-admin (e.g. organizer) request not scoped to themselves', async () => {
     const req = {
       query: { showUnpublished: 'true' },
       user: { id: 'u1', role: 'organizer' },
+    } as unknown as Request;
+
+    await getEventsController(req, buildRes(), next);
+
+    const passed = getEventsMock.mock.calls[0][0] as Record<string, any>;
+    expect(passed.showUnpublished).toBeUndefined();
+  });
+
+  it('honours showUnpublished when an organizer scopes the query to their OWN events', async () => {
+    // This is the /organizers/events + scanner-app path: protect() authenticates
+    // the caller and the route injects organizer=<own id> + showUnpublished=true.
+    const req = {
+      query: { showUnpublished: 'true', organizer: 'u1' },
+      user: { id: 'u1', role: 'organizer' },
+    } as unknown as Request;
+
+    await getEventsController(req, buildRes(), next);
+
+    const passed = getEventsMock.mock.calls[0][0] as Record<string, any>;
+    expect(passed.showUnpublished).toBe('true');
+    expect(passed.organizer).toBe('u1');
+  });
+
+  it('strips showUnpublished when a non-admin scopes the query to ANOTHER organizer', async () => {
+    const req = {
+      query: { showUnpublished: 'true', organizer: 'someone-else' },
+      user: { id: 'u1', role: 'organizer' },
+    } as unknown as Request;
+
+    await getEventsController(req, buildRes(), next);
+
+    const passed = getEventsMock.mock.calls[0][0] as Record<string, any>;
+    expect(passed.showUnpublished).toBeUndefined();
+  });
+
+  it('strips showUnpublished from an anonymous request even when organizer is supplied', async () => {
+    // Guards against undefined === undefined: an anonymous caller passing
+    // ?organizer=... must never match a missing user id.
+    const req = {
+      query: { showUnpublished: 'true', organizer: 'u1' },
     } as unknown as Request;
 
     await getEventsController(req, buildRes(), next);
