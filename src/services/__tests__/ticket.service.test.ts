@@ -59,6 +59,7 @@ import {
   settleFailedCharge,
   handleChargeWebhookEvent,
   reclaimExpiredReservations,
+  getEventTicketsForCheckIn,
 } from '../ticket.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
@@ -993,5 +994,50 @@ describe('reclaimExpiredReservations', () => {
 
     expect(summary).toMatchObject({ scanned: 1, errors: 1, released: 0, finalized: 0 });
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('getEventTicketsForCheckIn (offline scanner pre-sync)', () => {
+  const requester = { id: 'org-1', role: 'organizer' };
+
+  const grantEventAccess = (organizerId = 'org-1') =>
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId } as any);
+
+  it('returns ONLY sold tickets, scoped to the event, in the gate DTO shape', async () => {
+    grantEventAccess();
+    prismaMock.ticket.findMany.mockResolvedValue([
+      buildCheckInTicket(),
+      buildCheckInTicket({ id: 'ticket-2', uniqueCode: 'DEF456', isCheckedIn: true }),
+    ] as any);
+
+    const result = await getEventTicketsForCheckIn('event-1', requester);
+
+    // The query must constrain to this event AND status 'sold' so a forged or
+    // non-sold code is never present in the cache the scanner trusts offline.
+    const findArg = prismaMock.ticket.findMany.mock.calls[0][0];
+    expect(findArg.where).toMatchObject({ eventId: 'event-1', status: 'sold' });
+
+    expect(result.count).toBe(2);
+    expect(result.tickets).toHaveLength(2);
+    expect(result.syncedAt).toEqual(expect.any(String));
+    // isCheckedIn is preserved so the offline cache won't re-admit a used ticket.
+    expect(result.tickets[0]).toMatchObject({ id: 'ticket-1', isCheckedIn: false });
+    expect(result.tickets[1]).toMatchObject({ id: 'ticket-2', status: 'used', isCheckedIn: true });
+  });
+
+  it('REJECTS an organizer caching an event they do not own (no cross-tenant leak)', async () => {
+    grantEventAccess('someone-else');
+
+    await expect(getEventTicketsForCheckIn('event-1', requester)).rejects.toThrow(
+      'You do not have permission to check in tickets for this event'
+    );
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+  });
+
+  it('404s for an unknown event', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(null);
+
+    await expect(getEventTicketsForCheckIn('nope', requester)).rejects.toThrow('Event not found');
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
   });
 });

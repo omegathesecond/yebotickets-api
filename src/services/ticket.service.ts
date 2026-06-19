@@ -1413,6 +1413,55 @@ export const confirmCheckIn = async (
   }
 };
 
+/**
+ * List an event's sold tickets for OFFLINE caching by the gate scanner.
+ *
+ * The scanner pre-syncs this set when an operator opens an event so it can keep
+ * validating and checking attendees in when the venue network drops. We return
+ * ONLY 'sold' tickets — the exact set that is valid for check-in — so a forged
+ * or non-sold code can never be accepted offline (the scanner treats anything
+ * absent from this set as "not accepted"). Each row carries `isCheckedIn` so the
+ * cache starts in sync with the server and the offline path won't re-admit a
+ * ticket that was already used online.
+ *
+ * Access is scoped exactly like the live check-in endpoints via
+ * {@link assertEventAccess}: an organizer may only cache their OWN events, an
+ * admin any event. The DTO is the same {@link toCheckInTicketDto} shape the
+ * scanner already reads from /check-in-details, so the offline and online paths
+ * render identically.
+ *
+ * @param eventId Event whose ticket set to return
+ * @param requester Authenticated organizer/admin
+ * @returns Flattened sold-ticket DTOs plus a `syncedAt` server timestamp
+ */
+export const getEventTicketsForCheckIn = async (
+  eventId: string,
+  requester: CheckInRequester
+): Promise<{ eventId: string; syncedAt: string; count: number; tickets: any[] }> => {
+  try {
+    await assertEventAccess(eventId, requester);
+
+    const tickets = await prisma.ticket.findMany({
+      where: { eventId, status: 'sold' },
+      include: CHECK_IN_INCLUDE,
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const dtos = tickets.map(toCheckInTicketDto);
+
+    return {
+      eventId,
+      syncedAt: new Date().toISOString(),
+      count: dtos.length,
+      tickets: dtos,
+    };
+  } catch (error) {
+    console.error('Error in getEventTicketsForCheckIn service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to load event tickets for check-in', 500);
+  }
+};
+
 // ===========================================================================
 // Refunds & event cancellation
 // ===========================================================================
