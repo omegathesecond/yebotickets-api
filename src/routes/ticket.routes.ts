@@ -11,6 +11,7 @@ import {
   verifyTicketController,
   getCheckInDetailsController,
   confirmCheckInController,
+  getEventTicketsController,
   refundTicketController,
   cancelEventController
 } from '../controllers/ticket.controller';
@@ -656,6 +657,44 @@ router.post(
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   validate(checkInLookupValidator),
   confirmCheckInController
+);
+
+/**
+ * @swagger
+ * /api/tickets/event/{eventId}:
+ *   get:
+ *     summary: List an event's sold tickets for offline check-in caching
+ *     tags: [Tickets]
+ *     description: >
+ *       Return the event's sold-ticket set so the gate scanner can pre-sync it
+ *       and keep validating + checking attendees in when the venue network drops.
+ *       Only sold tickets are returned (the set valid for check-in); each carries
+ *       its current `isCheckedIn` state so the offline cache starts in sync.
+ *       Scoped to the requesting organizer's own events (admins: any).
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: eventId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID of the event whose ticket set to cache
+ *     responses:
+ *       200:
+ *         description: Sold-ticket set with a server sync timestamp
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not the owning organizer / not authorized
+ *       404:
+ *         description: Event not found
+ */
+router.get(
+  '/event/:eventId',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEventTicketsController
 );
 
 /**
