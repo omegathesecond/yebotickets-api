@@ -1,11 +1,19 @@
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
-import { sendOTP } from './whatsapp.service';
+import { sendOTP } from './comms.service';
+import { generateAuthTokens } from './token.service';
 import { YeboLinkClient } from './yebolink.client';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import { randomInt } from 'crypto';
+
+/**
+ * Maximum number of consecutive wrong guesses allowed against a single OTP
+ * before it is invalidated and the user is forced to request a fresh code.
+ * This is the hard brute-force lock: it holds even if an attacker spreads
+ * guesses across IPs to dodge the request-level rate limiter.
+ */
+const MAX_OTP_ATTEMPTS = 5;
 
 /** How long an issued password-reset code stays valid (minutes). */
 const RESET_CODE_TTL_MINUTES = 15;
@@ -30,17 +38,6 @@ const generateOTPCode = (): string => {
   // never mint a security-sensitive code (login OTP or password-reset code).
   // randomInt's max is exclusive, so this yields 100000–999999 inclusive.
   return randomInt(100000, 1000000).toString();
-};
-
-/**
- * Generate JWT token for a user
- */
-const generateAuthToken = (userId: string, role: string): string => {
-  const jwtSecret = process.env.JWT_SECRET || 'fallbacksecret';
-  const payload = { id: userId, role };
-  const options = { expiresIn: process.env.JWT_EXPIRES_IN || '24h' };
-  
-  return jwt.sign(payload, jwtSecret, options as jwt.SignOptions);
 };
 
 /**
@@ -87,12 +84,14 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     const otp = generateOTPCode();
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Update user with OTP
+    // Update user with OTP. Reset the failed-attempt counter so a fresh code
+    // always starts with a full allowance of verify attempts.
     await prisma.user.update({
       where: { id: user.id },
       data: {
         otpCode: otp,
         otpExpiresAt,
+        otpAttempts: 0,
       },
     });
 
@@ -115,7 +114,10 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
  * @param otp OTP entered by user
  * @returns Object containing user information and token
  */
-export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ user: any; token: string }> => {
+export const verifyOTP = async (
+  phoneNumber: string,
+  otp: string
+): Promise<{ user: any; token: string; refreshToken: string }> => {
   try {
     // Find user with the phone number
     const user = await prisma.user.findUnique({
@@ -138,23 +140,50 @@ export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ use
 
     // Check if OTP matches
     if (user.otpCode !== otp) {
-      throw new ApiError('Invalid OTP', 400);
+      // Wrong guess: bump the attempt counter. Once the threshold is reached,
+      // invalidate the code entirely (clear it + reset the counter) so the
+      // attacker can't keep guessing and the user is forced to request a new
+      // one. Returns 429 so the client surfaces the lockout distinctly.
+      const attempts = (user.otpAttempts ?? 0) + 1;
+
+      if (attempts >= MAX_OTP_ATTEMPTS) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            otpCode: null,
+            otpExpiresAt: null,
+            otpAttempts: 0,
+          },
+        });
+        throw new ApiError(
+          'Too many incorrect attempts. This code has been disabled — please request a new OTP.',
+          429
+        );
+      }
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { otpAttempts: attempts },
+      });
+      const remaining = MAX_OTP_ATTEMPTS - attempts;
+      throw new ApiError(`Invalid OTP. ${remaining} attempt(s) remaining.`, 400);
     }
 
-    // OTP verified, clear it and mark user as verified
+    // OTP verified, clear it, reset the attempt counter, and mark user verified
     const updatedUser = await prisma.user.update({
       where: { id: user.id },
       data: {
         otpCode: null,
         otpExpiresAt: null,
+        otpAttempts: 0,
         isVerified: true,
       },
     });
 
-    // Generate JWT token
-    const token = generateAuthToken(updatedUser.id, updatedUser.role);
+    // Generate access + refresh tokens
+    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role);
 
-    // Return user info (without sensitive data) and token
+    // Return user info (without sensitive data) and tokens
     const userToReturn = {
       id: updatedUser.id,
       name: updatedUser.name,
@@ -167,6 +196,7 @@ export const verifyOTP = async (phoneNumber: string, otp: string): Promise<{ use
     return {
       user: userToReturn,
       token,
+      refreshToken,
     };
   } catch (error) {
     console.error('Error in verifyOTP service:', error);
@@ -287,8 +317,9 @@ export const changePassword = async (
  * Looks the account up by email, mints a 6-digit single-use code with a short
  * TTL, persists it, and delivers it over YeboLink SMS to the account's
  * registered phone number (per the Omevision comms standard — no direct
- * provider here). Fails loudly (404) when no matching account exists and lets a
- * YeboLink delivery failure propagate rather than pretending the code was sent.
+ * provider here). Returns the same generic message whether or not the email
+ * matched (anti-enumeration) and lets a YeboLink delivery failure propagate
+ * rather than pretending the code was sent.
  *
  * @param email Email address tied to the organizer/staff account
  */

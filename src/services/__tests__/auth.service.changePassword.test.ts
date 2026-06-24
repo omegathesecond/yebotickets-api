@@ -9,9 +9,9 @@ jest.mock('../../config/prisma', () => ({
   default: mockDeep<PrismaClient>(),
 }));
 
-// auth.service pulls in whatsapp.service (sendOTP) at import time; stub it so no
-// real network/WhatsApp call is attempted while testing the password flow.
-jest.mock('../whatsapp.service', () => ({
+// auth.service pulls in comms.service (sendOTP) at import time; stub it so no
+// real network/YeboLink call is attempted while testing the password flow.
+jest.mock('../comms.service', () => ({
   sendOTP: jest.fn(async () => ({ ok: true })),
 }));
 

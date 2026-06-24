@@ -11,6 +11,7 @@ import {
   verifyTicket,
   getCheckInDetails,
   confirmCheckIn,
+  getEventTicketsForCheckIn,
   refundTicket,
   cancelEvent,
   PurchasePaymentInput
@@ -268,6 +269,34 @@ export const confirmCheckInController = async (req: Request, res: Response, next
     const { ticketId, eventId } = req.body;
 
     const result = await confirmCheckIn(ticketId, eventId, {
+      id: authReq.user.id,
+      role: authReq.user.role,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Offline pre-sync: return the event's sold-ticket set so the gate scanner can
+ * cache it and keep checking attendees in when the venue network drops. Scoped
+ * to the requesting organizer's own events (admins: any). Accepts :eventId.
+ */
+export const getEventTicketsController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { eventId } = req.params;
+
+    const result = await getEventTicketsForCheckIn(eventId, {
       id: authReq.user.id,
       role: authReq.user.role,
     });

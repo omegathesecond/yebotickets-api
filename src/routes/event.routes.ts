@@ -10,11 +10,40 @@ import {
   createEventValidator,
   updateEventValidator
 } from '../validators/event.validator';
+import {
+  getEarningsController,
+  getEventDetailsController,
+  getEventPurchasesController,
+  getEventTicketsController,
+} from '../controllers/organizer-event.controller';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
+
+/**
+ * @swagger
+ * /api/events/earnings:
+ *   get:
+ *     summary: Get the logged-in organizer's earnings
+ *     tags: [Events]
+ *     description: >
+ *       Total + per-event earnings derived from the organizer's real SOLD
+ *       tickets. MUST be declared before GET /:id so 'earnings' is not captured
+ *       as an event id.
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Earnings summary
+ */
+router.get(
+  '/earnings',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEarningsController
+);
 
 /**
  * @swagger
@@ -108,6 +137,109 @@ router.get('/', getEventsController);
  *               $ref: '#/components/schemas/Error'
  */
 router.get('/:id', getEventByIdController);
+
+/**
+ * @swagger
+ * /api/events/{id}/details:
+ *   get:
+ *     summary: Get organizer-facing stats for one event
+ *     tags: [Events]
+ *     description: >
+ *       Event plus computed stats (total revenue, tickets sold, pending
+ *       payments, per-ticket-type breakdown) for an event the caller owns.
+ *       Organizers may only read their own events; admins any.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Event details with stats
+ *       403:
+ *         description: Not the owner of this event
+ *       404:
+ *         description: Event not found
+ */
+router.get(
+  '/:id/details',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEventDetailsController
+);
+
+/**
+ * @swagger
+ * /api/events/{id}/purchases:
+ *   get:
+ *     summary: Paginated purchase history for one event (owner only)
+ *     tags: [Events]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *     responses:
+ *       200:
+ *         description: Paginated purchases
+ */
+router.get(
+  '/:id/purchases',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEventPurchasesController
+);
+
+/**
+ * @swagger
+ * /api/events/{id}/tickets:
+ *   get:
+ *     summary: Paginated issued-ticket list for one event (owner only)
+ *     tags: [Events]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *     responses:
+ *       200:
+ *         description: Paginated tickets
+ */
+router.get(
+  '/:id/tickets',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEventTicketsController
+);
 
 /**
  * @swagger

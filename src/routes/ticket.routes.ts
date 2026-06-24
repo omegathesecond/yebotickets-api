@@ -11,6 +11,7 @@ import {
   verifyTicketController,
   getCheckInDetailsController,
   confirmCheckInController,
+  getEventTicketsController,
   refundTicketController,
   cancelEventController
 } from '../controllers/ticket.controller';
@@ -100,9 +101,15 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  * @swagger
  * /api/tickets/purchase/{ticketTypeId}:
  *   post:
- *     summary: Purchase a ticket
+ *     summary: Purchase a single ticket of a type (pays via YeboPay before issuing)
  *     tags: [Tickets]
- *     description: Purchase a ticket of a specific type. User must be authenticated.
+ *     description: >
+ *       Purchase ONE ticket of the given type. The buyer must be authenticated.
+ *       For a priced ticket the API charges the buyer via YeboPay BEFORE issuing —
+ *       a free ticket (price 0) needs no payment body. To buy multiple tickets the
+ *       client calls this once per ticket with a fresh idempotencyKey each time
+ *       (each ticket is charged and issued independently). Discover the available
+ *       payment instruments via GET /api/tickets/payment-options.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -113,26 +120,51 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  *           type: string
  *         description: ID of the ticket type
  *     requestBody:
- *       required: true
+ *       required: false
+ *       description: >
+ *         Payment instrument forwarded to YeboPay. Omit entirely for a free
+ *         ticket; a PRICED ticket must carry either a saved paymentMethodId OR a
+ *         providerCode (with phone for mobile money).
  *       content:
  *         application/json:
  *           schema:
  *             type: object
  *             properties:
- *               quantity:
- *                 type: integer
- *                 example: 1
- *                 minimum: 1
- *                 description: Number of tickets to purchase
+ *               paymentMethodId:
+ *                 type: string
+ *                 description: A saved YeboPay payment method id.
+ *               providerCode:
+ *                 type: string
+ *                 description: A one-off rail code from /payment-options (e.g. a mobile-money provider).
+ *               phone:
+ *                 type: string
+ *                 description: Subscriber MSISDN — required when providerCode is a mobile-money rail.
+ *               country:
+ *                 type: string
+ *                 example: SZ
+ *                 description: ISO 3166-1 alpha-2 country code (defaults to SZ).
+ *               cardToken:
+ *                 type: string
+ *                 description: A tokenized card, when paying by card.
+ *               idempotencyKey:
+ *                 type: string
+ *                 description: Fresh per call so a retry never double-charges; auto-generated if omitted.
  *     responses:
- *       200:
- *         description: Ticket purchased successfully
+ *       201:
+ *         description: >
+ *           Synchronous payment SUCCEEDED — ticket issued with its scanner-ready
+ *           QR, unique code, amountPaid and delivery status.
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/PurchaseTicketResponse'
+ *       202:
+ *         description: >
+ *           Asynchronous charge (mobile money) is PENDING — the seat is held
+ *           (status 'reserved') and the ticket is issued automatically once
+ *           YeboPay confirms via webhook. No QR yet.
  *       400:
- *         description: Invalid request or insufficient tickets available
+ *         description: Invalid request, missing payment for a priced ticket, or insufficient tickets available
  *         content:
  *           application/json:
  *             schema:
@@ -151,6 +183,12 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       502:
+ *         description: Payment could not be processed by YeboPay (no ticket issued)
  *         content:
  *           application/json:
  *             schema:
@@ -619,6 +657,44 @@ router.post(
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   validate(checkInLookupValidator),
   confirmCheckInController
+);
+
+/**
+ * @swagger
+ * /api/tickets/event/{eventId}:
+ *   get:
+ *     summary: List an event's sold tickets for offline check-in caching
+ *     tags: [Tickets]
+ *     description: >
+ *       Return the event's sold-ticket set so the gate scanner can pre-sync it
+ *       and keep validating + checking attendees in when the venue network drops.
+ *       Only sold tickets are returned (the set valid for check-in); each carries
+ *       its current `isCheckedIn` state so the offline cache starts in sync.
+ *       Scoped to the requesting organizer's own events (admins: any).
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: eventId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID of the event whose ticket set to cache
+ *     responses:
+ *       200:
+ *         description: Sold-ticket set with a server sync timestamp
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not the owning organizer / not authorized
+ *       404:
+ *         description: Event not found
+ */
+router.get(
+  '/event/:eventId',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  getEventTicketsController
 );
 
 /**

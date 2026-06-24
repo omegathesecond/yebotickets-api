@@ -10,9 +10,8 @@ import crypto from 'crypto';
 import {
   buildTicketQrPayload,
   generateTicketQrDataUrl,
-  generateTicketQrBuffer,
 } from './qr.service';
-import { sendImageMessage, sendTextMessage } from './whatsapp.service';
+import { sendTextMessage, sendEmailMessage } from './comms.service';
 import {
   createCharge,
   getCharge,
@@ -48,7 +47,7 @@ const RESERVATION_TTL_MS = Number.parseInt(process.env['RESERVATION_TTL_MS'] || 
 const RESERVATION_HARD_EXPIRY_MS =
   Number.parseInt(process.env['RESERVATION_HARD_EXPIRY_MS'] || '', 10) || 60 * 60 * 1000;
 /** Cap how many stale holds one lazy sweep resolves, to bound purchase latency. */
-const RECLAIM_BATCH = 20;
+export const RECLAIM_BATCH = 20;
 
 /**
  * How the buyer is paying, forwarded to YeboPay. Either a saved
@@ -382,6 +381,7 @@ const PURCHASE_INCLUDE = {
       id: true,
       name: true,
       phoneNumber: true,
+      email: true,
     },
   },
 } as const;
@@ -393,7 +393,8 @@ const PURCHASE_INCLUDE = {
  * receives the QR inline in the response.
  */
 export interface TicketDeliveryResult {
-  channel: 'whatsapp';
+  /** The channel that actually delivered (or was attempted last on failure). */
+  channel: 'whatsapp' | 'email';
   status: 'sent' | 'failed';
   error?: string;
 }
@@ -459,32 +460,75 @@ const withQrFields = async <T extends { eventId: string; uniqueCode: string }>(
 });
 
 /**
- * Deliver the issued ticket QR + details to the buyer's phone via WhatsApp.
- * Failures are caught and returned as `status: 'failed'` (with the reason) so
- * the caller can warn the buyer rather than silently pretend delivery worked.
+ * Compose the HTML body for the ticket-delivery email. Carries the same details
+ * as the WhatsApp message plus the QR rendered inline (data URI). Email clients
+ * that strip data-URI images still show the ticket code in the text, and the
+ * scannable QR is always available inline in the purchase API response.
+ */
+const buildTicketEmailHtml = (ticket: any, qrDataUrl: string): string => {
+  const details = buildTicketMessage(ticket)
+    .split('\n')
+    .map((line) => (line ? `<p style="margin:4px 0">${line}</p>` : ''))
+    .join('');
+  return `<div style="font-family:system-ui,Arial,sans-serif;color:#111">${details}` +
+    `<div style="margin-top:16px"><img src="${qrDataUrl}" alt="Ticket QR code" width="220" height="220" /></div>` +
+    `</div>`;
+};
+
+/**
+ * Deliver the issued ticket details + code to the buyer over YeboLink (the
+ * canonical Omevision comms gateway). Primary channel is WhatsApp; if that
+ * fails (or the buyer has no phone on file) we fall back to email when an
+ * address is available. The QR is always returned inline in the purchase
+ * response, so a messaging failure never strands the buyer.
+ *
+ * Failures are caught and returned as `status: 'failed'` (never thrown) so the
+ * caller can warn the buyer rather than silently pretend delivery worked — a
+ * paid purchase is never rolled back over a comms hiccup, but the failure is
+ * surfaced, not swallowed.
  */
 const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> => {
   const phoneNumber = ticket.user?.phoneNumber;
-  if (!phoneNumber) {
-    return {
-      channel: 'whatsapp',
-      status: 'failed',
-      error: 'Buyer has no phone number on file',
-    };
+  const email = ticket.user?.email;
+  const text = buildTicketMessage(ticket);
+  const errors: string[] = [];
+
+  // Primary channel: WhatsApp via YeboLink.
+  if (phoneNumber) {
+    try {
+      await sendTextMessage(phoneNumber, text);
+      return { channel: 'whatsapp', status: 'sent' };
+    } catch (error) {
+      console.error('Failed to deliver ticket via WhatsApp:', error);
+      errors.push(`whatsapp: ${errorMessage(error)}`);
+    }
+  } else {
+    errors.push('whatsapp: buyer has no phone number on file');
   }
 
-  try {
-    const qrBuffer = await generateTicketQrBuffer(ticket.eventId, ticket.uniqueCode);
-    await sendImageMessage(phoneNumber, qrBuffer, buildTicketMessage(ticket));
-    return { channel: 'whatsapp', status: 'sent' };
-  } catch (error) {
-    console.error('Failed to deliver ticket via WhatsApp:', error);
-    return {
-      channel: 'whatsapp',
-      status: 'failed',
-      error: errorMessage(error),
-    };
+  // Fallback channel: email via YeboLink (only if the buyer has one on file).
+  if (email) {
+    try {
+      const qrDataUrl = await generateTicketQrDataUrl(ticket.eventId, ticket.uniqueCode);
+      await sendEmailMessage(
+        email,
+        `Your ticket for ${ticket.event?.title ?? 'your event'}`,
+        buildTicketEmailHtml(ticket, qrDataUrl),
+        text
+      );
+      return { channel: 'email', status: 'sent' };
+    } catch (error) {
+      console.error('Failed to deliver ticket via email:', error);
+      errors.push(`email: ${errorMessage(error)}`);
+    }
   }
+
+  // No channel succeeded — report failed on the last channel we could attempt.
+  return {
+    channel: email ? 'email' : 'whatsapp',
+    status: 'failed',
+    error: errors.join('; '),
+  };
 };
 
 /**
@@ -1366,6 +1410,55 @@ export const confirmCheckIn = async (
     console.error('Error in confirmCheckIn service:', error);
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to confirm check-in', 500);
+  }
+};
+
+/**
+ * List an event's sold tickets for OFFLINE caching by the gate scanner.
+ *
+ * The scanner pre-syncs this set when an operator opens an event so it can keep
+ * validating and checking attendees in when the venue network drops. We return
+ * ONLY 'sold' tickets — the exact set that is valid for check-in — so a forged
+ * or non-sold code can never be accepted offline (the scanner treats anything
+ * absent from this set as "not accepted"). Each row carries `isCheckedIn` so the
+ * cache starts in sync with the server and the offline path won't re-admit a
+ * ticket that was already used online.
+ *
+ * Access is scoped exactly like the live check-in endpoints via
+ * {@link assertEventAccess}: an organizer may only cache their OWN events, an
+ * admin any event. The DTO is the same {@link toCheckInTicketDto} shape the
+ * scanner already reads from /check-in-details, so the offline and online paths
+ * render identically.
+ *
+ * @param eventId Event whose ticket set to return
+ * @param requester Authenticated organizer/admin
+ * @returns Flattened sold-ticket DTOs plus a `syncedAt` server timestamp
+ */
+export const getEventTicketsForCheckIn = async (
+  eventId: string,
+  requester: CheckInRequester
+): Promise<{ eventId: string; syncedAt: string; count: number; tickets: any[] }> => {
+  try {
+    await assertEventAccess(eventId, requester);
+
+    const tickets = await prisma.ticket.findMany({
+      where: { eventId, status: 'sold' },
+      include: CHECK_IN_INCLUDE,
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const dtos = tickets.map(toCheckInTicketDto);
+
+    return {
+      eventId,
+      syncedAt: new Date().toISOString(),
+      count: dtos.length,
+      tickets: dtos,
+    };
+  } catch (error) {
+    console.error('Error in getEventTicketsForCheckIn service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to load event tickets for check-in', 500);
   }
 };
 

@@ -40,6 +40,11 @@ model User {
   // OTP fields
   otpCode     String?
   otpExpiresAt DateTime?
+  // Count of consecutive failed verify-otp attempts for the current code.
+  // Reset to 0 whenever a new OTP is issued or a verification succeeds; once it
+  // reaches the lockout threshold the code is invalidated and a new one must be
+  // requested. Guards against brute-forcing the 6-digit code.
+  otpAttempts Int      @default(0)
 
   // Password-reset fields (organizer/staff email+password recovery).
   // Kept separate from the OTP columns so a phone-login OTP and an email

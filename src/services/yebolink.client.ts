@@ -1,24 +1,26 @@
 /**
- * Client for YeboLink — the canonical Omevision comms gateway for all
- * SMS / WhatsApp / Email. YeboTickets routes its login OTP and ticket-delivery
- * messages through this instead of talking to a provider (e.g. the WhatsApp
- * Cloud API) directly, per the Omevision platform standard.
+ * Client for YeboLink — the canonical comms gateway used by every Omevision
+ * product to send SMS / WhatsApp / email (api.yebolink.com).
  *
- * Auth: workspace API key (`x-api-key: ybk_*`), bound from the
- * YEBOTICKETS__YEBOLINK_API_KEY[_DEV] secret in hiyebo Secret Manager and
- * exposed to the service as the YEBOLINK_API_KEY env var.
+ * Auth: a per-product workspace API key (`x-api-key: ybk_*`), bound from
+ * YEBOTICKETS__YEBOLINK_API_KEY[_DEV] in hiyebo Secret Manager.
  *
- * Fails loud per CLAUDE.md — never silently fall back if YeboLink is down or a
- * send fails. Callers decide how to surface that to the user.
+ * Fails loud per CLAUDE.md — never silently falls back if YeboLink is down or
+ * the key is missing. Callers decide whether a failure is fatal (OTP) or should
+ * be surfaced-but-not-fatal (ticket delivery after a paid purchase).
  */
 
 const BASE_URL = process.env.YEBOLINK_BASE_URL ?? 'https://api.yebolink.com';
 
-function getApiKey(): string {
+type Channel = 'sms' | 'whatsapp' | 'email';
+
+const getApiKey = (): string => {
   const key = process.env.YEBOLINK_API_KEY;
-  if (!key) throw new Error('YEBOLINK_API_KEY env var is not set');
+  if (!key) {
+    throw new Error('YEBOLINK_API_KEY env var is not set');
+  }
   return key;
-}
+};
 
 export interface YeboLinkMessageResult {
   messageId: string;
@@ -26,62 +28,81 @@ export interface YeboLinkMessageResult {
 }
 
 export interface SendSmsInput {
-  /** Recipient phone number in E.164 (e.g. +26878000000). */
   to: string;
-  /** Plain-text body of the SMS. */
   text: string;
-  /** Optional sender label; defaults to the workspace name. */
+  metadata?: Record<string, string>;
+}
+
+export interface SendWhatsAppInput {
+  to: string;
+  text: string;
+  /** Optional PUBLIC media URLs (not buffers) to attach to the WhatsApp message. */
+  mediaUrls?: string[];
+  metadata?: Record<string, string>;
+}
+
+export interface SendEmailInput {
+  to: string;
+  subject: string;
+  html: string;
+  text?: string;
   fromName?: string;
+  metadata?: Record<string, string>;
 }
 
-interface YeboLinkSendResponse {
-  success?: boolean;
-  data?: { id?: string; status?: string };
-  error?: string;
-}
-
-/**
- * POST a message to YeboLink's send endpoint and normalise the result.
- * Throws on transport failure or any non-success response, preserving the
- * YeboLink error message so the caller can log/surface it.
- */
-async function send(body: Record<string, unknown>): Promise<YeboLinkMessageResult> {
+const send = async (
+  channel: Channel,
+  to: string,
+  content: Record<string, unknown>,
+  metadata?: Record<string, string>
+): Promise<YeboLinkMessageResult> => {
   const res = await fetch(`${BASE_URL}/api/v1/messages/send`, {
     method: 'POST',
     headers: {
       'x-api-key': getApiKey(),
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ to, channel, content, metadata }),
   });
 
-  const payload = (await res.json().catch(() => ({}))) as YeboLinkSendResponse;
-  if (!res.ok || !payload.success) {
-    throw new Error(
-      `YeboLink /messages/send ${res.status}: ${payload.error ?? 'unknown error'}`
+  const body = (await res.json().catch(() => ({}))) as {
+    success?: boolean;
+    data?: { id?: string; status?: string };
+    error?: string;
+  };
+
+  if (!res.ok || !body.success) {
+    throw new Error(`YeboLink /messages/send ${res.status}: ${body.error ?? 'unknown error'}`);
+  }
+
+  return { messageId: body.data?.id ?? '', status: body.data?.status ?? '' };
+};
+
+export class YeboLinkClient {
+  static sendSMS(input: SendSmsInput): Promise<YeboLinkMessageResult> {
+    return send('sms', input.to, { text: input.text }, input.metadata);
+  }
+
+  static sendWhatsApp(input: SendWhatsAppInput): Promise<YeboLinkMessageResult> {
+    return send(
+      'whatsapp',
+      input.to,
+      { text: input.text, media_urls: input.mediaUrls },
+      input.metadata
     );
   }
 
-  return {
-    messageId: payload.data?.id ?? '',
-    status: payload.data?.status ?? '',
-  };
-}
-
-export class YeboLinkClient {
-  /**
-   * Send a plain SMS. Used for login OTP delivery and ticket-purchase
-   * confirmations (the QR itself can't traverse SMS, so callers send the
-   * human-readable ticket details + code and surface the QR another way).
-   */
-  static async sendSMS(input: SendSmsInput): Promise<YeboLinkMessageResult> {
-    return send({
-      to: input.to,
-      channel: 'sms',
-      content: {
+  static sendEmail(input: SendEmailInput): Promise<YeboLinkMessageResult> {
+    return send(
+      'email',
+      input.to,
+      {
+        subject: input.subject,
+        html: input.html,
         text: input.text,
         from_name: input.fromName ?? 'YeboTickets',
       },
-    });
+      input.metadata
+    );
   }
 }

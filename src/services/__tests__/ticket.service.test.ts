@@ -11,8 +11,9 @@ jest.mock('../../config/prisma', () => ({
 }));
 
 // --- Mock the side-effecting collaborators ---------------------------------
-// purchaseTicket generates a QR and delivers it over WhatsApp. We stub both so
-// the unit under test stays focused on the sell/charge/check-in logic and never
+// purchaseTicket generates a QR and delivers the ticket over YeboLink (WhatsApp,
+// with email as a fallback channel). We stub the QR + comms collaborators so the
+// unit under test stays focused on the sell/charge/check-in logic and never
 // makes a network call or renders a real image.
 jest.mock('../qr.service', () => ({
   buildTicketQrPayload: jest.fn((eventId: string, uniqueCode: string) => ({
@@ -23,9 +24,9 @@ jest.mock('../qr.service', () => ({
   generateTicketQrBuffer: jest.fn(async () => Buffer.from('fake-qr-png')),
 }));
 
-jest.mock('../whatsapp.service', () => ({
-  sendImageMessage: jest.fn(async () => ({ ok: true })),
+jest.mock('../comms.service', () => ({
   sendTextMessage: jest.fn(async () => ({ ok: true })),
+  sendEmailMessage: jest.fn(async () => ({ ok: true })),
 }));
 
 // Mock the YeboPay client so the purchase flow never hits the gateway. The
@@ -58,14 +59,15 @@ import {
   settleFailedCharge,
   handleChargeWebhookEvent,
   reclaimExpiredReservations,
+  getEventTicketsForCheckIn,
 } from '../ticket.service';
-import { sendImageMessage, sendTextMessage } from '../whatsapp.service';
+import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
-const sendImageMessageMock = sendImageMessage as jest.MockedFunction<typeof sendImageMessage>;
 const sendTextMessageMock = sendTextMessage as jest.MockedFunction<typeof sendTextMessage>;
+const sendEmailMessageMock = sendEmailMessage as jest.MockedFunction<typeof sendEmailMessage>;
 const createChargeMock = createCharge as jest.MockedFunction<typeof createCharge>;
 const getChargeMock = getCharge as jest.MockedFunction<typeof getCharge>;
 const refundChargeMock = refundCharge as jest.MockedFunction<typeof refundCharge>;
@@ -78,9 +80,10 @@ beforeEach(() => {
   // reclaim sweep up front (prisma.ticket.findMany); without this the call would
   // see `undefined` and throw. Tests that exercise reclaim override it.
   prismaMock.ticket.findMany.mockResolvedValue([] as any);
-  sendImageMessageMock.mockResolvedValue({ ok: true } as any);
   sendTextMessageMock.mockReset();
   sendTextMessageMock.mockResolvedValue({ ok: true } as any);
+  sendEmailMessageMock.mockReset();
+  sendEmailMessageMock.mockResolvedValue({ ok: true } as any);
   createChargeMock.mockReset();
   getChargeMock.mockReset();
   refundChargeMock.mockReset();
@@ -292,7 +295,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
       (c: any) => c[0]?.data?.status === 'sold'
     );
     expect(soldWrites).toHaveLength(0);
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('a PENDING (async mobile-money) charge HOLDS the reservation, persists the charge ref, and returns a pending result — no ticket issued, no release', async () => {
@@ -313,7 +316,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(result.paymentStatus).toBe('PENDING');
     expect(result.paymentRef).toBe('chg_1');
     expect(result.qrCode).toBeUndefined();
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
 
     // Two guarded writes: reserve (available->reserved) then mark-pending — but
     // NEVER a release (the seat stays held) and NEVER a flip to 'sold'.
@@ -826,7 +829,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
     const flip = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(flip.where).toMatchObject({ paymentRef: 'chg_1', status: 'reserved' });
     expect(flip.data).toMatchObject({ status: 'sold', paymentStatus: 'SUCCEEDED' });
-    expect(sendImageMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
   });
 
   it('a redelivered charge.succeeded is an idempotent no-op (already sold; no second flip, no second QR)', async () => {
@@ -839,7 +842,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
 
     expect(outcome).toMatchObject({ result: 'already_final', status: 'sold' });
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('a concurrent finalize (guarded write matches 0 rows) issues no duplicate and does not deliver again', async () => {
@@ -849,7 +852,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
     const outcome = await settleSucceededCharge('chg_1');
 
     expect(outcome).toMatchObject({ result: 'already_final', status: 'sold' });
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('charge.failed releases the reservation back to the pool', async () => {
@@ -862,7 +865,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
     const release = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(release.where).toMatchObject({ id: 'ticket-1', status: 'reserved' });
     expect(release.data).toMatchObject({ status: 'available', userId: null, paymentRef: null });
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('charge.failed for an already-SOLD ticket does NOT unwind it (conflict — left sold)', async () => {
@@ -883,7 +886,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
 
     expect(outcome).toEqual({ result: 'unmatched' });
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
-    expect(sendImageMessageMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('an unhandled event type (e.g. checkout.completed) is ignored without touching tickets', async () => {
@@ -912,7 +915,7 @@ describe('charge webhook settlement (async mobile-money)', () => {
     expect(second).toMatchObject({ result: 'already_final', status: 'sold' });
     // Exactly one flip-to-sold and one QR delivery, never two.
     expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
-    expect(sendImageMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -947,7 +950,7 @@ describe('reclaimExpiredReservations', () => {
 
     expect(summary).toMatchObject({ scanned: 1, finalized: 1, released: 0 });
     expect(getChargeMock).toHaveBeenCalledWith('chg_1');
-    expect(sendImageMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
   });
 
   it('releases a hold whose charge YeboPay reports FAILED', async () => {
@@ -991,5 +994,50 @@ describe('reclaimExpiredReservations', () => {
 
     expect(summary).toMatchObject({ scanned: 1, errors: 1, released: 0, finalized: 0 });
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('getEventTicketsForCheckIn (offline scanner pre-sync)', () => {
+  const requester = { id: 'org-1', role: 'organizer' };
+
+  const grantEventAccess = (organizerId = 'org-1') =>
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId } as any);
+
+  it('returns ONLY sold tickets, scoped to the event, in the gate DTO shape', async () => {
+    grantEventAccess();
+    prismaMock.ticket.findMany.mockResolvedValue([
+      buildCheckInTicket(),
+      buildCheckInTicket({ id: 'ticket-2', uniqueCode: 'DEF456', isCheckedIn: true }),
+    ] as any);
+
+    const result = await getEventTicketsForCheckIn('event-1', requester);
+
+    // The query must constrain to this event AND status 'sold' so a forged or
+    // non-sold code is never present in the cache the scanner trusts offline.
+    const findArg = prismaMock.ticket.findMany.mock.calls[0][0];
+    expect(findArg.where).toMatchObject({ eventId: 'event-1', status: 'sold' });
+
+    expect(result.count).toBe(2);
+    expect(result.tickets).toHaveLength(2);
+    expect(result.syncedAt).toEqual(expect.any(String));
+    // isCheckedIn is preserved so the offline cache won't re-admit a used ticket.
+    expect(result.tickets[0]).toMatchObject({ id: 'ticket-1', isCheckedIn: false });
+    expect(result.tickets[1]).toMatchObject({ id: 'ticket-2', status: 'used', isCheckedIn: true });
+  });
+
+  it('REJECTS an organizer caching an event they do not own (no cross-tenant leak)', async () => {
+    grantEventAccess('someone-else');
+
+    await expect(getEventTicketsForCheckIn('event-1', requester)).rejects.toThrow(
+      'You do not have permission to check in tickets for this event'
+    );
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+  });
+
+  it('404s for an unknown event', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(null);
+
+    await expect(getEventTicketsForCheckIn('nope', requester)).rejects.toThrow('Event not found');
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
   });
 });

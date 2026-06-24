@@ -4,12 +4,13 @@ import {
   verifyOTP,
   updateProfile,
   requestPasswordReset,
-  resetPassword,
-  changePassword
+  resetPassword
 } from '../services/auth.service';
 import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
+import prisma from '../config/prisma';
+import { verifyRefreshToken, generateAuthTokens } from '../services/token.service';
 
 export const requestOTPController = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -35,6 +36,41 @@ export const verifyOTPController = async (req: Request, res: Response, next: Nex
     res.status(200).json({
       success: true,
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/refresh-token
+ * Exchange a valid refresh token for a fresh access token (and a rotated refresh
+ * token). Responds with the BARE `{ accessToken, refreshToken }` body the
+ * customer-dashboard's axios refresh interceptor reads (response.data.accessToken),
+ * NOT the `{ success, data }` envelope. Fails loudly (401) on a missing/expired/
+ * non-refresh token — never silently issues a token for an invalid one.
+ */
+export const refreshTokenController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { refreshToken } = req.body;
+
+    // Throws a 401 ApiError if the token is invalid/expired or not a refresh token.
+    const payload = verifyRefreshToken(refreshToken);
+
+    // Confirm the user still exists (token could outlive a deleted account).
+    const user = await prisma.user.findUnique({
+      where: { id: payload.id },
+      select: { id: true, role: true },
+    });
+    if (!user) {
+      return next(new ApiError('User no longer exists', 401));
+    }
+
+    const tokens = generateAuthTokens(user.id, user.role);
+
+    res.status(200).json({
+      accessToken: tokens.token,
+      refreshToken: tokens.refreshToken,
     });
   } catch (error) {
     next(error);
@@ -109,29 +145,6 @@ export const resetPasswordController = async (req: Request, res: Response, next:
     res.status(200).json({
       success: true,
       message: 'Password has been reset successfully',
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * POST /auth/change-password
- * Verify the caller's current password and set a new one. Protected route —
- * the user id comes from the auth middleware, never the request body.
- */
-export const changePasswordController = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    if (!authReq.user || !authReq.user.id) {
-      return next(new ApiError('User not authenticated', 401));
-    }
-
-    const { currentPassword, newPassword } = req.body;
-    await changePassword(authReq.user.id, currentPassword, newPassword);
-    res.status(200).json({
-      success: true,
-      message: 'Password changed successfully',
     });
   } catch (error) {
     next(error);
