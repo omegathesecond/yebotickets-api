@@ -200,17 +200,34 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     };
     
     // Get ticket statistics for all events
-    let ticketStats = {
-      totalTypes: 0,
-      totalSold: 0,
-      totalRevenue: 0,
-    };
-    
-    for (const event of events) {
-      const eventId = (event as any).id;
+    const eventIds = events.map((event: any) => event.id);
+
+    let totalTypes = 0;
+    for (const eventId of eventIds) {
       const ticketTypes = await getTicketTypes(eventId);
-      ticketStats.totalTypes += ticketTypes.length;
+      totalTypes += ticketTypes.length;
     }
+
+    // Count sold tickets and sum revenue across this organizer's events.
+    // Mirrors the canonical sold/revenue computation in dashboard.service
+    // (status 'sold', revenue = sum of ticketType.price) so the organizer's
+    // own numbers match the platform admin metrics (DRY). A single findMany
+    // with the price included yields both the count and the revenue sum.
+    const soldTickets = eventIds.length
+      ? await prisma.ticket.findMany({
+          where: { eventId: { in: eventIds }, status: 'sold' },
+          include: { ticketType: { select: { price: true } } },
+        })
+      : [];
+
+    const ticketStats = {
+      totalTypes,
+      totalSold: soldTickets.length,
+      totalRevenue: soldTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0),
+      // Platform currency, matching dashboard.service's revenue metric, so any
+      // client rendering totalRevenue labels it truthfully instead of guessing.
+      currency: 'KES',
+    };
     
     res.status(200).json({
       success: true,
