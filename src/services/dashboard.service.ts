@@ -1,4 +1,5 @@
 import prisma from '../config/prisma';
+import { TICKET_CURRENCY } from '../config/currency';
 
 /**
  * Platform-wide metrics shared by the CEO dashboard (X-API-Key route) and the
@@ -73,7 +74,7 @@ export const getDashboardMetrics = async () => {
       value: revenueCurrent,
       trend: calculateTrend(revenueCurrent, revenuePrevious),
       changePercent: calculateChangePercent(revenueCurrent, revenuePrevious),
-      currency: 'KES',
+      currency: TICKET_CURRENCY,
     },
     organizers: {
       value: organizersCurrent,

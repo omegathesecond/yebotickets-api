@@ -1,6 +1,7 @@
 import prisma from '../config/prisma';
-import { 
-  ITicket, 
+import { TICKET_CURRENCY, DEFAULT_COUNTRY } from '../config/currency';
+import {
+  ITicket,
   ITicketType, 
   TicketStatus,
   TicketType as TicketTypeEnum 
@@ -20,10 +21,6 @@ import {
   YeboPayHttpError,
   type PaymentOptionsResponse,
 } from './yebopay.service';
-
-/** Currency + default country tickets are priced/charged in (Eswatini). */
-const TICKET_CURRENCY = 'SZL';
-const DEFAULT_COUNTRY = 'SZ';
 
 /**
  * How long a reservation may sit unconfirmed before the reclaim sweep asks

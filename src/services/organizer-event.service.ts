@@ -1,6 +1,7 @@
 import prisma from '../config/prisma';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
+import { TICKET_CURRENCY as CURRENCY } from '../config/currency';
 
 /**
  * Organizer-dashboard read models.
@@ -19,10 +20,6 @@ import { UserRole } from '../interfaces/user.interface';
  *     stats; an admin may read any. {@link assertEventAccess} is the single
  *     choke point for that rule.
  */
-
-/** Currency tickets are priced/charged in (Eswatini lilangeni), matching the
- *  buyer flow in ticket.service.ts and the SZL labels the dashboard renders. */
-const CURRENCY = 'SZL';
 
 interface Requester {
   id: string;
