@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
+import { TICKET_CURRENCY } from '../config/currency';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { updateProfile, changePassword } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
@@ -226,7 +227,7 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
       totalRevenue: soldTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0),
       // Platform currency, matching dashboard.service's revenue metric, so any
       // client rendering totalRevenue labels it truthfully instead of guessing.
-      currency: 'KES',
+      currency: TICKET_CURRENCY,
     };
     
     res.status(200).json({
