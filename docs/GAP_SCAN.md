@@ -1,81 +1,116 @@
-# YeboTickets — Gap Scan (2026-06-17, round 2)
+# YeboTickets — Gap Scan (2026-07-01, round 3)
 
-Task `task-1781692203620-txzibo`. Every finding below was verified against the
-**current `origin/main`** of each component repo (the worktree HEADs equal
-`origin/main`: api `840da31`, app `a7324b1`, customer-dashboard `a0991cb`,
-admin-dashboard `351d4ca`, scanner-app `8b8ec8f`). The round-1 scan
-(`task-1781665508533`) was blocked because it verified against a stale working
-tree — this pass re-pins everything to the canonical ref.
+Task `task-1781728500999-10uv7e`. Full-fleet audit of all five component repos
+(api, app, customer-dashboard, admin-dashboard, scanner-app) against the
+Omevision platform standards (YeboID auth, YeboPay payments, YeboLink comms,
+**no silent fallbacks**) and for missing/incomplete features.
+
+Every finding below was **verified line-by-line against the current default
+branch** of each repo (worktree HEADs == `origin/main`):
+api `8a6f1cb`, app `a7324b1`, customer-dashboard `162c480`,
+admin-dashboard `351d4ca`, scanner-app `1ea62a1`. Round-1
+(`task-1781665508533`) and round-2 (`task-1781692203620`) are superseded by this
+doc; their resolved cards are summarized under "Resolved since round 2" and are
+NOT re-filed.
 
 ## Overall verdict
 
-YeboTickets is **healthy and production-shaped**. Buyer app, scanner check-in,
-admin dashboard, payments (YeboPay), and comms (YeboLink) are all real and wired.
-The gaps are an open auth-hardening hole, a cross-repo organizer-dashboard
-dependency, and some placeholder/fabricated surfaces.
+**YeboTickets is mature and production-shaped.** The backend money-path is the
+strongest part of the codebase and needs no rework: ticket reservation is
+race-safe (pre-generated per-seat rows + lock-free compare-and-set `updateMany`
+claims — no oversell), YeboPay reserve→charge→finalize/release is correct and
+never issues a ticket without a `SUCCEEDED` charge, PENDING mobile-money holds
+are reclaimed by authoritative `GET /v1/charges/:id` polling, webhooks are
+HMAC-verified over the raw body and settle exactly-once, refunds call YeboPay
+first and only mark `REFUNDED` on confirmed money-back (surfacing a 501
+no-adapter loudly instead of faking it), and all comms go through YeboLink (the
+old direct-Meta WhatsApp path is gone). `tsc` is clean and all 92 api tests pass.
+
+The residual gaps have **migrated to the edges**: a handful of fabricated UI
+surfaces that violate the no-silent-fallback rule, dead CTAs, a token-in-logs
+leak on the scanner, two security-hardening items, and two missing
+trust-&-safety surfaces (event moderation, organizer payouts). None are defects
+in the money-path.
 
 ## Newly filed this round
 
 | Card | Sev | Component | Gap |
 |------|-----|-----------|-----|
-| `task-1781693730230-fj9aud` | HIGH | api | OTP endpoints have **no rate-limiting / no attempt cap** — brute-forceable + SMS-spam vector. `auth.routes.ts:21-22`, no limiter anywhere in `api/src`. |
-| `task-1781693730953-2om6g3` | HIGH | api | Organizer **dashboard stats endpoints don't exist** (`/user/dashboard-stats`, `/user/monthly-stats`, `/user/recent-activity`). `user.routes.ts:34` only has `/events`. The frontend fix (branch `2iimhf`) is stranded — it assumes these exist on the API. |
-| `task-1781693731619-4ilqk0` | MED | api | `reclaimExpiredReservations()` (`ticket.service.ts:834`) is **never scheduled** — only called best-effort per-purchase (`:989`). Stranded PENDING holds linger until the next buyer attempt on that type. |
-| `task-1781693732222-embj7c` | MED | customer-dashboard | Organizer **Settings & Support pages are dead placeholders** — `Settings.tsx:88,30,39,51-73` + `Support.tsx:54` have buttons/switches/selects with no handlers. |
+| app fabricated availability | MED | app | Event browse/featured cards hardcode `ticketsAvailable:1, ticketsSold:0` (`EventList.tsx:117`), so every card renders a green **"Available"** badge (`EventCard.tsx:53,158-160`) and a genuinely sold-out event still shows as buyable. No availability comes from the list endpoint. **Silent-fallback / buyer-trust violation.** |
+| scanner JWT in logs | MED (sec) | scanner-app | The bearer JWT and full user record are written to device logs via `print()` in **release** builds: `storage_service.dart:9,14`, `api_service.dart:28,91`, `auth_controller.dart:66`. Any app with log access or a crash-reporter can lift a live session token. |
+| api JWT fallbacksecret | MED (sec) | api | `token.service.ts:22,24` sign access + refresh tokens with `process.env.JWT_SECRET \|\| 'fallbacksecret'`. If `JWT_SECRET` is ever unset, tokens are signed with a public constant (forgery). Throw at startup instead. |
+| admin event moderation | MED | admin-dashboard | Events table is read-only (`EventsPage.tsx:84-118`), but the API already authorizes admin unpublish/cancel/delete (`event.routes.ts:169,204,239`). Admins have **no way to take down a fraudulent/abusive event** from the console. Wire take-down CTAs to the existing admin routes. |
+| organizer dashboard dead surfaces | MED | customer-dashboard | Sidebar footer dropdown items **Account/Earnings/Notifications** have no `onClick` (`app-sidebar.tsx:206,210,214`) — dead clicks; a fake `plan:'Enterprise'` badge (`:86,118`); and the landing "Recent Notifications" card is a hardcoded fake array (`Dashboard.tsx:47-60`) with no backing endpoint. Wire or remove each. |
+| frontend template cleanup | LOW | app + customer-dashboard | Dead eneza-ads template cruft still shipped and pulling junk prod deps into Vite frontends. customer-dashboard: `TransactionTable.tsx`, `pages/events/Ticket.tsx`, `types/advertiser*.ts`, `types/ad.ts`, `constants/mock-api.ts`, `constants/data.ts`, `lib/store.ts`, `lib/menu-list.ts`, `breadcrumbs.tsx`, `hooks/use-breadcrumbs.ts`, Next.js leftovers `middleware.ts`+`auth.ts` (the only reason `mongoose`+`@faker-js/faker` are deps); rename package from `eneza-customer-dashboard`, drop `TSX_COMPILE_ON_ERROR`. app: unused `mongodb`+`@types/mongodb`+stray `install`/`npm` deps, dead `components/EventDetails.tsx`. |
 
-## Resolved since round 1 (do NOT re-file)
+## Still valid — already tracked, NOT re-filed
+
+- **`GET /events?showUnpublished=true` leaks drafts** (`lpfuek`, HIGH sec) — the
+  fix (`security: gate showUnpublished on GET /events to admins only`) is on the
+  **approved-but-unmerged** branch
+  `omevision/task-1781667777873-lpfuek-security-get-events-showunpublished-true`
+  (commits `45a6865`, `7f75411`). On `main` the route `event.routes.ts:103` is
+  still ungated and `event.service.ts:94` still honors the flag for anyone.
+  **Action: merge the lpfuek branch** — no new card.
+- **Currency `KES` mislabel** (`9c4anu`, MED) — `dashboard.service.ts:76` is the
+  filed instance. Round-3 found a **second live instance**:
+  `organizer.controller.ts:229` also hardcodes `currency:'KES'` for the
+  `GET /api/user/events` stats block. Fold into the existing currency card
+  (fix both; the rest of the api correctly uses `TICKET_CURRENCY='SZL'`).
+- **App dead `/create-event` CTA + no 404 catch-all** (`pmsy1c`, LOW) — still
+  valid: `app/src/pages/Home.tsx:257` links to a non-existent route;
+  `App.tsx:26-36` has no `<Route path="*">`.
+- **Missing organizer payouts surface** — genuine platform gap (no payout/
+  disbursement route in the api, no UI). Organizers can't be paid out
+  in-product. A feature epic, not a line-level defect — left as a note for a
+  product decision, not filed as a bug this round.
+
+## Resolved since round 2 (do NOT re-file)
 
 - **Comms bypass YeboLink** (`bydl5v`) — RESOLVED. `whatsapp.service.ts` deleted;
-  OTP + ticket delivery now go through `comms.service.ts` → `yebolink.client`
-  (`api/src/services/comms.service.ts`). Zero `graph.facebook.com` references.
-- **Scanner silent-accept at the gate** (`ldzi6b`) — RESOLVED (commit `863d374`).
-  `api_exception.dart` preserves an `isNetworkError` flag; the scanner screen
-  gates on `error == true` and shows amber "could not reach server / try again"
-  for network blips vs red "ticket not accepted" + reason for server rejections.
-  Never silently accepts a revoked/refunded ticket.
-- **customer-dashboard cancel/refund + CreateEvent type-broken** (`8yyy6w`) — RESOLVED.
-- **Dead organizer menu links** (`afudqe`) — RESOLVED. Old `lib/menu-list.ts`
-  deleted; menu now in `app-sidebar.tsx:36-81`, every link maps to a real route.
-- **customer-dashboard login flow** — RESOLVED (commit `350c264`): real
-  `/organizers/login`, correct token/refreshToken unwrap, loud errors.
+  `comms.service.ts`→`yebolink.client.ts` for all SMS/WhatsApp/email; zero
+  `graph.facebook.com` refs.
+- **Organizer dashboard-stats/monthly-stats 404** (`2om6g3`/`2iimhf`) — RESOLVED.
+  `/user/dashboard-stats` + `/user/monthly-stats` exist and are gated
+  (`user.routes.ts:57,75`, `protect`+`authorize(ORGANIZER,ADMIN)`), backed by
+  real sold-row counts/revenue in SZL (`organizer-event.service.ts`). The
+  customer-dashboard landing KPIs + sales chart now render real data with a loud
+  error state. (Only the fake *notifications* card on that page remains — folded
+  into the round-3 "dead surfaces" card above.)
+- **Fabricated organizer stats always 0** (`pbcuvk`) — RESOLVED both sides:
+  `organizer.controller.ts:216-226` computes real `totalSold`/`totalRevenue`;
+  scanner `profile_screen.dart` renders a `FutureBuilder` over
+  `/organizers/dashboard` (no `15/1560/31200` literals remain).
+- **OTP endpoints unthrottled** (`fj9aud`) — RESOLVED (rate-limit + attempt cap).
+- **Reservation reclaim never scheduled** (`4ilqk0`) — RESOLVED (global sweep,
+  gated to a single instance cross-instance).
+- **Scanner silent-accept at the gate** (`ldzi6b`) — RESOLVED and re-verified:
+  the scanner now ships a full offline cache + queue + conflict-replay system,
+  and it is **fail-loud** — the offline path accepts only codes in the pre-synced
+  sold set, unknown/forged/wrong-event codes are red-rejected, and server
+  rejections surface as-is. Never silently accepts a revoked/refunded ticket.
+- **Dead organizer menu links / cancel-refund type breakage / login flow**
+  (`afudqe`,`8yyy6w`) — RESOLVED (live nav is `app-sidebar.tsx`; real
+  `/organizers/login`).
 
-## Still valid — already tracked from round 1 (NOT re-filed)
+## Healthy components — do NOT re-investigate
 
-- **`GET /events?showUnpublished=true` leaks drafts** (`lpfuek`, HIGH sec) — still
-  valid: `event.routes.ts:103` is unauthenticated; `event.service.ts:94` drops the
-  `isPublished:true` filter for anyone passing the flag. Gate behind organizer/admin.
-- **Fabricated organizer stats** (`pbcuvk`, MED) — still valid on both sides:
-  `organizer.controller.ts:203-213` leaves `totalSold`/`totalRevenue` at 0 (loop only
-  counts `totalTypes`); scanner `profile_screen.dart:61-63` hardcodes
-  `15 / 1,560 / $31,200` (also wrong `$` currency for the SZL market).
-- **Wrong currency `KES`** (`9c4anu`, MED) — still valid: `dashboard.service.ts:76`
-  hardcodes `currency:'KES'`; the rest of the api correctly uses SZL.
-- **App dead `/create-event` CTA + no 404 catch-all** (`pmsy1c`, LOW) — still valid:
-  `app/src/Home.tsx:257` links to `/create-event` (no such route); `App.tsx` has no
-  `<Route path="*">`, so the link lands on a blank page.
-- **Organizer dashboard landing** (`2iimhf`, frontend) — in-flight on branch
-  `omevision/task-1781667797539-2iimhf`; **blocked on the new API card
-  `2om6g3`** (the endpoints it calls don't exist on the API yet).
+- **api money-path** — reservations, YeboPay charge/finalize/release, webhook
+  settlement, PENDING reclaim, refund/cancel: all real, race-safe, idempotent,
+  fail-loud. No TODOs/stubs in `src/`. Tests + `tsc` green.
+- **admin-dashboard** — hand-built React/Vite (no CoreUI template pages), real
+  Prisma-backed KPIs, no mock data, every mutation server-gated
+  `authorize(ADMIN)`, all called endpoints exist, loud error states. Its only
+  actionable items are the API-side draft leak (tracked) and the missing
+  moderation/payouts surfaces (filed/noted above).
+- **app money/auth path** — fresh idempotency key per ticket, 201-issued vs
+  202-pending discrimination, loud "X of N processed" accounting, 401 re-auth,
+  pending-hold rendering with no fake QR. No silent fallbacks on the pay path.
 
-## Minor / not filed (notes for whoever touches these areas)
+## Standards deviation (architecture-level, flagged not filed)
 
-- scanner `profile_screen.dart:86-88`: "Change Password" button is a `Get.snackbar`
-  "Coming Soon" stub even though `change_password_screen.dart` is fully implemented —
-  a one-line wire-up (`Get.to(() => ChangePasswordScreen())`). Fold into `pbcuvk` or
-  a scanner-polish pass.
-- Two server entrypoints (`src/app.ts` has only `cors`; `src/server.ts` adds
-  `helmet`). Confirm which one actually boots in prod so security middleware applies.
-
-## Healthy — do NOT re-investigate
-
-- **Buyer app**: full browse → OTP → pay → QR / async-mobile-money polling →
-  WhatsApp delivery; SZL currency (`Event.ts:9`); no silent fallbacks; failed
-  charges surfaced distinctly from network errors.
-- **Scanner**: login, event selection, QR scan, manual entry, check-in verdict — all
-  real and loud.
-- **API payments**: YeboPay webhook HMAC-verified with timing-safe compare + 401 on
-  bad sig (`payment-webhook.service.ts:85-116`); refund money-before-status-flip
-  ordering; PENDING-charge idempotency; check-in race-safety via guarded `updateMany`;
-  ownership choke-point `assertEventAccess`.
-- **admin-dashboard**: real Prisma KPIs, server-side `authorize(ADMIN)`, loud client.
-- **Comms**: YeboLink only. **No** direct Stripe / MoMo / Twilio / Meta.
+Consumer auth is **custom phone+OTP+JWT, not YeboID**; the product stores its own
+`phoneNumber`/`email`/`name` instead of a `yeboidUserId` FK. Per Omevision
+standards consumer auth should be YeboID. This is pervasive (entire `User` model
++ auth flow across api/app/scanner) — a dedicated migration epic, not a
+line-level gap. Unchanged since prior rounds.
