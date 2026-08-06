@@ -1,3 +1,12 @@
+# Defaults are the PROD values; the yebotickets-api-dev trigger overrides each
+# one with its _DEV variant. Parameterised (rather than hardcoded) because
+# binding the PROD YeboPay key into the dev service would let a dev deploy take
+# REAL money from buyers through the live gateway.
+substitutions:
+  _YEBOPAY_API_KEY_SECRET: YEBOTICKETS__YEBOPAY_API_KEY
+  _YEBOPAY_WEBHOOK_SECRET_SECRET: YEBOTICKETS__YEBOPAY_WEBHOOK_SECRET
+  _YEBOPAY_BASE_URL: https://api.yebopay.app
+
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
@@ -35,7 +44,12 @@ steps:
       # --set-secrets, so a deploy never silently wipes bindings applied out
       # of band — e.g. the R2_* media creds bound to yebotickets-api-prod).
       - '--update-secrets'
-      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest'
+      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest,YEBOPAY_API_KEY=${_YEBOPAY_API_KEY_SECRET}:latest,YEBOPAY_WEBHOOK_SECRET=${_YEBOPAY_WEBHOOK_SECRET_SECRET}:latest'
+      # Which YeboPay gateway to talk to. The host is yebopay.APP —
+      # api.yebopay.com is an unrelated third-party site, so this must never be
+      # left to drift. Dev overrides it to https://dev-api.yebopay.app.
+      - '--update-env-vars'
+      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
