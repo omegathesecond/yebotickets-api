@@ -40,7 +40,12 @@ steps:
       # via substitutions so the dev trigger can point at the _DEV secrets
       # instead of prod's without touching this file.
       - '--update-secrets'
-      - 'DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest'
+      - 'DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest,YEBOPAY_API_KEY=${_YEBOPAY_API_KEY_SECRET}:latest,YEBOPAY_WEBHOOK_SECRET=${_YEBOPAY_WEBHOOK_SECRET_SECRET}:latest'
+      # Which YeboPay gateway to talk to. The host is yebopay.APP —
+      # api.yebopay.com is an unrelated third-party site, so this must never be
+      # left to drift. Dev overrides it to https://dev-api.yebopay.app.
+      - '--update-env-vars'
+      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
@@ -59,6 +64,13 @@ substitutions:
   _R2_ENDPOINT_SECRET: 'YEBOTICKETS__R2_ENDPOINT'
   _R2_BUCKET_NAME_SECRET: 'YEBOTICKETS__R2_BUCKET_NAME'
   _R2_PUBLIC_URL_SECRET: 'YEBOTICKETS__R2_PUBLIC_URL'
+  # Same additive-secret pattern for YeboPay: the dev trigger overrides these
+  # three with their _DEV counterparts (and _YEBOPAY_BASE_URL with
+  # https://dev-api.yebopay.app) so a dev deploy can never take real money
+  # through the live gateway.
+  _YEBOPAY_API_KEY_SECRET: 'YEBOTICKETS__YEBOPAY_API_KEY'
+  _YEBOPAY_WEBHOOK_SECRET_SECRET: 'YEBOTICKETS__YEBOPAY_WEBHOOK_SECRET'
+  _YEBOPAY_BASE_URL: 'https://api.yebopay.app'
 
 options:
   logging: CLOUD_LOGGING_ONLY

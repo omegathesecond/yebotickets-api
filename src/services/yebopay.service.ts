@@ -1,5 +1,5 @@
 /**
- * YeboPay client — the canonical Omevision payments gateway (api.yebopay.com).
+ * YeboPay client — the canonical Omevision payments gateway (api.yebopay.app).
  *
  * YeboTickets takes money through YeboPay ONLY; it never talks to a card
  * processor / mobile-money provider directly (that's YeboPay's job to abstract).
@@ -16,10 +16,20 @@
  * Env:
  *   YEBOPAY_API_KEY  — provisioned per product, per environment (ypk_*). Bound
  *                      from Secret Manager (YEBOTICKETS__YEBOPAY_API_KEY[_DEV]).
- *   YEBOPAY_BASE_URL — defaults to https://api.yebopay.com.
+ *   YEBOPAY_BASE_URL — defaults to https://api.yebopay.app (prod). Dev points at
+ *                      https://dev-api.yebopay.app so a dev deploy can never
+ *                      move real money through the prod gateway.
+ *
+ * NB the host is yebopay.APP, not the similarly-named `.com` domain — that is
+ * an unrelated third-party site (Apache/PHP), NOT this gateway. Defaulting to
+ * the wrong TLD would ship our `x-api-key` and every charge request to a host
+ * we do not control, and no payment would ever complete. The live domain
+ * mappings are the authority:
+ *   api.yebopay.app     -> yebopay-api-prod   (europe-west1, hiyebo)
+ *   dev-api.yebopay.app -> yebopay-api-dev
  */
 
-const YEBOPAY_BASE = process.env['YEBOPAY_BASE_URL'] || 'https://api.yebopay.com';
+const YEBOPAY_BASE = process.env['YEBOPAY_BASE_URL'] || 'https://api.yebopay.app';
 
 /** Read the API key, throwing loudly if it is not configured (no fallback). */
 const apiKey = (): string => {
