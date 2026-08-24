@@ -23,7 +23,7 @@ steps:
     args:
       - 'run'
       - 'deploy'
-      - 'yebotickets-api'
+      - '${_SERVICE}'
       - '--image'
       - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
       - '--region'
@@ -31,15 +31,34 @@ steps:
       - '--platform'
       - 'managed'
       - '--allow-unauthenticated'
+      - '--service-account'
+      - 'yebotickets-runtime@hiyebo.iam.gserviceaccount.com'
       # ADDITIVE secret binding (per CLAUDE.md: --update-secrets, never
       # --set-secrets, so a deploy never silently wipes bindings applied out
-      # of band — e.g. the R2_* media creds bound to yebotickets-api-prod).
+      # of band — e.g. the YEBOPAY_*/YEBOLINK_API_KEY/INTERNAL_API_KEY creds
+      # bound to yebotickets-api-prod/-dev). Secret names are parameterised
+      # via substitutions so the dev trigger can point at the _DEV secrets
+      # instead of prod's without touching this file.
       - '--update-secrets'
-      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest'
+      - 'DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
   - 'gcr.io/$PROJECT_ID/yebotickets-api:latest'
+
+substitutions:
+  # Defaults target prod; the yebotickets-api-dev trigger overrides these
+  # (already configured via `gcloud builds triggers` — see
+  # yebotickets-api-dev trigger substitutions) to point _SERVICE at
+  # yebotickets-api-dev and the secrets at their _DEV counterparts so a
+  # dev build never binds the prod database or R2 bucket.
+  _SERVICE: 'yebotickets-api-prod'
+  _DATABASE_URL_SECRET: 'YEBOTICKETS__DATABASE_URL'
+  _R2_ACCESS_KEY_ID_SECRET: 'YEBOTICKETS__R2_ACCESS_KEY_ID'
+  _R2_SECRET_ACCESS_KEY_SECRET: 'YEBOTICKETS__R2_SECRET_ACCESS_KEY'
+  _R2_ENDPOINT_SECRET: 'YEBOTICKETS__R2_ENDPOINT'
+  _R2_BUCKET_NAME_SECRET: 'YEBOTICKETS__R2_BUCKET_NAME'
+  _R2_PUBLIC_URL_SECRET: 'YEBOTICKETS__R2_PUBLIC_URL'
 
 options:
   logging: CLOUD_LOGGING_ONLY
