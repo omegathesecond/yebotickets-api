@@ -46,6 +46,18 @@ model User {
   // requested. Guards against brute-forcing the 6-digit code.
   otpAttempts Int      @default(0)
 
+  // Password-reset fields (organizer/staff email+password recovery).
+  // Kept separate from the OTP columns so a phone-login OTP and an email/phone
+  // password-reset can be in flight at the same time without clobbering each
+  // other. resetCodeHash stores a bcrypt hash of the code (never the code
+  // itself) so a leaked User row can't be used to reset the password directly.
+  // The code is single-use: it is cleared once a reset succeeds.
+  // resetCodeAttempts caps brute-force guessing — the code is burned after a
+  // small number of wrong attempts.
+  resetCodeHash      String?
+  resetCodeExpiresAt DateTime?
+  resetCodeAttempts  Int       @default(0)
+
   // Organizer profile (flattened)
   companyName      String?
   companyDescription String?

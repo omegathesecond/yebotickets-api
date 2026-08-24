@@ -1,8 +1,10 @@
 import { Request, Response, NextFunction } from 'express';
-import { 
-  requestOTP, 
-  verifyOTP, 
-  updateProfile
+import {
+  requestOTP,
+  verifyOTP,
+  updateProfile,
+  requestPasswordReset,
+  resetPassword
 } from '../services/auth.service';
 import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
@@ -90,6 +92,41 @@ export const updateProfileController = async (req: Request, res: Response, next:
     res.status(200).json({
       success: true,
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/request-password-reset
+ * Issue a single-use, time-limited reset code for an organizer/staff account
+ * (looked up by email or phone) and deliver it via YeboLink. Public route.
+ */
+export const requestPasswordResetController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email, phoneNumber } = req.body;
+    const result = await requestPasswordReset({ email, phoneNumber });
+    res.status(200).json({
+      success: true,
+      message: result.message,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/reset-password
+ * Verify a reset code (unexpired, unused) and set a new password. Public route.
+ */
+export const resetPasswordController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email, phoneNumber, resetCode, newPassword } = req.body;
+    await resetPassword({ email, phoneNumber }, resetCode, newPassword);
+    res.status(200).json({
+      success: true,
+      message: 'Password has been reset successfully',
     });
   } catch (error) {
     next(error);

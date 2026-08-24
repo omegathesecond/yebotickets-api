@@ -1,9 +1,10 @@
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
-import { sendOTP } from './comms.service';
+import { sendOTP, sendTextMessage } from './comms.service';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
+import { randomInt } from 'crypto';
 
 /**
  * Maximum number of consecutive wrong guesses allowed against a single OTP
@@ -13,11 +14,29 @@ import bcrypt from 'bcryptjs';
  */
 const MAX_OTP_ATTEMPTS = 5;
 
+/** How long an issued password-reset code stays valid (minutes). */
+const RESET_CODE_TTL_MINUTES = 15;
+
+/** Wrong reset-code guesses allowed before the code is burned (brute-force cap). */
+const MAX_RESET_CODE_ATTEMPTS = 5;
+
 /**
- * Generate a 6-digit OTP
+ * Generic, account-existence-agnostic responses for the public recovery
+ * endpoints. Returning the same shape whether or not the email/phone matched
+ * prevents account enumeration on these unauthenticated routes.
+ */
+const GENERIC_RESET_REQUEST_MESSAGE =
+  'If that account exists, a password reset code has been sent to the phone number on file.';
+const GENERIC_RESET_FAILURE_MESSAGE = 'Invalid or expired reset code';
+
+/**
+ * Generate a 6-digit code. Uses a CSPRNG (crypto.randomInt) rather than
+ * Math.random() — this mints both login OTPs and password-reset codes, and
+ * neither may be predictable. randomInt's max is exclusive, so this yields
+ * 100000-999999 inclusive.
  */
 const generateOTPCode = (): string => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return randomInt(100000, 1000000).toString();
 };
 
 /**
@@ -286,6 +305,117 @@ export const changePassword = async (
   await prisma.user.update({
     where: { id: userId },
     data: { password: hashed },
+  });
+
+  return { success: true };
+};
+
+/**
+ * Look up an organizer/staff account by email or phone number. Scoped to
+ * organizer/admin roles, matching the same scoping the password login route
+ * uses — a consumer (role 'user') account has no password to recover.
+ */
+const findResetAccount = (identifier: { email?: string; phoneNumber?: string }) =>
+  prisma.user.findFirst({
+    where: {
+      OR: [
+        { email: identifier.email || '' },
+        { phoneNumber: identifier.phoneNumber || '' },
+      ],
+      role: { in: ['organizer', 'admin'] },
+    },
+  });
+
+/**
+ * Request a password reset for an organizer/staff account.
+ *
+ * Looks the account up by email or phone, mints a 6-digit single-use code
+ * with a short TTL, persists a bcrypt HASH of it (never the code itself), and
+ * delivers the plaintext code over YeboLink to the account's registered phone
+ * via comms.service (the platform's canonical comms wrapper — no direct
+ * provider call here). Returns the same generic message whether or not the
+ * account matched (anti-enumeration) and lets a YeboLink delivery failure
+ * propagate rather than pretending the code was sent.
+ */
+export const requestPasswordReset = async (identifier: {
+  email?: string;
+  phoneNumber?: string;
+}): Promise<{ message: string }> => {
+  const user = await findResetAccount(identifier);
+
+  // Anti-enumeration: respond identically whether or not the account matched,
+  // and only do real work (mint + send) for a real account.
+  if (!user) {
+    return { message: GENERIC_RESET_REQUEST_MESSAGE };
+  }
+
+  const resetCode = generateOTPCode();
+  const resetCodeHash = await hashPassword(resetCode);
+  const resetCodeExpiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    // Reset the attempt counter alongside the fresh code.
+    data: { resetCodeHash, resetCodeExpiresAt, resetCodeAttempts: 0 },
+  });
+
+  // Deliver via YeboLink to the account's registered phone. A failure here
+  // throws and surfaces to the caller — we never claim success on a failed send.
+  await sendTextMessage(
+    user.phoneNumber,
+    `Your YeboTickets password reset code is ${resetCode}. It expires in ${RESET_CODE_TTL_MINUTES} minutes. If you didn't request this, ignore this message.`
+  );
+
+  return { message: GENERIC_RESET_REQUEST_MESSAGE };
+};
+
+/**
+ * Reset an organizer/staff password using a previously issued reset code.
+ *
+ * Verifies the code is present, unexpired, and matches the stored hash, then
+ * stores a fresh bcrypt hash of the new password and clears the reset code so
+ * it can't be reused (single-use). Every failure mode throws the same generic
+ * ApiError so a caller can't distinguish "no such account" from "wrong/expired
+ * code" (anti-enumeration) — there is no silent fallback.
+ */
+export const resetPassword = async (
+  identifier: { email?: string; phoneNumber?: string },
+  resetCode: string,
+  newPassword: string
+): Promise<{ success: true }> => {
+  const user = await findResetAccount(identifier);
+
+  if (!user || !user.resetCodeHash || !user.resetCodeExpiresAt) {
+    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+  }
+  if (new Date() > user.resetCodeExpiresAt) {
+    // Expired — burn it so it can't linger.
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
+    });
+    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+  }
+
+  const codeMatches = await bcrypt.compare(resetCode, user.resetCodeHash);
+  if (!codeMatches) {
+    // Brute-force cap: count the miss and burn the code once the cap is hit.
+    const attempts = user.resetCodeAttempts + 1;
+    await prisma.user.update({
+      where: { id: user.id },
+      data:
+        attempts >= MAX_RESET_CODE_ATTEMPTS
+          ? { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 }
+          : { resetCodeAttempts: attempts },
+    });
+    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+  }
+
+  const hashed = await hashPassword(newPassword);
+  await prisma.user.update({
+    where: { id: user.id },
+    // Clearing the code is what enforces single-use; reset the attempt counter.
+    data: { password: hashed, resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
   });
 
   return { success: true };
