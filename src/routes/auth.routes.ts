@@ -4,13 +4,17 @@ import {
   verifyOTPController,
   updateProfileController,
   getCurrentUserController,
-  refreshTokenController
+  refreshTokenController,
+  requestPasswordResetController,
+  resetPasswordController
 } from '../controllers/auth.controller';
 import {
   requestOTPValidator,
   verifyOTPValidator,
   updateProfileValidator,
-  refreshTokenValidator
+  refreshTokenValidator,
+  requestPasswordResetValidator,
+  resetPasswordValidator
 } from '../validators/auth.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect } from '../middleware/auth.middleware';
@@ -49,7 +53,27 @@ router.post('/verify-otp', verifyOtpLimiter, validate(verifyOTPValidator), verif
  */
 router.post('/refresh-token', validate(refreshTokenValidator), refreshTokenController);
 
+// Public password-recovery routes (organizer/staff email+password accounts).
+// Reuse the same limiters as the OTP flow rather than hand-rolling new ones:
+// requestOtpLimiter throttles issuance (comms cost/abuse), verifyOtpLimiter
+// throttles guessing the code.
+router.post(
+  '/request-password-reset',
+  requestOtpLimiter,
+  validate(requestPasswordResetValidator),
+  requestPasswordResetController
+);
+router.post(
+  '/reset-password',
+  verifyOtpLimiter,
+  validate(resetPasswordValidator),
+  resetPasswordController
+);
+
 // Protected routes
+// NOTE: change-password lives at POST /organizers/change-password (already
+// present, protect + organizer/admin authorize) which is what the scanner
+// calls — no duplicate is added here.
 router.get('/me', protect, getCurrentUserController);
 router.put('/profile', protect, validate(updateProfileValidator), updateProfileController);
 
