@@ -1,5 +1,13 @@
 import { body } from 'express-validator';
 
+export const moderateEventValidator = [
+  body('action')
+    .notEmpty()
+    .withMessage('action is required')
+    .isIn(['unpublish', 'cancel'])
+    .withMessage("action must be 'unpublish' or 'cancel'"),
+];
+
 export const createEventValidator = [
   body('title')
     .notEmpty()

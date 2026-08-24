@@ -1,11 +1,13 @@
 import { Request, Response, NextFunction } from 'express';
-import { 
-  createEvent, 
-  getEvents, 
-  getEventById, 
-  updateEvent, 
-  deleteEvent 
+import {
+  createEvent,
+  getEvents,
+  getEventById,
+  updateEvent,
+  deleteEvent,
+  adminUnpublishEvent,
 } from '../services/event.service';
+import { cancelEvent } from '../services/ticket.service';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 
@@ -75,6 +77,42 @@ export const updateEventController = async (req: Request, res: Response, next: N
       success: true,
       data: event,
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Admin-only moderation action on ANY event, regardless of organizerId:
+ *  - 'unpublish': takes the event off sale/listing immediately (isPublished=false)
+ *  - 'cancel': runs the existing cancel path (refunds sold tickets + isCancelled=true)
+ * Route is gated by authorize(ADMIN); organizer-owner update/delete are untouched.
+ * PATCH /api/events/:id/moderation
+ */
+export const moderateEventController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { id } = req.params;
+    const { action } = req.body;
+
+    if (action === 'unpublish') {
+      const event = await adminUnpublishEvent(id);
+      return res.status(200).json({ success: true, data: event });
+    }
+
+    if (action === 'cancel') {
+      const result = await cancelEvent(id, {
+        id: authReq.user.id,
+        role: authReq.user.role,
+      });
+      return res.status(200).json({ success: true, data: result });
+    }
+
+    return next(new ApiError("Invalid action: must be 'unpublish' or 'cancel'", 400));
   } catch (error) {
     next(error);
   }

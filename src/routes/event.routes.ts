@@ -1,14 +1,16 @@
 import express from 'express';
-import { 
+import {
   createEventController,
   getEventsController,
   getEventByIdController,
   updateEventController,
-  deleteEventController
+  deleteEventController,
+  moderateEventController
 } from '../controllers/event.controller';
-import { 
+import {
   createEventValidator,
-  updateEventValidator
+  updateEventValidator,
+  moderateEventValidator
 } from '../validators/event.validator';
 import {
   getEarningsController,
@@ -422,10 +424,62 @@ router.put(
  *               $ref: '#/components/schemas/Error'
  */
 router.delete(
-  '/:id', 
-  protect, 
-  authorize(UserRole.ORGANIZER, UserRole.ADMIN), 
+  '/:id',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   deleteEventController
 );
 
-export default router; 
+/**
+ * @swagger
+ * /api/events/{id}/moderation:
+ *   patch:
+ *     summary: Platform-admin moderation action on any event (Admin only)
+ *     tags: [Events]
+ *     description: >
+ *       Lets a platform admin unpublish (takedown) or cancel ANY event,
+ *       regardless of who owns it — unlike PUT/DELETE /api/events/:id, which
+ *       are scoped to the owning organizer. 'unpublish' flips isPublished to
+ *       false. 'cancel' runs the existing cancel path (refunds sold tickets,
+ *       flags isCancelled).
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - action
+ *             properties:
+ *               action:
+ *                 type: string
+ *                 enum: [unpublish, cancel]
+ *     responses:
+ *       200:
+ *         description: Event unpublished, or cancellation summary
+ *       400:
+ *         description: Invalid action
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Event not found
+ */
+router.patch(
+  '/:id/moderation',
+  protect,
+  authorize(UserRole.ADMIN),
+  validate(moderateEventValidator),
+  moderateEventController
+);
+
+export default router;
