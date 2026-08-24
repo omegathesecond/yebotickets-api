@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
 import { ApiError } from './error.middleware';
 import prisma from '../config/prisma';
 import { IUser, UserRole } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
+import { verifyAccessToken } from '../services/token.service';
 
 // Create a custom request interface with the user property
 export interface AuthRequest extends Request {
@@ -27,7 +27,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
     try {
       // Verify token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
+      const decoded = verifyAccessToken(token);
 
       // Get user from database
       const user = await prisma.user.findUnique({

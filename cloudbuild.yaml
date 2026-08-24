@@ -35,7 +35,7 @@ steps:
       # --set-secrets, so a deploy never silently wipes bindings applied out
       # of band — e.g. the R2_* media creds bound to yebotickets-api-prod).
       - '--update-secrets'
-      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest'
+      - 'DATABASE_URL=yebotickets-database-url:latest,R2_ACCESS_KEY_ID=YEBOTICKETS__R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=YEBOTICKETS__R2_SECRET_ACCESS_KEY:latest,R2_ENDPOINT=YEBOTICKETS__R2_ENDPOINT:latest,R2_BUCKET_NAME=YEBOTICKETS__R2_BUCKET_NAME:latest,R2_PUBLIC_URL=YEBOTICKETS__R2_PUBLIC_URL:latest,JWT_SECRET=YEBOTICKETS__JWT_SECRET:latest,JWT_REFRESH_SECRET=YEBOTICKETS__JWT_REFRESH_SECRET:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'

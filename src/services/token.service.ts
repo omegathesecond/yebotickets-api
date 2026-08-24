@@ -15,13 +15,18 @@ import { ApiError } from '../middleware/error.middleware';
  *    accepted as an access token. Used by POST /api/auth/refresh-token to mint a
  *    fresh access token without forcing the user to log in again.
  *
- * Secrets fall back to JWT_SECRET (and finally the legacy 'fallbacksecret' the
- * rest of the codebase already uses) so an environment that has not yet been
- * given a separate refresh secret still works rather than crashing at boot.
+ * JWT_SECRET is mandatory — there is no fallback literal. An environment
+ * that hasn't been given one fails loudly at startup rather than silently
+ * signing/verifying every token with a well-known constant (CLAUDE.md: no
+ * silent fallbacks). JWT_REFRESH_SECRET may fall back to JWT_SECRET so a
+ * dedicated refresh secret is optional, but a secret of some kind is not.
  */
-const accessSecret = (): string => process.env.JWT_SECRET || 'fallbacksecret';
-const refreshSecret = (): string =>
-  process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'fallbacksecret';
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is not set — refusing to start');
+}
+
+const accessSecret = (): string => process.env.JWT_SECRET as string;
+const refreshSecret = (): string => process.env.JWT_REFRESH_SECRET || (process.env.JWT_SECRET as string);
 
 const ACCESS_EXPIRES = (): string => process.env.JWT_EXPIRES_IN || '24h';
 const REFRESH_EXPIRES = (): string => process.env.JWT_REFRESH_EXPIRES_IN || '30d';
@@ -62,6 +67,27 @@ export const generateAuthTokens = (userId: string, role: string): AuthTokens => 
  * the token is missing/expired/tampered, or is not actually a refresh token
  * (e.g. someone replays an access token here) — never silently accepts it.
  */
+export interface AccessTokenPayload {
+  id: string;
+}
+
+/**
+ * Verify an access (bearer) token, throwing a loud 401 ApiError if it's
+ * missing/expired/tampered. Centralises access-token verification so
+ * `protect` doesn't read process.env.JWT_SECRET directly.
+ */
+export const verifyAccessToken = (token: string): AccessTokenPayload => {
+  try {
+    const decoded = jwt.verify(token, accessSecret());
+    if (typeof decoded === 'string' || !decoded.id) {
+      throw new Error('malformed payload');
+    }
+    return { id: decoded.id as string };
+  } catch {
+    throw new ApiError('Not authorized, invalid token', 401);
+  }
+};
+
 export const verifyRefreshToken = (token: string): RefreshTokenPayload => {
   let decoded: jwt.JwtPayload | string;
   try {
