@@ -188,8 +188,14 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     
     const organizerId = authReq.user.id;
     
-    // Get organizer's events
-    const events = await getEvents({ organizer: organizerId, showUnpublished: 'true' });
+    // Get organizer's events. includePast=true because the stats below need
+    // the organizer's full history (eventStats.past), not just what's
+    // upcoming — the public listing default of upcoming-only doesn't apply here.
+    const { data: events } = await getEvents({
+      organizer: organizerId,
+      showUnpublished: 'true',
+      includePast: 'true',
+    });
     
     // Get event statistics
     const eventStats = {

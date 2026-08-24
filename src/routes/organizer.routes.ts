@@ -353,11 +353,14 @@ router.get('/events', (req: Request, res: Response, next: NextFunction) => {
       next();
       return;
     }
-    // For organizers or when organizer ID is specified
+    // For organizers or when organizer ID is specified. includePast=true so
+    // an organizer managing their own events still sees past ones, unlike the
+    // public listing's upcoming-only default.
     req.query = {
       ...req.query,
       organizer: (req.query.organizer as string) || authReq.user.id,
-      showUnpublished: 'true'
+      showUnpublished: 'true',
+      includePast: 'true'
     };
   }
   next();

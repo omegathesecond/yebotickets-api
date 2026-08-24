@@ -63,22 +63,34 @@ export const createEvent = async (eventData: IEventInput, organizerId: string) =
   }
 };
 
+// Default page size when the caller sends no `limit` (matches the previous
+// hardcoded cap so existing callers see no size change). `MAX_LIMIT` bounds
+// any explicitly-requested limit so a client can't force an unbounded scan.
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+
+const toPositiveInt = (value: any, fallback: number): number => {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
 /**
- * Get all events with optional filtering
+ * Get all events with optional filtering and pagination
  * @param query Query parameters for filtering
- * @returns List of events
+ * @returns `{ data, total, page, limit, hasMore }` — `data` is the page of
+ *   events, `total` the full match count across all pages.
  */
 export const getEvents = async (query: Record<string, any> = {}) => {
   try {
     const where: any = {};
-    
+
     // Build filter based on query parameters. City/country use case-insensitive
     // contains so the buyer app's city pills ("Mbabane") and country dropdown
     // ("Eswatini") match regardless of how the value was stored/cased.
     if (query.category) where.category = query.category;
     if (query.city) where.locationCity = { contains: query.city, mode: 'insensitive' };
     if (query.country) where.locationCountry = { contains: query.country, mode: 'insensitive' };
-    
+
     // Date filters
     if (query.startAfter) {
       where.startDate = { gte: new Date(query.startAfter) };
@@ -89,7 +101,18 @@ export const getEvents = async (query: Record<string, any> = {}) => {
         lte: new Date(query.startBefore),
       };
     }
-    
+
+    // Default the listing to upcoming events only: exclude anything whose
+    // endDate has already passed (endDate, not startDate, so a multi-day
+    // event still shows on its final day). Without this, ordering ascending
+    // by startDate surfaces the OLDEST dead events first and they consume the
+    // page budget, pushing genuinely upcoming events off the end of the list.
+    // Organizer/admin surfaces that legitimately need history (e.g. their own
+    // past events) opt out with includePast=true.
+    if (query.includePast !== 'true') {
+      where.endDate = { gte: new Date() };
+    }
+
     // By default, only return published events unless specified
     if (query.showUnpublished !== 'true') {
       where.isPublished = true;
@@ -120,18 +143,32 @@ export const getEvents = async (query: Record<string, any> = {}) => {
       ];
     }
 
-    const events = await prisma.event.findMany({
-      where,
-      include: {
-        organizer: {
-          select: { id: true, name: true, email: true },
-        },
-      },
-      orderBy: { startDate: 'asc' },
-      take: query.limit ? parseInt(query.limit) : 50,
-    });
+    const page = toPositiveInt(query.page, 1);
+    const limit = Math.min(toPositiveInt(query.limit, DEFAULT_LIMIT), MAX_LIMIT);
+    const skip = (page - 1) * limit;
 
-    return events.map(transformEvent);
+    const [events, total] = await prisma.$transaction([
+      prisma.event.findMany({
+        where,
+        include: {
+          organizer: {
+            select: { id: true, name: true, email: true },
+          },
+        },
+        orderBy: { startDate: 'asc' },
+        skip,
+        take: limit,
+      }),
+      prisma.event.count({ where }),
+    ]);
+
+    return {
+      data: events.map(transformEvent),
+      total,
+      page,
+      limit,
+      hasMore: skip + events.length < total,
+    };
   } catch (error) {
     console.error('Error in getEvents service:', error);
     throw new ApiError('Failed to fetch events', 500);
