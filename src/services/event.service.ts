@@ -225,6 +225,39 @@ export const updateEvent = async (
 };
 
 /**
+ * Admin-only unpublish/takedown. Unlike updateEvent, this is NOT scoped to the
+ * calling organizer — a platform admin needs to be able to pull a
+ * fraudulent/abusive listing off sale on ANY event regardless of who owns it.
+ * Route-level authorize(ADMIN) is what gates access; this function does not
+ * re-check role itself.
+ * @param eventId Event ID
+ * @returns Updated event
+ */
+export const adminUnpublishEvent = async (eventId: string) => {
+  try {
+    const existingEvent = await prisma.event.findUnique({ where: { id: eventId } });
+
+    if (!existingEvent) {
+      throw new ApiError('Event not found', 404);
+    }
+
+    const event = await prisma.event.update({
+      where: { id: eventId },
+      data: { isPublished: false },
+      include: {
+        organizer: { select: { id: true, name: true, email: true } },
+      },
+    });
+
+    return transformEvent(event);
+  } catch (error) {
+    console.error('Error in adminUnpublishEvent service:', error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('Failed to unpublish event', 500);
+  }
+};
+
+/**
  * Delete event
  * @param eventId Event ID
  * @param organizerId ID of the organizer deleting the event (for authorization)
