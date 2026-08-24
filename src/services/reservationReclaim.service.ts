@@ -17,7 +17,7 @@ import {
 // This module closes that gap: it runs the reclaim GLOBALLY (no ticketTypeId,
 // so every type is swept) on a periodic timer (~5 min) AND exposes the same
 // sweep for an external driver (Cloud Scheduler -> POST /api/internal/
-// reclaim-reservations). The underlying per-row writes (releaseReservedTicket /
+// reclaim-reservations). The underlying per-row writes (releaseReservedTickets /
 // settleSucceededCharge) are guarded updateMany / status checks, so the sweep
 // is fully idempotent and safe to run concurrently from multiple Cloud Run
 // instances or to retry — no oversell, no double-release, no double-delivery.

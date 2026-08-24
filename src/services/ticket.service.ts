@@ -387,10 +387,10 @@ const PURCHASE_INCLUDE = {
 } as const;
 
 /**
- * Outcome of attempting to deliver an issued ticket to the buyer. `status:
+ * Outcome of attempting to deliver an issued ORDER to the buyer. `status:
  * 'failed'` is returned (never thrown) so the purchase response can surface the
  * failure loudly without pretending the message was sent — the buyer still
- * receives the QR inline in the response.
+ * receives the QR(s) inline in the response.
  */
 export interface TicketDeliveryResult {
   /** The channel that actually delivered (or was attempted last on failure). */
@@ -427,22 +427,38 @@ const formatEventDate = (date: Date): string => {
 };
 
 /**
- * Compose the human-readable ticket message that accompanies the QR image,
- * including event title, date, venue, ticket type and the unique code.
+ * Compose the human-readable message that accompanies the QR image(s) for a
+ * whole ORDER — one or more tickets of the same type, bought together in one
+ * purchase call — including event title, date, venue, ticket type and every
+ * ticket's unique code. A single-ticket order reads exactly like the previous
+ * per-ticket copy; a multi-ticket order lists every code so the buyer gets ONE
+ * message covering the whole group instead of one send per ticket.
  */
-const buildTicketMessage = (ticket: any): string => {
+const buildOrderMessage = (tickets: any[]): string => {
+  const first = tickets[0];
+  const multi = tickets.length > 1;
   const lines = [
-    `🎟️ Your ticket for ${ticket.event?.title ?? 'your event'}`,
+    multi
+      ? `🎟️ Your ${tickets.length} tickets for ${first.event?.title ?? 'your event'}`
+      : `🎟️ Your ticket for ${first.event?.title ?? 'your event'}`,
     '',
-    `📅 ${ticket.event?.startDate ? formatEventDate(ticket.event.startDate) : 'Date to be announced'}`,
-    `📍 ${formatVenue(ticket.event ?? {})}`,
+    `📅 ${first.event?.startDate ? formatEventDate(first.event.startDate) : 'Date to be announced'}`,
+    `📍 ${formatVenue(first.event ?? {})}`,
   ];
-  if (ticket.ticketType?.name) {
-    lines.push(`🎫 ${ticket.ticketType.name}`);
+  if (first.ticketType?.name) {
+    lines.push(`🎫 ${first.ticketType.name}`);
   }
-  lines.push(`🔑 Ticket code: ${ticket.uniqueCode}`);
   lines.push('');
-  lines.push('Show this QR code at the gate for entry.');
+  if (multi) {
+    lines.push('Ticket codes:');
+    tickets.forEach((t) => lines.push(`🔑 ${t.uniqueCode}`));
+  } else {
+    lines.push(`🔑 Ticket code: ${first.uniqueCode}`);
+  }
+  lines.push('');
+  lines.push(
+    multi ? 'Show each QR code at the gate for entry.' : 'Show this QR code at the gate for entry.'
+  );
   return lines.join('\n');
 };
 
@@ -460,37 +476,48 @@ const withQrFields = async <T extends { eventId: string; uniqueCode: string }>(
 });
 
 /**
- * Compose the HTML body for the ticket-delivery email. Carries the same details
- * as the WhatsApp message plus the QR rendered inline (data URI). Email clients
- * that strip data-URI images still show the ticket code in the text, and the
- * scannable QR is always available inline in the purchase API response.
+ * Compose the HTML body for the ticket-delivery email covering the WHOLE
+ * order: the shared order details as text, plus every ticket's QR rendered
+ * inline (data URI) so a multi-ticket order still hands the buyer every
+ * scannable code even over the fallback channel. Email clients that strip
+ * data-URI images still show every ticket code in the text, and every
+ * scannable QR is always available inline in the purchase API response too.
  */
-const buildTicketEmailHtml = (ticket: any, qrDataUrl: string): string => {
-  const details = buildTicketMessage(ticket)
+const buildOrderEmailHtml = async (tickets: any[]): Promise<string> => {
+  const details = buildOrderMessage(tickets)
     .split('\n')
     .map((line) => (line ? `<p style="margin:4px 0">${line}</p>` : ''))
     .join('');
-  return `<div style="font-family:system-ui,Arial,sans-serif;color:#111">${details}` +
-    `<div style="margin-top:16px"><img src="${qrDataUrl}" alt="Ticket QR code" width="220" height="220" /></div>` +
-    `</div>`;
+  const qrImages = await Promise.all(
+    tickets.map((t) => generateTicketQrDataUrl(t.eventId, t.uniqueCode))
+  );
+  const imagesHtml = qrImages
+    .map(
+      (dataUrl) =>
+        `<div style="margin-top:16px"><img src="${dataUrl}" alt="Ticket QR code" width="220" height="220" /></div>`
+    )
+    .join('');
+  return `<div style="font-family:system-ui,Arial,sans-serif;color:#111">${details}${imagesHtml}</div>`;
 };
 
 /**
- * Deliver the issued ticket details + code to the buyer over YeboLink (the
- * canonical Omevision comms gateway). Primary channel is WhatsApp; if that
- * fails (or the buyer has no phone on file) we fall back to email when an
- * address is available. The QR is always returned inline in the purchase
- * response, so a messaging failure never strands the buyer.
+ * Deliver an issued ORDER's ticket details + codes to the buyer over YeboLink
+ * (the canonical Omevision comms gateway) — exactly ONE message for the whole
+ * order, never one send per ticket. Primary channel is WhatsApp; if that fails
+ * (or the buyer has no phone on file) we fall back to email when an address is
+ * available. The QR(s) are always returned inline in the purchase response, so
+ * a messaging failure never strands the buyer.
  *
  * Failures are caught and returned as `status: 'failed'` (never thrown) so the
  * caller can warn the buyer rather than silently pretend delivery worked — a
  * paid purchase is never rolled back over a comms hiccup, but the failure is
  * surfaced, not swallowed.
  */
-const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> => {
-  const phoneNumber = ticket.user?.phoneNumber;
-  const email = ticket.user?.email;
-  const text = buildTicketMessage(ticket);
+const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult> => {
+  const first = tickets[0];
+  const phoneNumber = first.user?.phoneNumber;
+  const email = first.user?.email;
+  const text = buildOrderMessage(tickets);
   const errors: string[] = [];
 
   // Primary channel: WhatsApp via YeboLink.
@@ -499,7 +526,7 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
       await sendTextMessage(phoneNumber, text);
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
-      console.error('Failed to deliver ticket via WhatsApp:', error);
+      console.error('Failed to deliver order via WhatsApp:', error);
       errors.push(`whatsapp: ${errorMessage(error)}`);
     }
   } else {
@@ -509,16 +536,18 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
   // Fallback channel: email via YeboLink (only if the buyer has one on file).
   if (email) {
     try {
-      const qrDataUrl = await generateTicketQrDataUrl(ticket.eventId, ticket.uniqueCode);
+      const html = await buildOrderEmailHtml(tickets);
       await sendEmailMessage(
         email,
-        `Your ticket for ${ticket.event?.title ?? 'your event'}`,
-        buildTicketEmailHtml(ticket, qrDataUrl),
+        tickets.length > 1
+          ? `Your ${tickets.length} tickets for ${first.event?.title ?? 'your event'}`
+          : `Your ticket for ${first.event?.title ?? 'your event'}`,
+        html,
         text
       );
       return { channel: 'email', status: 'sent' };
     } catch (error) {
-      console.error('Failed to deliver ticket via email:', error);
+      console.error('Failed to deliver order via email:', error);
       errors.push(`email: ${errorMessage(error)}`);
     }
   }
@@ -532,44 +561,53 @@ const deliverTicketToBuyer = async (ticket: any): Promise<TicketDeliveryResult> 
 };
 
 /**
- * Atomically claim exactly one available ticket of a type for a buyer, flipping
- * it to the given target `status` (and applying any extra `data`).
+ * Atomically claim up to `quantity` available tickets of a type for a buyer,
+ * flipping each to the given target `status` (and applying any extra `data`) —
+ * reserving ALL of them or NONE (an order is never partially reserved).
  *
- * The race this guards against: two buyers `findFirst` the SAME available row,
- * then both write it by id — the second write silently steals the first buyer's
- * ticket and capacity can be exceeded. The fix folds the availability check INTO
- * the write: a conditional `updateMany` whose WHERE still requires
- * `status: 'available'` AND `userId: null`. The database evaluates that against
- * the live row, so for a given row exactly one concurrent writer matches
- * (`count === 1`) and every other sees `count === 0` — a lock-free
- * compare-and-set, mirroring the gate check-in guard in `confirmCheckIn`.
+ * The per-row race this guards against: two buyers `findFirst` the SAME
+ * available row, then both write it by id — the second write silently steals
+ * the first buyer's ticket and capacity can be exceeded. The fix folds the
+ * availability check INTO the write: a conditional `updateMany` whose WHERE
+ * still requires `status: 'available'` AND `userId: null`. The database
+ * evaluates that against the live row, so for a given row exactly one
+ * concurrent writer matches (`count === 1`) and every other sees `count === 0`
+ * — a lock-free compare-and-set, mirroring the gate check-in guard in
+ * `confirmCheckIn`. A lost race on one row does NOT fail the claim outright:
+ * another row may still be free, so we loop to the next candidate. The loop is
+ * naturally bounded — each lost race means that row is now taken, so the next
+ * `findFirst` (which filters `status: 'available'`) can never return it again;
+ * the visible pool strictly shrinks until we claim enough rows or it runs out.
  *
- * A lost race (`count === 0`) does NOT fail the buyer outright: another row may
- * still be free, so we loop to the next candidate. The loop is naturally
- * bounded — each lost race means that row is now taken, so the next `findFirst`
- * (which filters `status: 'available'`) can never return it again; the visible
- * pool strictly shrinks until we claim a row or it is genuinely empty.
+ * If fewer than `quantity` rows can be claimed, every row we DID claim in this
+ * attempt is released straight back to the pool (never left partially
+ * reserved) and the caller gets `tickets: []` plus how many are genuinely left
+ * (`availableRemaining`) so it can surface a clear 409.
  *
- * Paid tickets claim to `'reserved'` (held while we charge, then finalized to
- * `'sold'` only on a SUCCEEDED charge — see `purchaseTicket`); free tickets
- * claim straight to `'sold'`.
+ * Paid tickets claim to `'reserved'` (held while we charge once for the whole
+ * order, then finalized to `'sold'` only on a SUCCEEDED charge — see
+ * `purchaseTicket`); free tickets claim straight to `'sold'`.
  *
- * @returns the claimed ticket (with PURCHASE_INCLUDE relations), or `null` when
- *   no ticket of this type is available.
+ * @returns `{ tickets }` with exactly `quantity` claimed rows (PURCHASE_INCLUDE
+ *   relations) on success, or `{ tickets: [], availableRemaining }` when the
+ *   pool could not cover the whole order.
  */
-const claimAvailableTicket = async (
+const claimAvailableTickets = async (
   ticketTypeId: string,
   userId: string,
+  quantity: number,
   data: Record<string, unknown>
-) => {
-  for (;;) {
+): Promise<{ tickets: any[]; availableRemaining: number }> => {
+  const claimedIds: string[] = [];
+
+  while (claimedIds.length < quantity) {
     const candidate = await prisma.ticket.findFirst({
       where: { ticketTypeId, status: 'available', userId: null },
       select: { id: true },
     });
 
     if (!candidate) {
-      return null;
+      break; // pool exhausted
     }
 
     // Conditional claim: only flips the row while it is STILL available and
@@ -580,63 +618,88 @@ const claimAvailableTicket = async (
       data: { userId, ...data },
     });
 
-    if (claim.count === 0) {
-      continue; // lost this row; try the next available candidate
+    if (claim.count === 1) {
+      claimedIds.push(candidate.id);
     }
-
-    // We own the row; no other writer can match the guard now, so this read
-    // returns our committed claim with the relations needed for delivery.
-    return prisma.ticket.findUnique({
-      where: { id: candidate.id },
-      include: PURCHASE_INCLUDE,
-    });
+    // else lost this row; the next findFirst can never return it again.
   }
+
+  if (claimedIds.length < quantity) {
+    // Never partially reserve: give back everything this attempt claimed.
+    if (claimedIds.length > 0) {
+      await prisma.ticket.updateMany({
+        where: { id: { in: claimedIds }, userId },
+        data: {
+          userId: null,
+          status: 'available',
+          reservedAt: null,
+          paymentRef: null,
+          paymentStatus: null,
+          amountPaid: null,
+          purchaseDate: null,
+        },
+      });
+    }
+    const availableRemaining = await prisma.ticket.count({
+      where: { ticketTypeId, status: 'available', userId: null },
+    });
+    return { tickets: [], availableRemaining };
+  }
+
+  // We own every row; no other writer can match the guard now, so this read
+  // returns our committed claim with the relations needed for delivery.
+  const tickets = await prisma.ticket.findMany({
+    where: { id: { in: claimedIds } },
+    include: PURCHASE_INCLUDE,
+  });
+  return { tickets, availableRemaining: tickets.length };
 };
 
 /**
- * Finalize a row WE reserved (status 'reserved', owned by `userId`) into a sold
- * ticket once payment SUCCEEDED, persisting the YeboPay charge reference. The
- * guard (`status: 'reserved', userId`) means only the buyer who holds the
- * reservation can finalize it. Returns the sold ticket with relations.
+ * Finalize the rows WE reserved (status 'reserved', owned by `userId`) into
+ * sold tickets once ONE payment for the whole order SUCCEEDED, persisting the
+ * shared YeboPay charge reference on every row. The guard (`status:
+ * 'reserved', userId`) means only the buyer who holds the reservations can
+ * finalize them. Returns the sold tickets with relations.
  */
-const finalizeReservedTicket = async (
-  ticketId: string,
+const finalizeReservedTickets = async (
+  ticketIds: string[],
   userId: string,
-  payment: { paymentRef: string; paymentStatus: string; amountPaid: number }
+  payment: { paymentRef: string; paymentStatus: string; amountPaidPerTicket: number }
 ) => {
   await prisma.ticket.updateMany({
-    where: { id: ticketId, status: 'reserved', userId },
+    where: { id: { in: ticketIds }, status: 'reserved', userId },
     data: {
       status: 'sold',
       purchaseDate: new Date(),
       reservedAt: null, // hold consumed — drop it out of the reclaim sweep
       paymentRef: payment.paymentRef,
       paymentStatus: payment.paymentStatus,
-      amountPaid: payment.amountPaid,
+      amountPaid: payment.amountPaidPerTicket,
     },
   });
 
-  return prisma.ticket.findUnique({
-    where: { id: ticketId },
+  return prisma.ticket.findMany({
+    where: { id: { in: ticketIds } },
     include: PURCHASE_INCLUDE,
   });
 };
 
 /**
- * Release a reservation back to the pool when payment did NOT succeed, so a
- * failed charge never strands inventory. Conditional on the row still being our
- * reservation. Best-effort: a failure here is logged, not thrown, because the
- * caller is already surfacing the payment failure to the buyer.
+ * Release reservations back to the pool when payment did NOT succeed, so a
+ * failed charge never strands inventory. Conditional on each row still being
+ * our reservation. Best-effort: a failure here is logged, not thrown, because
+ * the caller is already surfacing the payment failure to the buyer.
  */
-const releaseReservedTicket = async (ticketId: string, userId: string): Promise<void> => {
+const releaseReservedTickets = async (ticketIds: string[], userId: string): Promise<void> => {
   try {
     await prisma.ticket.updateMany({
-      where: { id: ticketId, status: 'reserved', userId },
+      where: { id: { in: ticketIds }, status: 'reserved', userId },
       data: {
         status: 'available',
         userId: null,
         reservedAt: null,
-        // Clear the payment trail so the freed row is pristine for the next
+        // Clear the payment trail so the freed rows are pristine for the next
         // buyer. Safe because a charge that FAILED is terminal — YeboPay will
         // not later settle it (and an unmatched stray webhook is logged loudly).
         paymentRef: null,
@@ -645,59 +708,92 @@ const releaseReservedTicket = async (ticketId: string, userId: string): Promise<
       },
     });
   } catch (error) {
-    console.error('Failed to release reserved ticket after payment failure:', ticketId, error);
+    console.error('Failed to release reserved tickets after payment failure:', ticketIds, error);
   }
 };
 
 /**
- * Persist a PENDING (async) charge onto the row WE reserved, KEEPING it
- * reserved. Guarded on `status: 'reserved', userId` so only the holder writes
- * it. Records `paymentRef` (the YeboPay charge id) so the later
- * `charge.succeeded` webhook — whose payload carries the charge id but no
- * ticket metadata — can reverse-look-up exactly this row, plus `amountPaid` and
- * `paymentStatus: 'PENDING'`. The hold (`reservedAt`) is left in place so the
- * reclaim sweep still owns it if the charge never confirms.
+ * Release EVERY reserved row sharing a YeboPay charge ref back to the pool —
+ * used by the reclaim sweep, which only has the stale charge ref in hand (not
+ * the full set of ticket ids the original purchase reserved). Same guard and
+ * best-effort semantics as {@link releaseReservedTickets}.
  */
-const markReservationPending = async (
-  ticketId: string,
+const releaseReservedTicketsByPaymentRef = async (
+  paymentRef: string,
+  userId: string
+): Promise<void> => {
+  try {
+    await prisma.ticket.updateMany({
+      where: { paymentRef, status: 'reserved', userId },
+      data: {
+        status: 'available',
+        userId: null,
+        reservedAt: null,
+        paymentRef: null,
+        paymentStatus: null,
+        amountPaid: null,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to release reserved ticket group after payment failure:', paymentRef, error);
+  }
+};
+
+/**
+ * Persist a PENDING (async) charge onto the rows WE reserved, KEEPING them
+ * reserved. Guarded on `status: 'reserved', userId` so only the holder writes
+ * them. Records the SAME `paymentRef` (the YeboPay charge id) on every row so
+ * the later `charge.succeeded` webhook — whose payload carries the charge id
+ * but no ticket metadata — can reverse-look-up the whole order, plus each
+ * row's `amountPaid` (the per-ticket price) and `paymentStatus: 'PENDING'`.
+ * The hold (`reservedAt`) is left in place so the reclaim sweep still owns it
+ * if the charge never confirms.
+ */
+const markReservationsPending = async (
+  ticketIds: string[],
   userId: string,
-  payment: { paymentRef: string; amountPaid: number }
+  payment: { paymentRef: string; amountPaidPerTicket: number }
 ) => {
   await prisma.ticket.updateMany({
-    where: { id: ticketId, status: 'reserved', userId },
+    where: { id: { in: ticketIds }, status: 'reserved', userId },
     data: {
       paymentRef: payment.paymentRef,
       paymentStatus: 'PENDING',
-      amountPaid: payment.amountPaid,
+      amountPaid: payment.amountPaidPerTicket,
     },
   });
-  return prisma.ticket.findUnique({
-    where: { id: ticketId },
+  return prisma.ticket.findMany({
+    where: { id: { in: ticketIds } },
     include: PURCHASE_INCLUDE,
   });
 };
 
 /**
- * Shape the response for a held (payment-pending) purchase. There is NO ticket
- * to deliver yet — no QR — so this deliberately omits the QR fields and carries
- * `pending: true` + a clear buyer-facing message. The controller returns 202
- * Accepted (not 201) so the client knows the seat is held and the ticket will
- * arrive once payment confirms.
+ * Shape the response for a held (payment-pending) ORDER. There is NO ticket to
+ * deliver yet — no QR — so each entry deliberately omits the QR fields and
+ * carries `pending: true` + a clear buyer-facing message. The controller
+ * returns 202 Accepted (not 201) so the client knows the seats are held and
+ * the tickets will arrive once the ONE payment for the whole order confirms.
  */
-const buildPendingResult = (ticket: any, paymentRef: string) => ({
+const buildPendingOrderResult = (tickets: any[], paymentRef: string) => ({
   pending: true as const,
-  id: ticket.id,
-  status: mapTicketStatus('reserved'),
   paymentRef,
   paymentStatus: 'PENDING' as const,
-  amountPaid: ticket.amountPaid ?? null,
-  uniqueCode: ticket.uniqueCode,
-  event: ticket.event ?? null,
-  ticketType: ticket.ticketType
-    ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
-    : null,
-  message:
-    'Payment pending — approve the prompt on your phone. Your ticket will be issued automatically once payment is confirmed.',
+  tickets: tickets.map((ticket) => ({
+    pending: true as const,
+    id: ticket.id,
+    status: mapTicketStatus('reserved'),
+    paymentRef,
+    paymentStatus: 'PENDING' as const,
+    amountPaid: ticket.amountPaid ?? null,
+    uniqueCode: ticket.uniqueCode,
+    event: ticket.event ?? null,
+    ticketType: ticket.ticketType
+      ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
+      : null,
+    message:
+      'Payment pending — approve the prompt on your phone. Your ticket will be issued automatically once payment is confirmed.',
+  })),
 });
 
 // ===========================================================================
@@ -711,74 +807,80 @@ export type WebhookChargeOutcome =
   | { result: 'already_final'; ticketId: string; status: string }
   | { result: 'unmatched' };
 
-/** The single ticket holding a given YeboPay charge ref (1:1 — one charge per ticket). */
-const findTicketByPaymentRef = (paymentRef: string) =>
-  prisma.ticket.findFirst({ where: { paymentRef }, include: PURCHASE_INCLUDE });
+/**
+ * ALL tickets sharing a given YeboPay charge ref. An order shares ONE charge
+ * across every ticket it bought, so this may return several rows — the
+ * settlement functions below finalize/release the WHOLE group together.
+ */
+const findTicketsByPaymentRef = (paymentRef: string) =>
+  prisma.ticket.findMany({ where: { paymentRef }, include: PURCHASE_INCLUDE });
 
 /**
- * Settle a SUCCEEDED charge: finalize the reserved row holding it into a sold
- * ticket and deliver the QR.
+ * Settle a SUCCEEDED charge: finalize EVERY reserved row sharing it into sold
+ * tickets and deliver ONE order message covering all of them.
  *
  * Idempotent (webhooks may be redelivered, and the reclaim poll can race the
  * webhook): the flip is a guarded `updateMany` requiring `status: 'reserved'`,
- * so a row already sold matches 0 rows and the QR is delivered EXACTLY once. An
+ * so rows already sold match 0 rows and the order is delivered EXACTLY once. An
  * unmatched charge is logged loudly (money moved with no ticket to attach) — a
  * reconciliation signal, never a silent swallow.
  */
 export const settleSucceededCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
-  const ticket = await findTicketByPaymentRef(chargeId);
-  if (!ticket) {
-    console.error('YeboPay charge.succeeded matched no ticket — needs reconciliation:', chargeId);
+  const tickets = await findTicketsByPaymentRef(chargeId);
+  if (tickets.length === 0) {
+    console.error('YeboPay charge.succeeded matched no ticket(s) — needs reconciliation:', chargeId);
     return { result: 'unmatched' };
   }
-  if (ticket.status === 'sold') {
-    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+  if (tickets.every((t) => t.status === 'sold')) {
+    return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
   }
-  if (ticket.status !== 'reserved') {
-    // The hold was reclaimed/cancelled before this arrived — do NOT resurrect a
-    // dead row; flag it instead (buyer may have been debited late).
+  if (tickets.some((t) => t.status !== 'reserved')) {
+    // The hold was reclaimed/cancelled before this arrived (or the group is in
+    // a mixed state) — do NOT resurrect a dead row; flag it instead (buyer may
+    // have been debited late).
     console.error(
-      `YeboPay charge.succeeded for ticket ${ticket.id} in '${ticket.status}' (not reserved) — needs reconciliation:`,
-      chargeId
+      `YeboPay charge.succeeded for charge ${chargeId} touching ticket(s) not all 'reserved' — needs reconciliation:`,
+      tickets.map((t) => ({ id: t.id, status: t.status }))
     );
-    return { result: 'already_final', ticketId: ticket.id, status: ticket.status };
+    return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
   }
 
   const claimed = await prisma.ticket.updateMany({
-    where: { id: ticket.id, status: 'reserved', paymentRef: chargeId },
+    where: { paymentRef: chargeId, status: 'reserved' },
     data: { status: 'sold', purchaseDate: new Date(), reservedAt: null, paymentStatus: 'SUCCEEDED' },
   });
   if (claimed.count === 0) {
     // A concurrent webhook/poll finalized first — exactly-once preserved.
-    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+    return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
   }
 
-  const sold = await prisma.ticket.findUnique({ where: { id: ticket.id }, include: PURCHASE_INCLUDE });
-  const delivery = await deliverTicketToBuyer(sold);
-  return { result: 'issued', ticketId: ticket.id, delivery };
+  const sold = await prisma.ticket.findMany({ where: { paymentRef: chargeId }, include: PURCHASE_INCLUDE });
+  const delivery = await deliverOrderToBuyer(sold);
+  return { result: 'issued', ticketId: sold[0].id, delivery };
 };
 
 /**
- * Settle a FAILED charge: release the reserved row holding it back to the pool.
- * Idempotent — a row already released/sold matches no reserved guard (no-op). A
- * FAILED arriving for an already-SOLD ticket is a contradiction we refuse to act
- * on (we never unwind a delivered ticket); it is logged for a human.
+ * Settle a FAILED charge: release EVERY reserved row sharing it back to the
+ * pool. Idempotent — rows already released/sold match no reserved guard
+ * (no-op). A FAILED arriving for an already-SOLD ticket is a contradiction we
+ * refuse to act on (we never unwind a delivered ticket); it is logged for a
+ * human.
  */
 export const settleFailedCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
-  const ticket = await findTicketByPaymentRef(chargeId);
-  if (!ticket) return { result: 'unmatched' };
-  if (ticket.status === 'sold') {
+  const tickets = await findTicketsByPaymentRef(chargeId);
+  if (tickets.length === 0) return { result: 'unmatched' };
+  if (tickets.some((t) => t.status === 'sold')) {
     console.error(
-      `YeboPay charge.failed for an already-SOLD ticket ${ticket.id} — conflict, needs reconciliation:`,
-      chargeId
+      `YeboPay charge.failed for an already-SOLD ticket in charge ${chargeId} — conflict, needs reconciliation:`,
+      tickets.map((t) => t.id)
     );
-    return { result: 'already_final', ticketId: ticket.id, status: 'sold' };
+    return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
   }
-  if (ticket.status !== 'reserved') {
-    return { result: 'already_final', ticketId: ticket.id, status: ticket.status };
+  if (tickets.some((t) => t.status !== 'reserved')) {
+    return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
   }
-  await releaseReservedTicket(ticket.id, ticket.userId!);
-  return { result: 'released', ticketId: ticket.id };
+  await releaseReservedTicketsByPaymentRef(chargeId, tickets[0].userId!);
+  return { result: 'released', ticketId: tickets[0].id };
 };
 
 /**
@@ -863,7 +965,7 @@ export const reclaimExpiredReservations = async (
       // against YeboPay. Reclaim only once it is genuinely abandoned (hard expiry).
       if (!ticket.paymentRef) {
         if (pastHardExpiry) {
-          await releaseReservedTicket(ticket.id, ticket.userId!);
+          await releaseReservedTickets([ticket.id], ticket.userId!);
           summary.released++;
         } else {
           summary.stillPending++;
@@ -876,12 +978,13 @@ export const reclaimExpiredReservations = async (
         const outcome = await settleSucceededCharge(ticket.paymentRef);
         if (outcome.result === 'issued' || outcome.result === 'already_final') summary.finalized++;
       } else if (charge.status === 'FAILED') {
-        await releaseReservedTicket(ticket.id, ticket.userId!);
+        await releaseReservedTicketsByPaymentRef(ticket.paymentRef, ticket.userId!);
         summary.released++;
       } else if (pastHardExpiry) {
         // Still PENDING (or a refund state) long past any real USSD lifetime —
-        // treat as dead and reclaim so the seat isn't stranded forever.
-        await releaseReservedTicket(ticket.id, ticket.userId!);
+        // treat as dead and reclaim so the seat isn't stranded forever (every
+        // row sharing this order's charge ref, not just this one).
+        await releaseReservedTicketsByPaymentRef(ticket.paymentRef, ticket.userId!);
         summary.released++;
       } else {
         summary.stillPending++;
@@ -909,42 +1012,70 @@ const assertPaymentProvided = (payment?: PurchasePaymentInput): PurchasePaymentI
   return payment;
 };
 
+/** Max tickets a single purchase call may buy in one order (mirrors the validator). */
+export const MAX_PURCHASE_QUANTITY = 10;
+
 /**
- * Purchase a ticket — collecting payment via YeboPay BEFORE issuing.
+ * Purchase an ORDER of `quantity` tickets of the same type (default 1) —
+ * collecting payment via YeboPay BEFORE issuing, exactly ONCE for the WHOLE
+ * order. A buyer approves at most one mobile-money prompt no matter how many
+ * tickets they buy, and a partial failure never takes money for tickets it
+ * didn't also issue.
  *
- * Flow for a PRICED ticket (`price > 0`):
- *   1. Atomically RESERVE one available row (race-safe claim → 'reserved').
- *   2. Charge the buyer for `ticketType.price` via YeboPay (`createCharge`).
- *   3. Only on `status === 'SUCCEEDED'` finalize the row to 'sold', persisting
- *      the charge ref/status/amount, then generate + deliver the QR.
- *   4. On FAILED/PENDING (or a transport error) we RELEASE the reservation and
- *      throw loudly — NO ticket is issued (no silent free issue; CLAUDE.md).
- * A FREE ticket (`price <= 0`) skips the charge and claims straight to 'sold'.
+ * Flow for a PRICED ticket type (`price > 0`):
+ *   1. Atomically RESERVE `quantity` available rows, ALL or NONE (race-safe
+ *      batched claim → 'reserved'; see `claimAvailableTickets`). If fewer than
+ *      `quantity` are available, nothing is reserved and this throws 409 with
+ *      how many are actually left.
+ *   2. Charge the buyer ONCE for `quantity * ticketType.price` via YeboPay.
+ *   3. Only on `status === 'SUCCEEDED'` finalize every row to 'sold',
+ *      persisting the SAME charge ref on all of them (amountPaid per row stays
+ *      `ticketType.price`, so existing per-ticket revenue math keeps working),
+ *      then generate + deliver ONE order message covering every ticket.
+ *   4. On FAILED/PENDING (or a transport error) we RELEASE all the reservations
+ *      and throw loudly — NO ticket is issued (no silent free issue;
+ *      CLAUDE.md). There is no fourth partial state: every row in the order
+ *      ends up sold, still-reserved (pending), or released — together.
+ * A FREE ticket type (`price <= 0`) skips the charge and claims straight to
+ * 'sold', same all-or-nothing semantics.
  *
- * The buyer app sends a fresh `idempotencyKey` per ticket, so the per-call
- * charge is retry-safe and a multi-ticket order (the app loops this call) is
- * charged once per ticket — never double-charged, never under-charged.
+ * The buyer app sends a fresh `idempotencyKey` per ORDER (not per ticket), so
+ * the one charge for the whole order is retry-safe — replaying the same key
+ * returns the same charge rather than double-charging.
  *
- * Delivery: generates a QR encoding the canonical { eventId, ticketId:
- * uniqueCode } payload the gate scanner parses and sends it (with event detail)
- * over WhatsApp. A failed delivery does NOT roll back the paid purchase and is
- * NOT swallowed — it is surfaced via `delivery.status: 'failed'`; the buyer
- * still has the QR inline in this response.
+ * Delivery: generates a QR per ticket encoding the canonical { eventId,
+ * ticketId: uniqueCode } payload the gate scanner parses, and sends ONE
+ * WhatsApp/email message covering the whole order (never one send per
+ * ticket). A failed delivery does NOT roll back the paid purchase and is NOT
+ * swallowed — it is surfaced via `delivery.status: 'failed'` on every ticket;
+ * the buyer still has every QR inline in this response.
  *
- * The claim itself is atomic (see `claimAvailableTicket`): concurrent buyers can
- * never be allocated the same Ticket row and the pool can never be oversold.
+ * The claim itself is atomic per row (see `claimAvailableTickets`): concurrent
+ * buyers can never be allocated the same Ticket row and the pool can never be
+ * oversold.
  *
  * @param ticketTypeId Ticket type ID
  * @param userId User ID (also the YeboPay customer reference / yeboid_sub)
  * @param payment How the buyer is paying (required for priced tickets)
- * @returns Purchased ticket with qrCode, qrPayload, payment fields and delivery status
+ * @param quantity How many tickets to buy in this order (default 1, 1..MAX_PURCHASE_QUANTITY)
+ * @returns `{ pending: false, tickets }` (issued, QRs included) or
+ *   `{ pending: true, paymentRef, paymentStatus, tickets }` (held)
  */
 export const purchaseTicket = async (
   ticketTypeId: string,
   userId: string,
-  payment?: PurchasePaymentInput
+  payment?: PurchasePaymentInput,
+  quantity: number = 1
 ) => {
   try {
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_PURCHASE_QUANTITY) {
+      throw new ApiError(
+        `quantity must be a whole number between 1 and ${MAX_PURCHASE_QUANTITY}`,
+        400
+      );
+    }
+    const qty = quantity;
+
     // Find ticket type (with just the event's cancellation flag — needed to
     // reject sales for a cancelled event before any reserve/charge happens).
     const ticketType = await prisma.ticketType.findUnique({
@@ -966,21 +1097,29 @@ export const purchaseTicket = async (
 
     const price = ticketType.price;
 
-    // --- Free tickets: no payment, claim straight to sold. -------------------
+    // --- Free tickets: no payment, claim straight to sold, all-or-nothing. ---
     if (!price || price <= 0) {
-      const freeTicket = await claimAvailableTicket(ticketTypeId, userId, {
-        status: 'sold',
-        purchaseDate: new Date(),
-        paymentStatus: 'FREE',
-        amountPaid: 0,
-      });
-      if (!freeTicket) {
-        throw new ApiError('No tickets available for this ticket type', 400);
+      const { tickets: freeTickets, availableRemaining } = await claimAvailableTickets(
+        ticketTypeId,
+        userId,
+        qty,
+        {
+          status: 'sold',
+          purchaseDate: new Date(),
+          paymentStatus: 'FREE',
+          amountPaid: 0,
+        }
+      );
+      if (freeTickets.length === 0) {
+        throw new ApiError(
+          `Only ${availableRemaining} ticket(s) left for this ticket type — requested ${qty}.`,
+          409
+        );
       }
-      return finishIssuedTicket(freeTicket);
+      return finishIssuedOrder(freeTickets);
     }
 
-    // --- Paid tickets: reserve -> charge -> finalize / hold / release. -------
+    // --- Paid tickets: reserve N -> charge ONCE -> finalize / hold / release. -
     const validPayment = assertPaymentProvided(payment);
 
     // 0. Reclaim any stale holds for this type FIRST so an abandoned async
@@ -990,23 +1129,30 @@ export const purchaseTicket = async (
       console.error('Reservation reclaim sweep failed (continuing):', ticketTypeId, error)
     );
 
-    // 1. Reserve one available row atomically (held, not yet sold). reservedAt
-    //    stamps the hold so the reclaim sweep can later resolve it if the async
-    //    charge never confirms.
-    const reserved = await claimAvailableTicket(ticketTypeId, userId, {
-      status: 'reserved',
-      reservedAt: new Date(),
-    });
-    if (!reserved) {
-      throw new ApiError('No tickets available for this ticket type', 400);
+    // 1. Reserve `qty` available rows atomically, all-or-nothing (held, not yet
+    //    sold). reservedAt stamps each hold so the reclaim sweep can later
+    //    resolve them if the async charge never confirms.
+    const { tickets: reserved, availableRemaining } = await claimAvailableTickets(
+      ticketTypeId,
+      userId,
+      qty,
+      { status: 'reserved', reservedAt: new Date() }
+    );
+    if (reserved.length === 0) {
+      throw new ApiError(
+        `Only ${availableRemaining} ticket(s) left for this ticket type — requested ${qty}.`,
+        409
+      );
     }
+    const reservedIds = reserved.map((t) => t.id);
 
-    // 2. Charge BEFORE issuing. Any transport error releases the reservation
-    //    and surfaces loudly — we never issue a ticket without confirmed money.
+    // 2. Charge BEFORE issuing — ONCE for the whole order. Any transport error
+    //    releases every reservation and surfaces loudly — we never issue a
+    //    ticket without confirmed money.
     let charge;
     try {
       charge = await createCharge({
-        amount: price,
+        amount: price * qty,
         currency: TICKET_CURRENCY,
         yeboidSub: userId,
         paymentMethodId: validPayment.paymentMethodId,
@@ -1014,12 +1160,18 @@ export const purchaseTicket = async (
         providerCode: validPayment.providerCode,
         phone: validPayment.phone,
         cardToken: validPayment.cardToken,
-        description: `${ticketType.name} ticket — ${reserved.event?.title ?? 'event'}`,
-        metadata: { ticketId: reserved.id, ticketTypeId, eventId: reserved.eventId, userId },
+        description: `${qty}x ${ticketType.name} ticket — ${reserved[0].event?.title ?? 'event'}`,
+        metadata: {
+          ticketIds: reservedIds,
+          ticketTypeId,
+          eventId: reserved[0].eventId,
+          userId,
+          quantity: qty,
+        },
         idempotencyKey: validPayment.idempotencyKey || crypto.randomUUID(),
       });
     } catch (error) {
-      await releaseReservedTicket(reserved.id, userId);
+      await releaseReservedTickets(reservedIds, userId);
       if (error instanceof YeboPayHttpError) {
         throw new ApiError(`Payment could not be processed (YeboPay ${error.status}).`, 502);
       }
@@ -1029,39 +1181,41 @@ export const purchaseTicket = async (
     // 3a. PENDING (asynchronous rail — mobile money). The buyer has NOT paid yet
     //     but WILL be debited once they approve the USSD prompt; the money then
     //     settles via a `charge.succeeded` webhook (handled in handleChargeEvent).
-    //     We must KEEP the reservation (releasing it would let the seat resell
-    //     while the buyer is mid-approval, then their settled payment would have
-    //     no ticket — the exact silent failure CLAUDE.md forbids). Persist the
-    //     charge ref so the webhook can find this row, and tell the buyer their
-    //     ticket will be issued on confirmation — NOT a hard failure.
+    //     We must KEEP every reservation (releasing them would let the seats
+    //     resell while the buyer is mid-approval, then their settled payment
+    //     would have no ticket — the exact silent failure CLAUDE.md forbids).
+    //     Persist the SAME charge ref on all rows so the webhook can find the
+    //     whole order, and tell the buyer their tickets will be issued on
+    //     confirmation — NOT a hard failure.
     if (charge.status === 'PENDING') {
-      const held = await markReservationPending(reserved.id, userId, {
+      const held = await markReservationsPending(reservedIds, userId, {
         paymentRef: charge.id,
-        amountPaid: Number.parseFloat(charge.amount),
+        amountPaidPerTicket: price,
       });
-      return buildPendingResult(held ?? reserved, charge.id);
+      return buildPendingOrderResult(held.length ? held : reserved, charge.id);
     }
 
     // 3b. Any non-SUCCEEDED, non-PENDING status (FAILED/REFUNDED/…) is a hard
-    //     failure: release the hold and surface it loudly — no ticket issued.
+    //     failure: release every hold and surface it loudly — no ticket issued.
     if (charge.status !== 'SUCCEEDED') {
-      await releaseReservedTicket(reserved.id, userId);
+      await releaseReservedTickets(reservedIds, userId);
       const reason = charge.failure_reason ? `: ${charge.failure_reason}` : '';
       throw new ApiError(`Payment ${charge.status.toLowerCase()}${reason}. No ticket was issued.`, 402);
     }
 
-    // 4. Payment confirmed synchronously — finalize the reservation into a sold
-    //    ticket and persist the charge reference for reconciliation/refunds.
-    const sold = await finalizeReservedTicket(reserved.id, userId, {
+    // 4. Payment confirmed synchronously — finalize every reservation into a
+    //    sold ticket and persist the shared charge reference for
+    //    reconciliation/refunds.
+    const sold = await finalizeReservedTickets(reservedIds, userId, {
       paymentRef: charge.id,
       paymentStatus: charge.status,
-      amountPaid: Number.parseFloat(charge.amount),
+      amountPaidPerTicket: price,
     });
-    if (!sold) {
-      throw new ApiError('Failed to finalize the purchased ticket', 500);
+    if (sold.length === 0) {
+      throw new ApiError('Failed to finalize the purchased ticket(s)', 500);
     }
 
-    return finishIssuedTicket(sold);
+    return finishIssuedOrder(sold);
   } catch (error) {
     console.error('Error in purchaseTicket service:', error);
     if (error instanceof ApiError) throw error;
@@ -1070,20 +1224,27 @@ export const purchaseTicket = async (
 };
 
 /**
- * Shared tail of a successful issue: deliver the QR over WhatsApp (failures
- * surfaced, not swallowed) and shape the response with the QR + delivery status.
+ * Shared tail of a successful issue: deliver ONE order message over WhatsApp
+ * covering every ticket (failures surfaced, not swallowed) and shape the
+ * response as `{ pending: false, tickets }`, each carrying its own QR plus the
+ * shared delivery outcome.
  */
-const finishIssuedTicket = async (ticket: any) => {
-  const delivery = await deliverTicketToBuyer(ticket);
-  const withQr = await withQrFields(ticket);
-  return {
-    ...withQr,
-    status: mapTicketStatus(ticket.status),
-    ticketType: ticket.ticketType
-      ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
-      : null,
-    delivery,
-  };
+const finishIssuedOrder = async (tickets: any[]) => {
+  const delivery = await deliverOrderToBuyer(tickets);
+  const withQr = await Promise.all(
+    tickets.map(async (ticket) => {
+      const qr = await withQrFields(ticket);
+      return {
+        ...qr,
+        status: mapTicketStatus(ticket.status),
+        ticketType: ticket.ticketType
+          ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
+          : null,
+        delivery,
+      };
+    })
+  );
+  return { pending: false as const, tickets: withQr };
 };
 
 /**
