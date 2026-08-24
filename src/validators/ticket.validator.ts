@@ -160,6 +160,14 @@ export const purchaseTicketValidator = [
     .isString()
     .withMessage('idempotencyKey must be a string'),
 
+  // How many tickets to buy in this order (one order, one payment). Defaults
+  // to 1 in the service; capped at 10 so a single mobile-money charge stays a
+  // reasonable amount and the reservation batch stays bounded.
+  body('quantity')
+    .optional()
+    .isInt({ min: 1, max: 10 })
+    .withMessage('quantity must be an integer between 1 and 10'),
+
   // Mobile-money rails need a phone; if a one-off providerCode is given without
   // a saved paymentMethodId and without a card token, require the phone so we
   // fail fast with a clear 400 instead of a downstream YeboPay error.

@@ -133,8 +133,10 @@ export const purchaseTicketController = async (req: Request, res: Response, next
     const userId = authReq.user.id;
 
     // Payment details forwarded to YeboPay. Optional for free (price 0) tickets;
-    // the service rejects a priced purchase that arrives without them.
-    const { paymentMethodId, providerCode, country, phone, cardToken, idempotencyKey } =
+    // the service rejects a priced purchase that arrives without them. quantity
+    // defaults to 1 — buying N tickets in one order charges YeboPay exactly
+    // once for the whole order (see ticket.service.purchaseTicket).
+    const { paymentMethodId, providerCode, country, phone, cardToken, idempotencyKey, quantity } =
       req.body ?? {};
     const payment: PurchasePaymentInput = {
       paymentMethodId,
@@ -145,16 +147,21 @@ export const purchaseTicketController = async (req: Request, res: Response, next
       idempotencyKey,
     };
 
-    const ticket = await purchaseTicket(ticketTypeId, userId, payment);
+    const order = await purchaseTicket(
+      ticketTypeId,
+      userId,
+      payment,
+      quantity !== undefined ? Number(quantity) : undefined
+    );
 
-    // An asynchronous (mobile-money) charge comes back PENDING: the seat is held
-    // and the ticket will be issued once payment confirms via webhook. Signal
-    // this with 202 Accepted (not 201 Created) so the client shows "pending"
-    // rather than treating a not-yet-issued ticket as bought.
-    const isPending = (ticket as { pending?: boolean }).pending === true;
+    // An asynchronous (mobile-money) charge comes back PENDING: the seats are
+    // held and the tickets will be issued once payment confirms via webhook.
+    // Signal this with 202 Accepted (not 201 Created) so the client shows
+    // "pending" rather than treating a not-yet-issued order as bought.
+    const isPending = (order as { pending?: boolean }).pending === true;
     res.status(isPending ? 202 : 201).json({
       success: true,
-      data: ticket,
+      data: order,
     });
   } catch (error) {
     next(error);

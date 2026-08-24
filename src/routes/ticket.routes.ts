@@ -101,15 +101,16 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  * @swagger
  * /api/tickets/purchase/{ticketTypeId}:
  *   post:
- *     summary: Purchase a single ticket of a type (pays via YeboPay before issuing)
+ *     summary: Purchase an order of 1-10 tickets of a type in ONE payment (pays via YeboPay before issuing)
  *     tags: [Tickets]
  *     description: >
- *       Purchase ONE ticket of the given type. The buyer must be authenticated.
- *       For a priced ticket the API charges the buyer via YeboPay BEFORE issuing —
- *       a free ticket (price 0) needs no payment body. To buy multiple tickets the
- *       client calls this once per ticket with a fresh idempotencyKey each time
- *       (each ticket is charged and issued independently). Discover the available
- *       payment instruments via GET /api/tickets/payment-options.
+ *       Purchase `quantity` tickets (default 1, max 10) of the given type in a
+ *       single order. The buyer must be authenticated. For a priced ticket the
+ *       API reserves all `quantity` seats atomically (all-or-nothing) and
+ *       charges the buyer via YeboPay ONCE for the whole order BEFORE issuing —
+ *       a free ticket (price 0) needs no payment body. A buyer approves at most
+ *       one mobile-money prompt no matter how many tickets they buy. Discover
+ *       the available payment instruments via GET /api/tickets/payment-options.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -148,23 +149,30 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  *                 description: A tokenized card, when paying by card.
  *               idempotencyKey:
  *                 type: string
- *                 description: Fresh per call so a retry never double-charges; auto-generated if omitted.
+ *                 description: Fresh per order (not per ticket) so a retry never double-charges; auto-generated if omitted.
+ *               quantity:
+ *                 type: integer
+ *                 minimum: 1
+ *                 maximum: 10
+ *                 default: 1
+ *                 description: How many tickets of this type to buy in one order (one charge for all of them).
  *     responses:
  *       201:
  *         description: >
- *           Synchronous payment SUCCEEDED — ticket issued with its scanner-ready
- *           QR, unique code, amountPaid and delivery status.
+ *           Synchronous payment SUCCEEDED — all `quantity` tickets issued, each
+ *           with its scanner-ready QR, unique code, amountPaid and (shared)
+ *           delivery status.
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/PurchaseTicketResponse'
  *       202:
  *         description: >
- *           Asynchronous charge (mobile money) is PENDING — the seat is held
- *           (status 'reserved') and the ticket is issued automatically once
- *           YeboPay confirms via webhook. No QR yet.
+ *           Asynchronous charge (mobile money) is PENDING — all `quantity` seats
+ *           are held (status 'reserved') and the tickets are issued
+ *           automatically once YeboPay confirms via webhook. No QR yet.
  *       400:
- *         description: Invalid request, missing payment for a priced ticket, or insufficient tickets available
+ *         description: Invalid request or missing payment for a priced ticket
  *         content:
  *           application/json:
  *             schema:
@@ -177,6 +185,12 @@ router.get('/payment-options', protect, getPaymentOptionsController);
  *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: Ticket type not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Not enough tickets available to cover the requested quantity (none reserved)
  *         content:
  *           application/json:
  *             schema:
