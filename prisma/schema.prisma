@@ -28,6 +28,17 @@ enum TicketTypeEnum {
   group
 }
 
+enum PayoutMethod {
+  bank_transfer
+  mobile_money
+}
+
+enum PayoutRequestStatus {
+  pending
+  paid
+  rejected
+}
+
 model User {
   id          String   @id @default(uuid())
   name        String
@@ -75,16 +86,52 @@ model User {
   addressState     String?
   addressZipCode   String?
   addressCountry   String?
-  
+
+  // Payout method (how the organizer wants to receive withdrawals). All
+  // nullable/optional — an organizer only fills these in once they intend to
+  // request a payout; validated at the service layer against `payoutMethod`.
+  payoutMethod             PayoutMethod?
+  payoutBankName           String?
+  payoutBankAccountName    String?
+  payoutBankAccountNumber  String?
+  payoutBankBranch         String?
+  payoutMobileProvider     String?
+  payoutMobileNumber       String?
+
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
-  
+
   // Relations
   events      Event[]
   tickets     Ticket[]
-  
+  payoutRequests PayoutRequest[]
+
   @@index([phoneNumber])
   @@index([email])
+}
+
+model PayoutRequest {
+  id            String               @id @default(uuid())
+
+  organizerId   String
+  organizer     User                 @relation(fields: [organizerId], references: [id])
+
+  // Snapshot of what was requested; the source of truth for "available
+  // balance" stays the real ticket-sales earnings calculation (see
+  // organizer-event.service.ts getOrganizerEarnings) minus PENDING/PAID
+  // requests — this row never itself becomes the money figure elsewhere.
+  amount        Float
+  status        PayoutRequestStatus  @default(pending)
+
+  requestedAt   DateTime             @default(now())
+  processedAt   DateTime?
+  adminNote     String?
+
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  @@index([organizerId])
+  @@index([status])
 }
 
 model Event {
