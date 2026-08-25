@@ -34,12 +34,16 @@ export const createEventController = async (req: Request, res: Response, next: N
 
 export const getEventsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const events = await getEvents(req.query);
-    
+    const { data, total, page, limit, hasMore } = await getEvents(req.query);
+
     res.status(200).json({
       success: true,
-      count: events.length,
-      data: events,
+      count: data.length,
+      data,
+      total,
+      page,
+      limit,
+      hasMore,
     });
   } catch (error) {
     next(error);
