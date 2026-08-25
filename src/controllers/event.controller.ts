@@ -32,9 +32,20 @@ export const createEventController = async (req: Request, res: Response, next: N
   }
 };
 
+/**
+ * GET /api/events is public (no `protect`/`authorize` middleware) — so it must
+ * never trust showUnpublished/showCancelled from the caller, or an anonymous
+ * request could enumerate draft/unpublished events (e.g. combined with
+ * `organizer` to list a specific organizer's unpublished events). Strip both
+ * before calling getEvents() so its isPublished:true/isCancelled:false
+ * defaults always apply here. Authenticated organizer/admin access to their
+ * own unpublished events goes through getOrganizerDashboardController, which
+ * calls getEvents() directly server-side and is unaffected by this.
+ */
 export const getEventsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { data, total, page, limit, hasMore } = await getEvents(req.query);
+    const { showUnpublished, showCancelled, ...publicQuery } = req.query;
+    const { data, total, page, limit, hasMore } = await getEvents(publicQuery);
 
     res.status(200).json({
       success: true,
