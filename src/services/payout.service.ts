@@ -1,25 +1,32 @@
 import prisma from '../config/prisma';
 import { ApiError } from '../middleware/error.middleware';
-import { getOrganizerEarnings } from './organizer-event.service';
+import { CURRENCY, getPlatformFeePercent } from '../config/platform';
+import {
+  getOrganizerStatement,
+  splitPayoutFee,
+  RESERVED_PAYOUT_STATUSES,
+  OrganizerStatement,
+} from './settlement.service';
 
 /**
- * Organizer payout method + withdrawal-request flow.
+ * Organizer payout destination + withdrawal workflow.
  *
- * YeboTickets has no outbound disbursement integration (YeboPay is
- * inbound/collection only per platform convention) — this is a manual
- * request+admin-approval flow, mirroring how account-deletion is handled via a
- * support handoff. An organizer sets how they want to be paid, requests a
- * withdrawal against their real available balance, and an admin marks the
- * request PAID (after wiring the money manually) or REJECTED.
+ * Ticket money is charged into the PLATFORM's YeboPay merchant account and
+ * YeboPay does not yet expose a payouts rail, so disbursement is a manual
+ * transfer an admin performs out of band. This module models the workflow
+ * around that transfer; {@link markPayoutRequestPaid} is the SINGLE seam where
+ * the money is declared to have moved. When YeboPay ships /v1/payouts, that one
+ * function calls it and records the returned reference — nothing else here
+ * changes.
  *
- * The one invariant that matters: "available balance" is ALWAYS
- * totalEarnings (derived from real sold tickets, see
- * organizer-event.service.ts getOrganizerEarnings) minus any PENDING or PAID
- * payout requests — never a stored/mocked figure — so an organizer can never
- * request the same earnings twice.
+ * Lifecycle: pending (requested) -> approved -> paid, with pending|approved ->
+ * rejected as the exit. `paid` and `rejected` are terminal.
+ *
+ * The invariant that matters: what an organizer may withdraw is ALWAYS
+ * recomputed by settlement.service.ts from real ticket rows minus fees, payouts
+ * and open requests — never a stored balance — so the same earnings can never
+ * be withdrawn twice.
  */
-
-const RESERVED_STATUSES: Array<'pending' | 'paid'> = ['pending', 'paid'];
 
 const PAYOUT_METHOD_SELECT = {
   payoutMethod: true,
@@ -31,29 +38,13 @@ const PAYOUT_METHOD_SELECT = {
   payoutMobileNumber: true,
 } as const;
 
-/** Sum of the organizer's PENDING + PAID payout requests — money already
- *  spoken for, whether or not it has actually moved yet. */
-const getReservedAmount = async (organizerId: string): Promise<number> => {
-  const reserved = await prisma.payoutRequest.aggregate({
-    where: { organizerId, status: { in: RESERVED_STATUSES } },
-    _sum: { amount: true },
-  });
-  return reserved._sum?.amount || 0;
-};
+/** Postgres unique-violation. Raised by the partial unique index that allows at
+ *  most one open payout request per organizer (see the settlement migration). */
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
 
-/**
- * Real available balance for the organizer: total earnings from sold tickets
- * minus whatever has already been requested-or-paid out.
- */
-export const getAvailableBalance = async (organizerId: string) => {
-  const { totalEarnings } = await getOrganizerEarnings({ id: organizerId, role: 'organizer' });
-  const reservedAmount = await getReservedAmount(organizerId);
-  return {
-    totalEarnings,
-    reservedAmount,
-    availableBalance: Math.max(0, totalEarnings - reservedAmount),
-  };
-};
+/** The organizer's balance + per-event statement. */
+export const getOrganizerBalance = async (organizerId: string): Promise<OrganizerStatement> =>
+  getOrganizerStatement(organizerId);
 
 export const getPayoutMethod = async (organizerId: string) => {
   const user = await prisma.user.findUnique({
@@ -77,9 +68,9 @@ export interface PayoutMethodInput {
 }
 
 /**
- * Update the organizer's payout method. Requires the fields the chosen method
- * actually needs to pay them, so an admin fulfilling a request always has
- * somewhere real to send the money.
+ * Update the organizer's payout destination. Requires whatever the chosen
+ * method actually needs to pay them, so an admin fulfilling a request always
+ * has somewhere real to send the money.
  */
 export const updatePayoutMethod = async (organizerId: string, input: PayoutMethodInput) => {
   const {
@@ -118,10 +109,29 @@ export const updatePayoutMethod = async (organizerId: string, input: PayoutMetho
   });
 };
 
+/** Freeze where the money is going, so editing the profile later cannot
+ *  redirect a request an admin is already fulfilling. */
+const destinationSnapshot = (method: Awaited<ReturnType<typeof getPayoutMethod>>) =>
+  method.payoutMethod === 'bank_transfer'
+    ? {
+        destinationMethod: method.payoutMethod,
+        destinationAccountName: method.payoutBankAccountName,
+        destinationAccountNumber: method.payoutBankAccountNumber,
+        destinationBankName: method.payoutBankName,
+        destinationDetail: method.payoutBankBranch,
+      }
+    : {
+        destinationMethod: method.payoutMethod,
+        destinationAccountName: method.payoutBankAccountName,
+        destinationAccountNumber: method.payoutMobileNumber,
+        destinationBankName: null,
+        destinationDetail: method.payoutMobileProvider,
+      };
+
 /**
- * Create a withdrawal request. Rejects up front if the organizer has not set
- * a payout method (nowhere to send the money) or if the requested amount
- * exceeds their real available balance.
+ * Create a withdrawal request for a NET amount, validated against the real
+ * available balance. Rejects when there is nowhere to send the money, when a
+ * request is already open, or when the amount exceeds what is withdrawable.
  */
 export const createPayoutRequest = async (organizerId: string, amount: number) => {
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -133,31 +143,62 @@ export const createPayoutRequest = async (organizerId: string, amount: number) =
     throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
   }
 
-  const { availableBalance } = await getAvailableBalance(organizerId);
-  if (amount > availableBalance) {
+  // One open request at a time: an organizer with two open requests could
+  // request the same balance twice before either is settled.
+  const open = await prisma.payoutRequest.findFirst({
+    where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
+    select: { id: true, status: true },
+  });
+  if (open) {
     throw new ApiError(
-      `Amount exceeds your available balance of ${availableBalance.toFixed(2)}`,
+      'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
+      409
+    );
+  }
+
+  const statement = await getOrganizerStatement(organizerId);
+  if (amount > statement.availableBalance) {
+    throw new ApiError(
+      `Amount exceeds your available balance of ${statement.currency} ${statement.availableBalance.toFixed(2)}`,
       400
     );
   }
 
-  return prisma.payoutRequest.create({
-    data: { organizerId, amount, status: 'pending' },
-  });
+  try {
+    return await prisma.payoutRequest.create({
+      data: {
+        organizerId,
+        ...splitPayoutFee(amount, statement.feePercent),
+        currency: statement.currency,
+        status: 'pending',
+        ...destinationSnapshot(method),
+      },
+    });
+  } catch (error: any) {
+    // Lost the race against a concurrent request: the partial unique index
+    // rejected the second insert. Surface the same conflict the check above
+    // would have produced rather than a raw 500.
+    if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+      throw new ApiError(
+        'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
+        409
+      );
+    }
+    throw error;
+  }
 };
 
-export const getOrganizerPayoutRequests = async (organizerId: string) => {
-  return prisma.payoutRequest.findMany({
+export const getOrganizerPayoutRequests = async (organizerId: string) =>
+  prisma.payoutRequest.findMany({
     where: { organizerId },
     orderBy: { requestedAt: 'desc' },
   });
-};
 
-const VALID_STATUS_FILTERS = ['pending', 'paid', 'rejected'];
+const VALID_STATUS_FILTERS = ['pending', 'approved', 'paid', 'rejected'];
 
-/** Admin: list payout requests across all organizers, optionally filtered by
- *  status. Route-level `authorize(ADMIN)` is what gates access; this function
- *  does not re-check the role (mirrors event.service.ts's convention). */
+/** Admin: payout requests across all organizers, optionally filtered by status.
+ *  Route-level `authorize(ADMIN)` is what gates access; this function does not
+ *  re-check the role (mirrors event.service.ts's convention). */
 export const listPayoutRequests = async (status?: string) => {
   if (status && !VALID_STATUS_FILTERS.includes(status)) {
     throw new ApiError('Invalid status filter', 400);
@@ -181,27 +222,97 @@ export const listPayoutRequests = async (status?: string) => {
   });
 };
 
-/** Admin: mark a PENDING payout request PAID or REJECTED, with an optional
- *  note. Route-level `authorize(ADMIN)` gates access. */
-export const updatePayoutRequestStatus = async (
-  id: string,
-  status: 'paid' | 'rejected',
-  adminNote?: string
-) => {
-  if (status !== 'paid' && status !== 'rejected') {
-    throw new ApiError('Status must be paid or rejected', 400);
-  }
-
+/** Load a request for an admin transition, asserting the transition is legal. */
+const loadForTransition = async (id: string, allowedFrom: string[]) => {
   const existing = await prisma.payoutRequest.findUnique({ where: { id } });
   if (!existing) {
     throw new ApiError('Payout request not found', 404);
   }
-  if (existing.status !== 'pending') {
-    throw new ApiError('Only pending payout requests can be updated', 400);
+  if (!allowedFrom.includes(existing.status)) {
+    throw new ApiError(
+      `A ${existing.status} payout request cannot be changed from here (expected: ${allowedFrom.join(' or ')})`,
+      400
+    );
   }
+  return existing;
+};
 
+/** Admin: approve a requested payout — cleared to pay, money has NOT moved yet.
+ *  Stays reserved against the balance, so approving changes nothing the
+ *  organizer can withdraw. */
+export const approvePayoutRequest = async (id: string, adminNote?: string) => {
+  await loadForTransition(id, ['pending']);
+  const now = new Date();
   return prisma.payoutRequest.update({
     where: { id },
-    data: { status, adminNote, processedAt: new Date() },
+    data: { status: 'approved', approvedAt: now, processedAt: now, adminNote },
   });
 };
+
+/** Admin: reject a payout request, releasing its amount back to the
+ *  organizer's available balance. Allowed while approved too — nothing has
+ *  moved until it is marked paid. */
+export const rejectPayoutRequest = async (id: string, adminNote?: string) => {
+  await loadForTransition(id, ['pending', 'approved']);
+  return prisma.payoutRequest.update({
+    where: { id },
+    data: { status: 'rejected', processedAt: new Date(), adminNote },
+  });
+};
+
+/**
+ * Admin: record that an APPROVED payout has actually been transferred.
+ *
+ * This is the seam the YeboPay payouts rail drops into: today the transfer
+ * happens out of band and the admin supplies its reference, tomorrow this
+ * function calls /v1/payouts and records the reference it returns. Either way
+ * `reference` is mandatory — an untraceable settled payout cannot be
+ * reconciled against the platform's own account.
+ */
+export const markPayoutRequestPaid = async (
+  id: string,
+  reference: string,
+  adminNote?: string
+) => {
+  if (!reference || !reference.trim()) {
+    throw new ApiError('An external transfer reference is required to mark a payout paid', 400);
+  }
+  await loadForTransition(id, ['approved']);
+  const now = new Date();
+  return prisma.payoutRequest.update({
+    where: { id },
+    data: {
+      status: 'paid',
+      paidAt: now,
+      processedAt: now,
+      reference: reference.trim(),
+      adminNote,
+    },
+  });
+};
+
+export interface PayoutStatusUpdate {
+  adminNote?: string;
+  reference?: string;
+}
+
+/** Admin: single entry point behind PATCH /organizers/admin/payout-requests/:id. */
+export const updatePayoutRequestStatus = async (
+  id: string,
+  status: 'approved' | 'paid' | 'rejected',
+  { adminNote, reference }: PayoutStatusUpdate = {}
+) => {
+  switch (status) {
+    case 'approved':
+      return approvePayoutRequest(id, adminNote);
+    case 'rejected':
+      return rejectPayoutRequest(id, adminNote);
+    case 'paid':
+      return markPayoutRequestPaid(id, reference ?? '', adminNote);
+    default:
+      throw new ApiError('Status must be approved, paid or rejected', 400);
+  }
+};
+
+/** Re-exported so callers have one import for "the platform's money settings". */
+export { CURRENCY, getPlatformFeePercent };

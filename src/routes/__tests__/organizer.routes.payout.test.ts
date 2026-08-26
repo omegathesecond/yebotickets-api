@@ -73,7 +73,9 @@ describe('GET /organizers/admin/payout-requests — admin-only', () => {
 });
 
 describe('PATCH /organizers/admin/payout-requests/:id — admin-only', () => {
-  const body = JSON.stringify({ status: 'paid' });
+  // `approved` needs no external reference, so this body exercises authz
+  // without tripping the paid-requires-reference rule.
+  const body = JSON.stringify({ status: 'approved' });
   const headers = { 'content-type': 'application/json' };
 
   it('rejects a non-admin organizer with 403', async () => {
@@ -93,6 +95,28 @@ describe('PATCH /organizers/admin/payout-requests/:id — admin-only', () => {
       body,
     });
     expect(res.status).toBe(404);
+  });
+
+  it('rejects marking a payout paid with no transfer reference (400 at validation)', async () => {
+    prismaMock.payoutRequest.findUnique.mockResolvedValue(null as any);
+    const res = await fetch(`${baseUrl}/organizers/admin/payout-requests/pr-1`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body: JSON.stringify({ status: 'paid' }),
+    });
+    // 400, not 404: the request never reaches the handler that would look the
+    // row up, so an untraceable settlement can't be recorded even by mistake.
+    expect(res.status).toBe(400);
+    expect(prismaMock.payoutRequest.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown status at validation', async () => {
+    const res = await fetch(`${baseUrl}/organizers/admin/payout-requests/pr-1`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body: JSON.stringify({ status: 'settled' }),
+    });
+    expect(res.status).toBe(400);
   });
 });
 

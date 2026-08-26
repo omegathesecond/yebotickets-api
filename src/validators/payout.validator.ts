@@ -22,8 +22,17 @@ export const createPayoutRequestValidator = [
 
 export const payoutRequestStatusValidator = [
   body('status')
-    .isIn(['paid', 'rejected'])
-    .withMessage('status must be paid or rejected'),
+    .isIn(['approved', 'paid', 'rejected'])
+    .withMessage('status must be approved, paid or rejected'),
 
   body('adminNote').optional().isString().withMessage('adminNote must be a string'),
+
+  // External transfer reference. Mandatory when settling a payout — the service
+  // enforces it too, so it can never be bypassed by a caller that skips
+  // validation, but rejecting it here gives a clearer field-level error.
+  body('reference')
+    .if(body('status').equals('paid'))
+    .trim()
+    .notEmpty()
+    .withMessage('reference is required when marking a payout paid'),
 ];

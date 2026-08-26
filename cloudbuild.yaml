@@ -44,8 +44,13 @@ steps:
       # Which YeboPay gateway to talk to. The host is yebopay.APP —
       # api.yebopay.com is an unrelated third-party site, so this must never be
       # left to drift. Dev overrides it to https://dev-api.yebopay.app.
+      #
+      # PLATFORM_FEE_PERCENT is the platform's commission on ticket sales, read
+      # by the organizer settlement calculation. Defaults to 0 (organizers are
+      # owed 100% of gross) until the business sets a rate; change it via the
+      # trigger substitution, never by hand, so a redeploy cannot reset it.
       - '--update-env-vars'
-      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL}'
+      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
@@ -71,6 +76,11 @@ substitutions:
   _YEBOPAY_API_KEY_SECRET: 'YEBOTICKETS__YEBOPAY_API_KEY'
   _YEBOPAY_WEBHOOK_SECRET_SECRET: 'YEBOTICKETS__YEBOPAY_WEBHOOK_SECRET'
   _YEBOPAY_BASE_URL: 'https://api.yebopay.app'
+  # Platform commission on ticket sales, as a percentage of gross. 0 = the
+  # platform takes nothing, which is today's behaviour. Must be >= 0 and < 100;
+  # a non-numeric value makes the API fail loudly rather than quietly settle at
+  # 0% and give away the platform's revenue.
+  _PLATFORM_FEE_PERCENT: '0'
 
 options:
   logging: CLOUD_LOGGING_ONLY
