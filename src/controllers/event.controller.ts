@@ -32,9 +32,29 @@ export const createEventController = async (req: Request, res: Response, next: N
   }
 };
 
+/**
+ * This controller is shared by two routes:
+ *  - GET /api/events — fully public, no `protect`/`authorize` middleware.
+ *  - GET /api/organizers/events — behind protect+authorize(ORGANIZER, ADMIN);
+ *    its wrapper middleware sets showUnpublished/organizer server-side so
+ *    organizers/staff (including the scanner app) can see their own drafts.
+ * Only strip showUnpublished/showCancelled when req.user is absent, i.e. the
+ * request came in through the unauthenticated public route — otherwise an
+ * anonymous caller could enumerate draft/unpublished events (e.g. combined
+ * with `organizer` to list a specific organizer's unpublished events) via
+ * GET /api/events?showUnpublished=true. Authenticated requests keep whatever
+ * query getEvents() was already handed.
+ */
 export const getEventsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { data, total, page, limit, hasMore } = await getEvents(req.query);
+    const authReq = req as AuthenticatedRequest;
+    const query = authReq.user
+      ? req.query
+      : (() => {
+          const { showUnpublished, showCancelled, ...publicQuery } = req.query;
+          return publicQuery;
+        })();
+    const { data, total, page, limit, hasMore } = await getEvents(query);
 
     res.status(200).json({
       success: true,
