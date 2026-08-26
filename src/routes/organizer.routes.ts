@@ -93,6 +93,20 @@ import {
   organizerStatusValidator,
   changePasswordValidator
 } from '../validators/organizer.validator';
+import {
+  getPayoutMethodController,
+  updatePayoutMethodController,
+  getPayoutBalanceController,
+  createPayoutRequestController,
+  getPayoutRequestsController,
+  listPayoutRequestsController,
+  updatePayoutRequestController
+} from '../controllers/payout.controller';
+import {
+  payoutMethodValidator,
+  createPayoutRequestValidator,
+  payoutRequestStatusValidator
+} from '../validators/payout.validator';
 
 const router = express.Router();
 
@@ -237,6 +251,78 @@ router.put('/:id/status', authorize(UserRole.ADMIN), validate(organizerStatusVal
  */
 router.delete('/:id', authorize(UserRole.ADMIN), deleteOrganizerController);
 
+/**
+ * @swagger
+ * /organizers/admin/payout-requests:
+ *   get:
+ *     summary: List all organizer payout requests (Admin only)
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [pending, approved, paid, rejected]
+ *         description: Filter by status
+ *     responses:
+ *       200:
+ *         description: List of payout requests
+ *       403:
+ *         description: Admin access required
+ */
+router.get('/admin/payout-requests', authorize(UserRole.ADMIN), listPayoutRequestsController);
+
+/**
+ * @swagger
+ * /organizers/admin/payout-requests/{id}:
+ *   patch:
+ *     summary: Approve, reject or mark paid a payout request (Admin only)
+ *     description: >
+ *       Lifecycle: pending -> approved -> paid, with pending|approved ->
+ *       rejected as the exit. Marking a request paid REQUIRES `reference` (the
+ *       external bank/mobile-money transfer reference) so every settled payout
+ *       is traceable.
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [approved, paid, rejected]
+ *               adminNote:
+ *                 type: string
+ *               reference:
+ *                 type: string
+ *                 description: External transfer reference. Required when status is paid.
+ *     responses:
+ *       200:
+ *         description: Payout request updated
+ *       403:
+ *         description: Admin access required
+ */
+router.patch(
+  '/admin/payout-requests/:id',
+  authorize(UserRole.ADMIN),
+  validate(payoutRequestStatusValidator),
+  updatePayoutRequestController
+);
+
 // Routes accessible by both admin and organizer
 router.use(authorize(UserRole.ORGANIZER, UserRole.ADMIN));
 
@@ -298,6 +384,116 @@ router.put('/profile', validate(organizerProfileValidator), updateOrganizerProfi
  *         description: Current password is incorrect
  */
 router.post('/change-password', validate(changePasswordValidator), changePasswordController);
+
+/**
+ * @swagger
+ * /organizers/payout-method:
+ *   get:
+ *     summary: Get the logged-in organizer's payout method
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Payout method details
+ *   put:
+ *     summary: Update the logged-in organizer's payout method
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               payoutMethod:
+ *                 type: string
+ *                 enum: [bank_transfer, mobile_money]
+ *               payoutBankName:
+ *                 type: string
+ *               payoutBankAccountName:
+ *                 type: string
+ *               payoutBankAccountNumber:
+ *                 type: string
+ *               payoutBankBranch:
+ *                 type: string
+ *               payoutMobileProvider:
+ *                 type: string
+ *               payoutMobileNumber:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Payout method updated
+ */
+router.get('/payout-method', getPayoutMethodController);
+router.put('/payout-method', validate(payoutMethodValidator), updatePayoutMethodController);
+
+/**
+ * @swagger
+ * /organizers/payout-balance:
+ *   get:
+ *     summary: Get the logged-in organizer's settlement statement
+ *     description: >
+ *       The single source of truth for what the organizer is owed, recomputed
+ *       from real ticket rows on every call: grossSales (what was charged for
+ *       sold tickets) less refundedSales, less pendingSales held back for
+ *       events that have not finished, less the platform fee, less amounts
+ *       already paidOut or reserved by an open request — leaving
+ *       availableBalance. `events` carries the per-event breakdown with the
+ *       hold reason for anything not yet withdrawable.
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Settlement statement
+ */
+router.get('/payout-balance', getPayoutBalanceController);
+
+/**
+ * @swagger
+ * /organizers/payout-requests:
+ *   post:
+ *     summary: Request a payout/withdrawal
+ *     description: >
+ *       Amount is NET (the platform fee is already deducted from
+ *       availableBalance). Rejected with 409 if a request is already open, and
+ *       with 400 if the amount exceeds the available balance or no payout
+ *       method is on file.
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - amount
+ *             properties:
+ *               amount:
+ *                 type: number
+ *     responses:
+ *       201:
+ *         description: Payout request created
+ *       400:
+ *         description: Amount exceeds available balance, or no payout method on file
+ *       409:
+ *         description: A payout request is already awaiting processing
+ *   get:
+ *     summary: Get the logged-in organizer's payout request history
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of the organizer's payout requests
+ */
+router.post('/payout-requests', validate(createPayoutRequestValidator), createPayoutRequestController);
+router.get('/payout-requests', getPayoutRequestsController);
 
 /**
  * @swagger

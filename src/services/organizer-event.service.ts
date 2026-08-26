@@ -1,6 +1,8 @@
 import prisma from '../config/prisma';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
+import { CURRENCY } from '../config/platform';
+import { ticketRevenue } from './settlement.service';
 
 /**
  * Organizer-dashboard read models.
@@ -19,10 +21,6 @@ import { UserRole } from '../interfaces/user.interface';
  *     stats; an admin may read any. {@link assertEventAccess} is the single
  *     choke point for that rule.
  */
-
-/** Currency tickets are priced/charged in (Eswatini lilangeni), matching the
- *  buyer flow in ticket.service.ts and the SZL labels the dashboard renders. */
-const CURRENCY = 'SZL';
 
 interface Requester {
   id: string;
@@ -131,9 +129,14 @@ export const getOrganizerEvents = async (
 };
 
 /**
- * Total + per-event earnings for the logged-in organizer (GET /api/events/earnings).
- * Earnings are the sum of `ticketType.price` over the organizer's SOLD tickets,
- * grouped by event.
+ * Total + per-event GROSS SALES for the logged-in organizer
+ * (GET /api/events/earnings) — the sum of what was actually charged
+ * ({@link ticketRevenue}) over their SOLD tickets, grouped by event.
+ *
+ * This is a sales figure, NOT a withdrawable one: it ignores the platform fee,
+ * the not-yet-finished-event hold-back and money already paid out. What an
+ * organizer may actually withdraw comes from settlement.service.ts — the two
+ * must never be confused, which is why the dashboard labels this "gross sales".
  */
 export const getOrganizerEarnings = async (requester: Requester) => {
   const events = await prisma.event.findMany({
@@ -148,11 +151,10 @@ export const getOrganizerEarnings = async (requester: Requester) => {
   if (eventIds.length > 0) {
     const soldTickets = await prisma.ticket.findMany({
       where: { eventId: { in: eventIds }, status: 'sold' },
-      select: { eventId: true, ticketType: { select: { price: true } } },
+      select: { eventId: true, amountPaid: true, ticketType: { select: { price: true } } },
     });
     for (const t of soldTickets) {
-      const price = t.ticketType?.price || 0;
-      earningsByEvent.set(t.eventId, (earningsByEvent.get(t.eventId) || 0) + price);
+      earningsByEvent.set(t.eventId, (earningsByEvent.get(t.eventId) || 0) + ticketRevenue(t));
     }
   }
 
@@ -223,13 +225,6 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
     },
   };
 };
-
-/** Money a single sold ticket actually brought in: what YeboPay charged
- *  (`amountPaid`) when present, else the ticket type's list price. Mirrors the
- *  per-purchase amount in {@link getEventPurchases} so every revenue figure on
- *  the dashboard is derived the same way. */
-const ticketRevenue = (t: { amountPaid?: number | null; ticketType?: { price: number } | null }) =>
-  t.amountPaid ?? t.ticketType?.price ?? 0;
 
 /**
  * Headline KPIs for the organizer dashboard landing page
