@@ -1,13 +1,9 @@
 -- Organizer settlement + payouts.
 --
 -- Purely ADDITIVE: nothing is dropped or renamed. `pending` keeps its meaning
--- ("requested"); `approved` is inserted into the lifecycle between it and
--- `paid`. Existing rows keep working untouched.
-
--- AlterEnum: add the approval step. Postgres only allows ADD VALUE outside a
--- transaction block in older versions; Prisma runs each migration statement
--- separately, and IF NOT EXISTS makes a re-run safe.
-ALTER TYPE "PayoutRequestStatus" ADD VALUE IF NOT EXISTS 'approved' AFTER 'pending';
+-- ("requested"); `approved` is added to the enum by the preceding migration
+-- (20260826115000) so it is committed before the partial index below uses it.
+-- Existing rows keep working untouched.
 
 -- AlterTable: settlement bookkeeping on each payout.
 ALTER TABLE "PayoutRequest"
