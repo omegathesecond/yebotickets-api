@@ -264,7 +264,7 @@ router.delete('/:id', authorize(UserRole.ADMIN), deleteOrganizerController);
  *         name: status
  *         schema:
  *           type: string
- *           enum: [pending, paid, rejected]
+ *           enum: [pending, approved, paid, rejected]
  *         description: Filter by status
  *     responses:
  *       200:
@@ -278,7 +278,12 @@ router.get('/admin/payout-requests', authorize(UserRole.ADMIN), listPayoutReques
  * @swagger
  * /organizers/admin/payout-requests/{id}:
  *   patch:
- *     summary: Mark a payout request paid or rejected (Admin only)
+ *     summary: Approve, reject or mark paid a payout request (Admin only)
+ *     description: >
+ *       Lifecycle: pending -> approved -> paid, with pending|approved ->
+ *       rejected as the exit. Marking a request paid REQUIRES `reference` (the
+ *       external bank/mobile-money transfer reference) so every settled payout
+ *       is traceable.
  *     tags: [Organizers]
  *     security:
  *       - bearerAuth: []
@@ -299,9 +304,12 @@ router.get('/admin/payout-requests', authorize(UserRole.ADMIN), listPayoutReques
  *             properties:
  *               status:
  *                 type: string
- *                 enum: [paid, rejected]
+ *                 enum: [approved, paid, rejected]
  *               adminNote:
  *                 type: string
+ *               reference:
+ *                 type: string
+ *                 description: External transfer reference. Required when status is paid.
  *     responses:
  *       200:
  *         description: Payout request updated
@@ -426,17 +434,21 @@ router.put('/payout-method', validate(payoutMethodValidator), updatePayoutMethod
  * @swagger
  * /organizers/payout-balance:
  *   get:
- *     summary: Get the logged-in organizer's real available balance
+ *     summary: Get the logged-in organizer's settlement statement
  *     description: >
- *       totalEarnings (from real sold tickets) minus any PENDING or PAID
- *       payout requests, so this never allows double-requesting the same
- *       earnings.
+ *       The single source of truth for what the organizer is owed, recomputed
+ *       from real ticket rows on every call: grossSales (what was charged for
+ *       sold tickets) less refundedSales, less pendingSales held back for
+ *       events that have not finished, less the platform fee, less amounts
+ *       already paidOut or reserved by an open request — leaving
+ *       availableBalance. `events` carries the per-event breakdown with the
+ *       hold reason for anything not yet withdrawable.
  *     tags: [Organizers]
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: Available balance
+ *         description: Settlement statement
  */
 router.get('/payout-balance', getPayoutBalanceController);
 
@@ -445,6 +457,11 @@ router.get('/payout-balance', getPayoutBalanceController);
  * /organizers/payout-requests:
  *   post:
  *     summary: Request a payout/withdrawal
+ *     description: >
+ *       Amount is NET (the platform fee is already deducted from
+ *       availableBalance). Rejected with 409 if a request is already open, and
+ *       with 400 if the amount exceeds the available balance or no payout
+ *       method is on file.
  *     tags: [Organizers]
  *     security:
  *       - bearerAuth: []
@@ -464,6 +481,8 @@ router.get('/payout-balance', getPayoutBalanceController);
  *         description: Payout request created
  *       400:
  *         description: Amount exceeds available balance, or no payout method on file
+ *       409:
+ *         description: A payout request is already awaiting processing
  *   get:
  *     summary: Get the logged-in organizer's payout request history
  *     tags: [Organizers]

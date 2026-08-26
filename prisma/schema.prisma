@@ -34,7 +34,11 @@ enum PayoutMethod {
 }
 
 enum PayoutRequestStatus {
+  // `pending` IS the "requested" state (kept, not renamed, so existing rows and
+  // clients stay valid). Lifecycle: pending -> approved -> paid, with
+  // pending|approved -> rejected as the exit. `paid` and `rejected` are terminal.
   pending
+  approved
   paid
   rejected
 }
@@ -120,12 +124,42 @@ model PayoutRequest {
   // balance" stays the real ticket-sales earnings calculation (see
   // organizer-event.service.ts getOrganizerEarnings) minus PENDING/PAID
   // requests — this row never itself becomes the money figure elsewhere.
+  // `amount` is the NET figure the organizer receives — the settlement
+  // calculation (settlement.service.ts) already deducts the platform fee, so an
+  // organizer requests against an already-net available balance.
   amount        Float
+  currency      String               @default("SZL")
+
+  // Platform fee frozen at request time. Storing the rate AND the money means a
+  // later change to PLATFORM_FEE_PERCENT never restates a historic payout:
+  // grossAmount = amount + feeAmount is the ticket revenue this payout consumed.
+  feePercent    Float                @default(0)
+  feeAmount     Float                @default(0)
+  grossAmount   Float                @default(0)
+
   status        PayoutRequestStatus  @default(pending)
 
   requestedAt   DateTime             @default(now())
+  approvedAt    DateTime?
+  paidAt        DateTime?
+  // Kept for backward compatibility with rows/clients written before the
+  // approve step existed: set alongside approvedAt/paidAt and on rejection.
   processedAt   DateTime?
+  // External transfer reference (bank/mobile-money confirmation). REQUIRED when
+  // an admin marks a request paid, so every settled payout is traceable to a
+  // real transfer.
+  reference     String?
   adminNote     String?
+
+  // Destination SNAPSHOT, copied off the organizer's User row at request time.
+  // The User fields are editable, so without this an admin fulfilling an old
+  // request would read an account the organizer has since changed.
+  destinationMethod        PayoutMethod?
+  destinationAccountName   String?
+  destinationAccountNumber String?
+  destinationBankName      String?
+  // Bank branch for bank_transfer, mobile-money provider for mobile_money.
+  destinationDetail        String?
 
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt

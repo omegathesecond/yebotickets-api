@@ -25,11 +25,16 @@ export const updatePayoutMethodController = async (req: Request, res: Response, 
   }
 };
 
-/** GET /api/organizers/payout-balance — the caller's real available balance. */
+/**
+ * GET /api/organizers/payout-balance — the caller's settlement statement:
+ * gross sales, refunds, money held back for unfinished events, the platform
+ * fee, what has been paid out or reserved, and the resulting available balance,
+ * with a per-event breakdown.
+ */
 export const getPayoutBalanceController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const authReq = req as AuthenticatedRequest;
-    const data = await payoutService.getAvailableBalance(authReq.user.id);
+    const data = await payoutService.getOrganizerBalance(authReq.user.id);
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);
@@ -70,16 +75,20 @@ export const listPayoutRequestsController = async (req: Request, res: Response, 
   }
 };
 
-/** PATCH /api/organizers/admin/payout-requests/:id — admin marks paid/rejected. */
+/**
+ * PATCH /api/organizers/admin/payout-requests/:id — admin advances a request:
+ * approved (cleared to pay), paid (transfer done — `reference` required) or
+ * rejected (amount released back to the organizer's balance).
+ */
 export const updatePayoutRequestController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
-    const { status, adminNote } = req.body;
+    const { status, adminNote, reference } = req.body;
     if (!id) {
       next(new ApiError('Payout request id is required', 400));
       return;
     }
-    const data = await payoutService.updatePayoutRequestStatus(id, status, adminNote);
+    const data = await payoutService.updatePayoutRequestStatus(id, status, { adminNote, reference });
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);
