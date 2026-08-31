@@ -9,7 +9,7 @@ jest.mock('../../config/prisma', () => ({
 }));
 
 import prisma from '../../config/prisma';
-import { getEvents, getEventById } from '../event.service';
+import { getEvents, getEventById, adminUnpublishEvent } from '../event.service';
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 
@@ -138,6 +138,33 @@ describe('getEvents — upcoming-only default', () => {
 
     const includePastResult = await getEvents({ includePast: 'true' });
     expect(includePastResult.data.map((e: any) => e.id)).toContain('past-event');
+  });
+});
+
+describe('adminUnpublishEvent — admin takedown, unscoped by owning organizer', () => {
+  it('unpublishes an event owned by a DIFFERENT organizer than the caller (no ownership check in the service; route-level authorize(ADMIN) is the gate)', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(
+      buildEventRow({ id: 'event-1', organizerId: 'some-other-organizer', isPublished: true }) as any
+    );
+    prismaMock.event.update.mockResolvedValue(
+      buildEventRow({ id: 'event-1', organizerId: 'some-other-organizer', isPublished: false }) as any
+    );
+
+    const event = await adminUnpublishEvent('event-1');
+
+    expect(prismaMock.event.update).toHaveBeenCalledTimes(1);
+    expect(prismaMock.event.update.mock.calls[0][0]).toMatchObject({
+      where: { id: 'event-1' },
+      data: { isPublished: false },
+    });
+    expect(event.isPublished).toBe(false);
+  });
+
+  it('404s when the event does not exist, and never calls update', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(null);
+
+    await expect(adminUnpublishEvent('missing-event')).rejects.toMatchObject({ statusCode: 404 });
+    expect(prismaMock.event.update).not.toHaveBeenCalled();
   });
 });
 
