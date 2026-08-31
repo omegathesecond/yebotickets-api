@@ -44,15 +44,30 @@ const ticket = (
   price = 0
 ) => ({ eventId, status, amountPaid, ticketType: { price } });
 
-/** Wire the two reads the statement makes, plus zeroed payout aggregates. */
-const wire = (events: any[], tickets: any[], payouts: { paid?: number; reserved?: number } = {}) => {
+/** Wire the two reads the statement makes, plus payout aggregates. `paid`/
+ *  `reserved` may be a plain net amount (grossAmount/feeAmount default to 0,
+ *  matching legacy rows) or a full frozen split as `splitPayoutFee` produces. */
+const wire = (
+  events: any[],
+  tickets: any[],
+  payouts: {
+    paid?: number | { amount: number; grossAmount: number; feeAmount: number };
+    reserved?: number | { amount: number; grossAmount: number; feeAmount: number };
+  } = {}
+) => {
+  const normalize = (v: number | { amount: number; grossAmount: number; feeAmount: number } | undefined) =>
+    typeof v === 'number' ? { amount: v, grossAmount: 0, feeAmount: 0 } : v ?? { amount: 0, grossAmount: 0, feeAmount: 0 };
+
+  const paid = normalize(payouts.paid);
+  const reserved = normalize(payouts.reserved);
+
   prismaMock.event.findMany.mockResolvedValue(events as any);
   prismaMock.ticket.findMany.mockResolvedValue(tickets as any);
   prismaMock.payoutRequest.aggregate.mockImplementation((async (args: any) => {
     const status = args.where.status;
     const isPaidQuery = status === 'paid';
-    const amount = isPaidQuery ? payouts.paid ?? 0 : payouts.reserved ?? 0;
-    return { _sum: { amount } };
+    const { amount, grossAmount, feeAmount } = isPaidQuery ? paid : reserved;
+    return { _sum: { amount, grossAmount, feeAmount } };
   }) as any);
 };
 
@@ -179,6 +194,30 @@ describe('getOrganizerStatement — what the organizer is owed', () => {
     const statement = await getOrganizerStatement(ORG, NOW);
 
     expect(statement.availableBalance).toBe(0);
+  });
+
+  it('does NOT retro-charge a payout already settled at a different fee rate', async () => {
+    // Organizer earned 1000 while the fee was 0%, requested it all, and it was
+    // PAID — frozen as amount 1000 / feePercent 0 / feeAmount 0 / grossAmount
+    // 1000 (splitPayoutFee's own math). Only afterwards does the business turn
+    // the fee on. A second event then sells another 500 of eligible gross that
+    // was NEVER part of that payout.
+    setFee('10');
+    wire(
+      [event('paid-out', FINISHED), event('new', FINISHED)],
+      [ticket('paid-out', 'sold', 1000), ticket('new', 'sold', 500)],
+      { paid: { amount: 1000, grossAmount: 1000, feeAmount: 0 } }
+    );
+
+    const statement = await getOrganizerStatement(ORG, NOW);
+
+    // The 1000 already paid out must not be re-taxed at 10% now that the rate
+    // changed — only the fresh 500 gross is fee'd at the current rate.
+    expect(statement.eligibleGross).toBe(1500);
+    expect(statement.platformFee).toBe(50);
+    expect(statement.netEarned).toBe(1450);
+    expect(statement.paidOut).toBe(1000);
+    expect(statement.availableBalance).toBe(450);
   });
 
   it('returns an empty statement for an organizer with no events', async () => {
