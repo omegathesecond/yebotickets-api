@@ -146,6 +146,39 @@ describe('getOrganizerStatement — what the organizer is owed', () => {
 
     expect(statement.availableBalance).toBe(0);
     expect(statement.events[0].holdReason).toBe('Event was cancelled');
+    // Cancelled-event gross is its own bucket, not "pending" — it is being
+    // refunded to the buyer (the ticket only stayed 'sold' because that
+    // refund failed and is awaiting retry) and will never become withdrawable.
+    expect(statement.cancelledSales).toBe(300);
+    expect(statement.pendingSales).toBe(0);
+  });
+
+  it('separates finished, upcoming, and cancelled sales into three non-overlapping buckets', async () => {
+    // Three events in three different states:
+    //  - 'finished': ended, not cancelled -> withdrawable (eligibleGross)
+    //  - 'future': not yet ended -> pendingSales (will release once it ends)
+    //  - 'cancelled': ended AND cancelled, but still has a 'sold' ticket
+    //    because its refund failed and is awaiting retry (cancelEvent leaves
+    //    such tickets 'sold' rather than force-marking them cancelled) ->
+    //    cancelledSales, NOT pendingSales — this money is never coming.
+    wire(
+      [event('finished', FINISHED), event('future', UPCOMING), event('cancelled', FINISHED, { isCancelled: true })],
+      [ticket('finished', 'sold', 100), ticket('future', 'sold', 400), ticket('cancelled', 'sold', 300)]
+    );
+
+    const statement = await getOrganizerStatement(ORG, NOW);
+
+    expect(statement.grossSales).toBe(800);
+    expect(statement.eligibleGross).toBe(100);
+    expect(statement.pendingSales).toBe(400);
+    expect(statement.cancelledSales).toBe(300);
+    // The three buckets must not overlap and must account for every dollar.
+    expect(statement.eligibleGross + statement.pendingSales + statement.cancelledSales).toBe(
+      statement.grossSales
+    );
+    // Only the finished, non-cancelled event's gross is ever withdrawable —
+    // the cancelled event's still-sold ticket must not inflate the balance.
+    expect(statement.availableBalance).toBe(100);
   });
 
   it('SUBTRACTS the platform fee from what may be withdrawn', async () => {

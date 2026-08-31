@@ -439,10 +439,12 @@ router.put('/payout-method', validate(payoutMethodValidator), updatePayoutMethod
  *       The single source of truth for what the organizer is owed, recomputed
  *       from real ticket rows on every call: grossSales (what was charged for
  *       sold tickets) less refundedSales, less pendingSales held back for
- *       events that have not finished, less the platform fee, less amounts
- *       already paidOut or reserved by an open request — leaving
- *       availableBalance. `events` carries the per-event breakdown with the
- *       hold reason for anything not yet withdrawable.
+ *       events that have not finished, less cancelledSales (still-sold tickets
+ *       on a cancelled event awaiting refund retry — never withdrawable, not
+ *       "pending"), less the platform fee, less amounts already paidOut or
+ *       reserved by an open request — leaving availableBalance. `events`
+ *       carries the per-event breakdown with the hold reason for anything not
+ *       yet withdrawable.
  *     tags: [Organizers]
  *     security:
  *       - bearerAuth: []
