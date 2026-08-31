@@ -74,11 +74,20 @@ export const getEventsController = async (req: Request, res: Response, next: Nex
   }
 };
 
+/**
+ * GET /api/events/:id has no protect/authorize middleware — it must stay
+ * reachable anonymously for published events. req.user is a sound auth proxy
+ * because auth.middleware.ts:52 is the ONLY assignment of req.user anywhere
+ * in src, so an absent user here means genuinely unauthenticated, not just
+ * "route mounted without protect".
+ */
 export const getEventByIdController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const event = await getEventById(id);
-    
+    const authReq = req as AuthenticatedRequest;
+    const viewer = authReq.user ? { id: authReq.user.id, role: authReq.user.role } : null;
+    const event = await getEventById(id, viewer);
+
     res.status(200).json({
       success: true,
       data: event,

@@ -73,7 +73,10 @@ describe('transformEvent — surfaces cancellation state', () => {
       buildEventRow({ isCancelled: true, cancelledAt, ticketTypes: [] }) as any
     );
 
-    const event = await getEventById('event-1');
+    // A cancelled event now 404s for an unauthenticated caller (see
+    // event.controller.publicById.test.ts); fetch as the owning organizer so
+    // this test can still assert on the transform's cancellation fields.
+    const event = await getEventById('event-1', { id: 'org-1', role: 'organizer' });
 
     expect(event.isCancelled).toBe(true);
     expect(event.cancelledAt).toEqual(cancelledAt);
