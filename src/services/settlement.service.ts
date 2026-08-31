@@ -74,8 +74,15 @@ export interface OrganizerStatement {
   grossSales: number;
   /** Refunded/cancelled tickets. Informational: already excluded from grossSales. */
   refundedSales: number;
-  /** Sold-ticket money still held back because its event has not finished. */
+  /** Sold-ticket money still held back because its event has not finished. Never
+   *  includes cancelled events — see `cancelledSales`. */
   pendingSales: number;
+  /** Sold-ticket money for CANCELLED events — a ticket only stays 'sold' here
+   *  because its refund failed and is awaiting retry (see cancelEvent). This
+   *  money is being returned to the buyer and will never be withdrawable, so
+   *  it must never be shown or counted as "on hold" (which implies it is
+   *  eventually payable). */
+  cancelledSales: number;
   /** Sold-ticket money released for settlement (finished, non-cancelled events). */
   eligibleGross: number;
   /** Platform commission on eligibleGross. */
@@ -165,7 +172,14 @@ export const getOrganizerStatement = async (
   const grossSales = lines.reduce((sum, l) => sum + l.grossSales, 0);
   const refundedSales = lines.reduce((sum, l) => sum + l.refundedSales, 0);
   const eligibleGross = lines.filter((l) => l.eligible).reduce((sum, l) => sum + l.grossSales, 0);
-  const pendingSales = grossSales - eligibleGross;
+  // Cancelled events are never eligible, but their still-sold gross (refund
+  // failed, awaiting retry) must NOT read as "pending" — it will never be
+  // released, it is being refunded to the buyer. Split it into its own bucket
+  // so pendingSales means only "will be released when the event ends".
+  const cancelledSales = lines.filter((l) => l.isCancelled).reduce((sum, l) => sum + l.grossSales, 0);
+  const pendingSales = lines
+    .filter((l) => !l.eligible && !l.isCancelled)
+    .reduce((sum, l) => sum + l.grossSales, 0);
 
   const [paidAgg, reservedAgg] = await Promise.all([
     prisma.payoutRequest.aggregate({
@@ -201,6 +215,7 @@ export const getOrganizerStatement = async (
     grossSales: roundMoney(grossSales),
     refundedSales: roundMoney(refundedSales),
     pendingSales: roundMoney(pendingSales),
+    cancelledSales: roundMoney(cancelledSales),
     eligibleGross: roundMoney(eligibleGross),
     platformFee,
     netEarned,
