@@ -167,22 +167,32 @@ export const getOrganizerStatement = async (
   const eligibleGross = lines.filter((l) => l.eligible).reduce((sum, l) => sum + l.grossSales, 0);
   const pendingSales = grossSales - eligibleGross;
 
-  const platformFee = roundMoney((eligibleGross * feePercent) / 100);
-  const netEarned = roundMoney(eligibleGross - platformFee);
-
   const [paidAgg, reservedAgg] = await Promise.all([
     prisma.payoutRequest.aggregate({
       where: { organizerId, status: 'paid' },
-      _sum: { amount: true },
+      _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
     prisma.payoutRequest.aggregate({
       where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
-      _sum: { amount: true },
+      _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
   ]);
 
   const paidOut = roundMoney(paidAgg._sum?.amount || 0);
   const reserved = roundMoney(reservedAgg._sum?.amount || 0);
+
+  // Gross already consumed by payouts settled (or reserved) at their OWN
+  // frozen rate — re-taxing it at today's rate would restate history the
+  // moment PLATFORM_FEE_PERCENT changes (see splitPayoutFee). Only the
+  // remaining, never-consumed gross is fee'd at the current rate.
+  const consumedGross = roundMoney((paidAgg._sum?.grossAmount || 0) + (reservedAgg._sum?.grossAmount || 0));
+  const consumedFee = roundMoney((paidAgg._sum?.feeAmount || 0) + (reservedAgg._sum?.feeAmount || 0));
+  const remainingGross = Math.max(0, roundMoney(eligibleGross - consumedGross));
+  const remainingFee = roundMoney((remainingGross * feePercent) / 100);
+
+  const platformFee = roundMoney(consumedFee + remainingFee);
+  const netEarned = roundMoney(eligibleGross - platformFee);
+
   const availableBalance = Math.max(0, roundMoney(netEarned - paidOut - reserved));
 
   return {
