@@ -1,33 +1,40 @@
 import prisma from '../config/prisma';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
 import { ApiError } from '../middleware/error.middleware';
+import { UserRole } from '../interfaces/user.interface';
 
 /**
- * Transform Prisma event to API response format
+ * Transform Prisma event to API response format.
+ * `includeOrganizerEmail` defaults to true so every existing caller (create/
+ * update/list) keeps its current shape; getEventById is the only caller that
+ * passes false, for viewers who aren't the owning organizer or an admin.
  */
-const transformEvent = (event: any) => ({
-  id: event.id,
-  title: event.title,
-  description: event.description,
-  location: nestEventLocation(event),
-  startDate: event.startDate,
-  endDate: event.endDate,
-  organizer: event.organizer ? {
-    id: event.organizer.id,
-    name: event.organizer.name,
-    email: event.organizer.email,
-  } : { id: event.organizerId },
-  isPublished: event.isPublished,
-  // Surface cancellation so a client landing on a cancelled event (e.g. via a
-  // stale link) can show it's off-sale rather than silently offer to buy.
-  isCancelled: event.isCancelled ?? false,
-  cancelledAt: event.cancelledAt ?? null,
-  coverImage: event.coverImage,
-  category: event.category,
-  ticketTypes: event.ticketTypes || [],
-  createdAt: event.createdAt,
-  updatedAt: event.updatedAt,
-});
+const transformEvent = (event: any, options: { includeOrganizerEmail?: boolean } = {}) => {
+  const includeOrganizerEmail = options.includeOrganizerEmail ?? true;
+  return {
+    id: event.id,
+    title: event.title,
+    description: event.description,
+    location: nestEventLocation(event),
+    startDate: event.startDate,
+    endDate: event.endDate,
+    organizer: event.organizer ? {
+      id: event.organizer.id,
+      name: event.organizer.name,
+      ...(includeOrganizerEmail ? { email: event.organizer.email } : {}),
+    } : { id: event.organizerId },
+    isPublished: event.isPublished,
+    // Surface cancellation so a client landing on a cancelled event (e.g. via a
+    // stale link) can show it's off-sale rather than silently offer to buy.
+    isCancelled: event.isCancelled ?? false,
+    cancelledAt: event.cancelledAt ?? null,
+    coverImage: event.coverImage,
+    category: event.category,
+    ticketTypes: event.ticketTypes || [],
+    createdAt: event.createdAt,
+    updatedAt: event.updatedAt,
+  };
+};
 
 /**
  * Create a new event
@@ -163,7 +170,7 @@ export const getEvents = async (query: Record<string, any> = {}) => {
     ]);
 
     return {
-      data: events.map(transformEvent),
+      data: events.map((event) => transformEvent(event)),
       total,
       page,
       limit,
@@ -178,9 +185,15 @@ export const getEvents = async (query: Record<string, any> = {}) => {
 /**
  * Get event by ID
  * @param eventId Event ID
+ * @param viewer The authenticated caller (if any) — undefined/null for a
+ *   public/unauthenticated request. Only the owning organizer or an admin
+ *   may see an unpublished/cancelled event, or the organizer's email.
  * @returns Event details
  */
-export const getEventById = async (eventId: string) => {
+export const getEventById = async (
+  eventId: string,
+  viewer?: { id: string; role: string } | null
+) => {
   try {
     const event = await prisma.event.findUnique({
       where: { id: eventId },
@@ -196,7 +209,18 @@ export const getEventById = async (eventId: string) => {
       throw new ApiError('Event not found', 404);
     }
 
-    return transformEvent(event);
+    const isOwningOrganizer = !!viewer && viewer.id === event.organizerId;
+    const isAdmin = viewer?.role === UserRole.ADMIN;
+    const isPrivilegedViewer = isOwningOrganizer || isAdmin;
+
+    if ((!event.isPublished || event.isCancelled) && !isPrivilegedViewer) {
+      // Same 404 shape as "doesn't exist" so an unauthenticated (or
+      // non-owning) caller can't distinguish a draft/cancelled event from
+      // one that was never created.
+      throw new ApiError('Event not found', 404);
+    }
+
+    return transformEvent(event, { includeOrganizerEmail: isPrivilegedViewer });
   } catch (error) {
     console.error('Error in getEventById service:', error);
     if (error instanceof ApiError) throw error;
