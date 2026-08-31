@@ -87,7 +87,7 @@ describe('GET /api/events (anonymous) — always scoped to published, non-cancel
 });
 
 describe('GET /api/organizers/events (authenticated) — organizer still sees its own drafts', () => {
-  it('does NOT force isPublished/isCancelled when protect has set req.user', async () => {
+  it('does NOT force isPublished/isCancelled when protect has set req.user to an organizer', async () => {
     // Mirrors organizer.routes.ts's wrapper middleware, which sets these
     // server-side after protect + authorize(ORGANIZER, ADMIN).
     const req = {
@@ -97,7 +97,7 @@ describe('GET /api/organizers/events (authenticated) — organizer still sees it
         showCancelled: 'true',
         includePast: 'true',
       },
-      user: { id: 'org-1', role: 'ORGANIZER' },
+      user: { id: 'org-1', role: 'organizer' },
     } as unknown as Request;
 
     await getEventsController(req, buildRes(), jest.fn());
@@ -106,5 +106,28 @@ describe('GET /api/organizers/events (authenticated) — organizer still sees it
     expect(where.isPublished).toBeUndefined();
     expect(where.isCancelled).toBeUndefined();
     expect(where.organizerId).toBe('org-1');
+  });
+});
+
+describe('GET /events gated by role, not merely req.user presence', () => {
+  it('still forces isPublished:true/isCancelled:false when req.user is set but role is the plain "user" role', async () => {
+    // If this controller is ever mounted behind `protect` alone (without
+    // `authorize(ORGANIZER, ADMIN)`), an authenticated customer must not be
+    // able to enumerate another organizer's drafts.
+    const req = {
+      query: {
+        showUnpublished: 'true',
+        showCancelled: 'true',
+        organizer: 'victim-organizer-id',
+      },
+      user: { id: 'customer-1', role: 'user' },
+    } as unknown as Request;
+
+    await getEventsController(req, buildRes(), jest.fn());
+
+    const where = whereFromLastQuery();
+    expect(where.isPublished).toBe(true);
+    expect(where.isCancelled).toBe(false);
+    expect(where.organizerId).toBe('victim-organizer-id');
   });
 });

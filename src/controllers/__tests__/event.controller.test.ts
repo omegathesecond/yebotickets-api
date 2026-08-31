@@ -52,10 +52,10 @@ describe('getEventsController — public route never trusts anonymous showUnpubl
 });
 
 describe('getEventsController — authenticated callers (e.g. GET /api/organizers/events) keep their query untouched', () => {
-  it('does not strip showUnpublished/showCancelled when req.user is present', async () => {
+  it('does not strip showUnpublished/showCancelled when req.user is an organizer', async () => {
     const req = {
       query: { showUnpublished: 'true', showCancelled: 'true', organizer: 'org-1', includePast: 'true' },
-      user: { id: 'org-1', role: 'ORGANIZER' },
+      user: { id: 'org-1', role: 'organizer' },
     } as unknown as Request;
 
     await getEventsController(req, buildRes(), jest.fn());
@@ -65,5 +65,26 @@ describe('getEventsController — authenticated callers (e.g. GET /api/organizer
     expect(passedQuery.showUnpublished).toBe('true');
     expect(passedQuery.showCancelled).toBe('true');
     expect(passedQuery.organizer).toBe('org-1');
+  });
+});
+
+describe('getEventsController — role gating, not merely req.user presence', () => {
+  it('still strips showUnpublished/showCancelled for an authenticated non-privileged "user" role', async () => {
+    // Guards against this controller ever being mounted behind `protect` alone
+    // (without `authorize(ORGANIZER, ADMIN)`) — a logged-in customer must not
+    // be able to enumerate draft/unpublished events.
+    const req = {
+      query: { showUnpublished: 'true', showCancelled: 'true', organizer: 'victim-organizer-id' },
+      user: { id: 'customer-1', role: 'user' },
+    } as unknown as Request;
+
+    await getEventsController(req, buildRes(), jest.fn());
+
+    expect(getEventsMock).toHaveBeenCalledTimes(1);
+    const passedQuery = getEventsMock.mock.calls[0][0];
+    expect(passedQuery.showUnpublished).toBeUndefined();
+    expect(passedQuery.showCancelled).toBeUndefined();
+    // organizer itself is fine to pass through once drafts are excluded.
+    expect(passedQuery.organizer).toBe('victim-organizer-id');
   });
 });
