@@ -1,0 +1,34 @@
+# CI only. Deploys are handled by Cloud Build, NOT by this workflow.
+#
+# Active deploy path:
+#   trigger `yebotickets-api-prod` (push to main)  -> cloudbuild.yaml
+#   trigger `yebotickets-api-dev`  (push to dev)   -> cloudbuild.yaml
+#
+# The deploy job that used to live here pushed to the legacy gcr.io path and
+# failed on every run with `artifactregistry.repositories.uploadArtifacts
+# denied`. It also used `gcloud run deploy --set-secrets`, which REPLACES every
+# secret binding rather than adding to it -- so a "fixed" run would have wiped
+# unrelated secret wiring. It was removed rather than repaired; Cloud Build
+# already owns this deploy.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master, dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Run tests
+        run: npm test
