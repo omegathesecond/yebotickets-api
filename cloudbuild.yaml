@@ -1,3 +1,21 @@
+# Deploy path: GitHub push to `main` -> Cloud Build trigger `yebotickets-api-prod`
+# (id 04122141-7676-462e-9c1f-c6fcd142a405) -> this file -> Cloud Run
+# yebotickets-api-prod. `dev` -> trigger `yebotickets-api-dev` -> yebotickets-api-dev.
+#
+# 2026-09-07: found this trigger had 0 successful runs since 2026-04-26 (both
+# builds that day failed on the `gcloud run deploy` step, back when this file
+# still deployed the wrong service name with a destructive --set-secrets — see
+# git history). The service kept getting new revisions anyway because someone
+# was deploying by hand (`gcloud run deploy --source .` as the deployer SA,
+# visible as `run.googleapis.com/client-name: gcloud` + a
+# `gs://run-sources-...` source annotation on the revision, NOT a Cloud Build
+# git-triggered image) instead of via this pipeline — main had drifted ~5
+# merged commits ahead of what was actually live in prod. The prod trigger
+# (57a3ccdc) was at some point deleted and recreated as 04122141 on 2026-09-04,
+# which is the standard fix for a Cloud Build GitHub-App trigger whose webhook
+# stopped delivering — re-verified working here: `gcloud builds triggers run
+# 04122141... --branch=main` built + deployed main HEAD cleanly to
+# yebotickets-api-prod-00007 (IAM, cloudbuild.yaml, secrets all correct).
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
