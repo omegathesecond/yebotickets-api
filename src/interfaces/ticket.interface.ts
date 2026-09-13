@@ -44,6 +44,9 @@ export interface ITicket {
   refundRef?: string | null;
   refundedAt?: Date | null;
   cancelledAt?: Date | null;
+  // Buyer self-service refund request (intent only — see ticket.service.requestTicketRefund)
+  refundRequestedAt?: Date | null;
+  refundRequestReason?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

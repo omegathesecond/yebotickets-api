@@ -227,6 +227,23 @@ export const refundTicketValidator = [
     .withMessage('reason must be at most 500 characters'),
 ];
 
+// Buyer self-service refund request: POST /api/tickets/:ticketId/refund-request.
+// ticketId is the ticket's UUID; an optional reason is forwarded to the organizer.
+export const requestTicketRefundValidator = [
+  param('ticketId')
+    .notEmpty()
+    .withMessage('Ticket ID is required')
+    .isUUID()
+    .withMessage('Invalid ticket ID format'),
+
+  body('reason')
+    .optional()
+    .isString()
+    .withMessage('reason must be a string')
+    .isLength({ max: 500 })
+    .withMessage('reason must be at most 500 characters'),
+];
+
 // Cancel an event: POST /api/tickets/events/:eventId/cancel. eventId is a UUID.
 export const cancelEventValidator = [
   param('eventId')

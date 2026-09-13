@@ -54,6 +54,7 @@ import {
   purchaseTicket,
   verifyTicket,
   refundTicket,
+  requestTicketRefund,
   cancelEvent,
   settleSucceededCharge,
   settleFailedCharge,
@@ -889,6 +890,139 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
 
     expect(result.result).toBe('refunded');
     expect(refundChargeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A sold ticket with the relations requestTicketRefund loads (event incl.
+// organizer, and the buyer). Distinct from buildSoldPaidTicket's REFUND_INCLUDE
+// shape since requestTicketRefund selects a different subset.
+const buildRefundRequestTicket = (over: Partial<any> = {}) => ({
+  id: 'ticket-1',
+  uniqueCode: 'ABC123',
+  ticketTypeId: 'tt-1',
+  eventId: 'event-1',
+  userId: 'user-1',
+  status: 'sold',
+  refundRequestedAt: null,
+  refundRequestReason: null,
+  event: {
+    id: 'event-1',
+    title: 'Test Fest',
+    isCancelled: false,
+    organizer: { id: 'org-1', name: 'Organizer Org', phoneNumber: '+26878111111' },
+  },
+  user: { id: 'user-1', name: 'Buyer' },
+  ...over,
+});
+
+const BUYER = { id: 'user-1' };
+
+describe('requestTicketRefund (buyer self-service refund request)', () => {
+  it('records the request and notifies the organizer for a sold ticket the buyer owns', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(buildRefundRequestTicket() as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+
+    const result = await requestTicketRefund('ticket-1', BUYER, 'plans changed');
+
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    const writeArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(writeArg.where).toMatchObject({ id: 'ticket-1', refundRequestedAt: null });
+    expect(writeArg.data).toMatchObject({ refundRequestReason: 'plans changed' });
+    expect(writeArg.data.refundRequestedAt).toBeInstanceOf(Date);
+
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMessageMock.mock.calls[0][0]).toBe('+26878111111');
+    expect(sendTextMessageMock.mock.calls[0][1]).toContain('ABC123');
+
+    expect(result).toMatchObject({
+      ticketId: 'ticket-1',
+      uniqueCode: 'ABC123',
+      organizerNotified: true,
+    });
+    expect(result.refundRequestedAt).toBeInstanceOf(Date);
+
+    // Does NOT touch money or ticket status — refundCharge is never called.
+    expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 when the ticket does not exist', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(null);
+
+    await expect(requestTicketRefund('ticket-x', BUYER)).rejects.toMatchObject({ statusCode: 404 });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects (403) when the caller does not own the ticket — no IDOR', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildRefundRequestTicket({ userId: 'someone-else' }) as any
+    );
+
+    await expect(requestTicketRefund('ticket-1', BUYER)).rejects.toMatchObject({ statusCode: 403 });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects (400) a ticket that is not sold', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildRefundRequestTicket({ status: 'cancelled' }) as any
+    );
+
+    await expect(requestTicketRefund('ticket-1', BUYER)).rejects.toMatchObject({ statusCode: 400 });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects (400) when the event is already cancelled', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildRefundRequestTicket({ event: { ...buildRefundRequestTicket().event, isCancelled: true } }) as any
+    );
+
+    await expect(requestTicketRefund('ticket-1', BUYER)).rejects.toMatchObject({ statusCode: 400 });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects (409) when a request is already pending for this ticket', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildRefundRequestTicket({ refundRequestedAt: new Date('2026-01-01T00:00:00Z') }) as any
+    );
+
+    await expect(requestTicketRefund('ticket-1', BUYER)).rejects.toMatchObject({ statusCode: 409 });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects (409) on a concurrent double-request race (updateMany claims 0 rows)', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(buildRefundRequestTicket() as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 0 } as any);
+
+    await expect(requestTicketRefund('ticket-1', BUYER)).rejects.toMatchObject({ statusCode: 409 });
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('still records the request when the organizer notify fails (best-effort, not thrown)', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(buildRefundRequestTicket() as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+    sendTextMessageMock.mockRejectedValue(new Error('YeboLink down'));
+
+    const result = await requestTicketRefund('ticket-1', BUYER);
+
+    expect(result.organizerNotified).toBe(false);
+    expect(result.organizerNotifyError).toContain('YeboLink down');
+    // The request itself still succeeded — updateMany already ran.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the request without notifying when the organizer has no phone on file', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(
+      buildRefundRequestTicket({
+        event: { ...buildRefundRequestTicket().event, organizer: { id: 'org-1', name: 'Organizer Org', phoneNumber: null } },
+      }) as any
+    );
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
+
+    const result = await requestTicketRefund('ticket-1', BUYER);
+
+    expect(result.organizerNotified).toBe(false);
+    expect(result.organizerNotifyError).toBe('Organizer has no phone number on file');
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 });
 

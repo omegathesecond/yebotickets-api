@@ -13,6 +13,7 @@ import {
   confirmCheckInController,
   getEventTicketsController,
   refundTicketController,
+  requestTicketRefundController,
   cancelEventController
 } from '../controllers/ticket.controller';
 import {
@@ -23,11 +24,12 @@ import {
   verifyTicketValidator,
   checkInLookupValidator,
   refundTicketValidator,
+  requestTicketRefundValidator,
   cancelEventValidator
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
-import { purchaseTicketLimiter, refundLimiter } from '../middleware/rateLimit.middleware';
+import { purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
@@ -763,6 +765,58 @@ router.post(
   refundLimiter,
   validate(refundTicketValidator),
   refundTicketController
+);
+
+/**
+ * @swagger
+ * /api/tickets/{ticketId}/refund-request:
+ *   post:
+ *     summary: Buyer self-service — request a refund for a ticket you own
+ *     tags: [Tickets]
+ *     description: >
+ *       Flags intent to refund a SOLD ticket the caller owns and notifies the
+ *       organizer. Does NOT refund anything — the organizer/admin still has to
+ *       act on it via POST /api/tickets/refund/{ticketId}. Rejects with 409 if
+ *       a request is already pending for this ticket.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: ticketId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID of the ticket to request a refund for
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *                 description: Optional reason forwarded to the organizer
+ *     responses:
+ *       201:
+ *         description: Refund request recorded
+ *       400:
+ *         description: Ticket is not sold, or its event is already cancelled
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: You do not own this ticket
+ *       404:
+ *         description: Ticket not found
+ *       409:
+ *         description: A refund request is already pending for this ticket
+ */
+router.post(
+  '/:ticketId/refund-request',
+  protect,
+  refundRequestLimiter,
+  validate(requestTicketRefundValidator),
+  requestTicketRefundController
 );
 
 /**

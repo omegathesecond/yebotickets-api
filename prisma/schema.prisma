@@ -315,6 +315,15 @@ model Ticket {
   refundedAt    DateTime?
   cancelledAt   DateTime?
 
+  // Buyer self-service refund REQUEST (intent only — does not move money).
+  // Set by POST /api/tickets/:ticketId/refund-request when a buyer asks for a
+  // refund on their own sold ticket; the organizer/admin still has to act on it
+  // via the existing POST /api/tickets/refund/:ticketId endpoint, which clears
+  // both fields once it actually refunds/cancels the ticket. Nullable: only
+  // tickets with an open (or previously made) request carry these.
+  refundRequestedAt    DateTime?
+  refundRequestReason  String?
+
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 

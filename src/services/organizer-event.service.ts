@@ -419,6 +419,8 @@ export const getEventPurchases = async (
     totalAmount: t.amountPaid ?? t.ticketType?.price ?? 0,
     purchaseDate: t.purchaseDate ?? t.createdAt,
     status: t.status,
+    refundRequestedAt: t.refundRequestedAt ?? null,
+    refundRequestReason: t.refundRequestReason ?? null,
   }));
 
   return {
@@ -466,6 +468,8 @@ export const getEventTickets = async (
     validUntil: event.endDate,
     status: t.status,
     ownerName: t.user?.name || 'Unknown',
+    refundRequestedAt: t.refundRequestedAt ?? null,
+    refundRequestReason: t.refundRequestReason ?? null,
   }));
 
   return {

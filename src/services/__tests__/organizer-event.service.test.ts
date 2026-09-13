@@ -15,6 +15,7 @@ import {
   getOrganizerEarnings,
   getEventDetailsForOrganizer,
   getEventPurchases,
+  getEventTickets,
   getOrganizerDashboardStats,
   getOrganizerMonthlyStats,
   getOrganizerRecentActivity,
@@ -264,9 +265,95 @@ describe('getEventPurchases — pagination + ownership', () => {
       totalAmount: 100,
       purchaseDate: new Date('2026-06-01T10:00:00Z'),
       status: 'sold',
+      refundRequestedAt: null,
+      refundRequestReason: null,
     });
     // Only non-available (issued) tickets are queried.
     const where = (prismaMock.ticket.findMany.mock.calls[0][0] as any).where;
     expect(where.status).toEqual({ not: 'available' });
+  });
+
+  it('surfaces a pending buyer refund request so the organizer can see it', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
+    prismaMock.ticket.count.mockResolvedValue(1 as any);
+    prismaMock.ticket.findMany.mockResolvedValue([
+      {
+        id: 'ticket-1',
+        user: { name: 'Buyer One' },
+        ticketType: { name: 'VIP', price: 100 },
+        amountPaid: 100,
+        purchaseDate: new Date('2026-06-01T10:00:00Z'),
+        createdAt: new Date('2026-06-01T09:00:00Z'),
+        status: 'sold',
+        refundRequestedAt: new Date('2026-06-02T10:00:00Z'),
+        refundRequestReason: 'plans changed',
+      },
+    ] as any);
+
+    const result = await getEventPurchases('event-1', { id: 'org-1', role: 'organizer' }, '1', '10');
+
+    expect(result.purchases[0]).toMatchObject({
+      refundRequestedAt: new Date('2026-06-02T10:00:00Z'),
+      refundRequestReason: 'plans changed',
+    });
+  });
+});
+
+describe('getEventTickets — pagination + ownership', () => {
+  it('rejects a non-owner before reading tickets', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(eventRow({ organizerId: 'org-OTHER' }) as any);
+    await expect(
+      getEventTickets('event-1', { id: 'org-1', role: 'organizer' }, '1', '10')
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('surfaces a pending buyer refund request alongside the ticket row', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
+    prismaMock.ticket.count.mockResolvedValue(1 as any);
+    prismaMock.ticket.findMany.mockResolvedValue([
+      {
+        id: 'ticket-1',
+        user: { name: 'Buyer One' },
+        ticketType: { name: 'VIP', price: 100 },
+        purchaseDate: new Date('2026-06-01T10:00:00Z'),
+        createdAt: new Date('2026-06-01T09:00:00Z'),
+        status: 'sold',
+        refundRequestedAt: new Date('2026-06-02T10:00:00Z'),
+        refundRequestReason: 'plans changed',
+      },
+    ] as any);
+
+    const result = await getEventTickets('event-1', { id: 'org-1', role: 'organizer' }, '1', '10');
+
+    expect(result.tickets[0]).toMatchObject({
+      id: 'ticket-1',
+      ownerName: 'Buyer One',
+      refundRequestedAt: new Date('2026-06-02T10:00:00Z'),
+      refundRequestReason: 'plans changed',
+    });
+  });
+
+  it('reports no pending refund request for a ticket without one', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
+    prismaMock.ticket.count.mockResolvedValue(1 as any);
+    prismaMock.ticket.findMany.mockResolvedValue([
+      {
+        id: 'ticket-2',
+        user: { name: 'Buyer Two' },
+        ticketType: { name: 'General', price: 50 },
+        purchaseDate: new Date('2026-06-01T10:00:00Z'),
+        createdAt: new Date('2026-06-01T09:00:00Z'),
+        status: 'sold',
+        refundRequestedAt: null,
+        refundRequestReason: null,
+      },
+    ] as any);
+
+    const result = await getEventTickets('event-1', { id: 'org-1', role: 'organizer' }, '1', '10');
+
+    expect(result.tickets[0]).toMatchObject({
+      refundRequestedAt: null,
+      refundRequestReason: null,
+    });
   });
 });
