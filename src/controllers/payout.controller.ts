@@ -82,13 +82,14 @@ export const listPayoutRequestsController = async (req: Request, res: Response, 
  */
 export const updatePayoutRequestController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
+    const authReq = req as AuthenticatedRequest;
     const { id } = req.params;
     const { status, adminNote, reference } = req.body;
     if (!id) {
       next(new ApiError('Payout request id is required', 400));
       return;
     }
-    const data = await payoutService.updatePayoutRequestStatus(id, status, { adminNote, reference });
+    const data = await payoutService.updatePayoutRequestStatus(id, status, authReq.user.id, { adminNote, reference });
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);
@@ -103,9 +104,10 @@ export const updatePayoutRequestController = async (req: Request, res: Response,
  */
 export const updateOrganizerPayoutApprovalController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
+    const authReq = req as AuthenticatedRequest;
     const { id } = req.params;
     const { payoutApprovalStatus } = req.body;
-    const data = await payoutService.setPayoutApprovalStatus(id, payoutApprovalStatus);
+    const data = await payoutService.setPayoutApprovalStatus(id, payoutApprovalStatus, authReq.user.id);
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);
