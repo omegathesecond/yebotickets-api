@@ -119,13 +119,27 @@ model User {
   // to `approved` in this field's migration so they are not locked out.
   payoutApprovalStatus PayoutApprovalStatus @default(unreviewed)
 
+  // Audit trail for the review gate above: WHO (which admin) last changed
+  // payoutApprovalStatus and WHEN — required for AML/compliance traceability
+  // on a decision that gates real money movement. Set by
+  // payout.service.ts#setPayoutApprovalStatus from the authenticated admin's
+  // id; never written by anything else.
+  payoutApprovalReviewedByAdminId String?
+  payoutApprovalReviewedBy        User?     @relation("PayoutApprovalReviewedBy", fields: [payoutApprovalReviewedByAdminId], references: [id])
+  payoutApprovalReviewedAt        DateTime?
+
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   // Relations
   events      Event[]
   tickets     Ticket[]
-  payoutRequests PayoutRequest[]
+  payoutRequests         PayoutRequest[] @relation("PayoutRequestOrganizer")
+  payoutRequestsReviewed PayoutRequest[] @relation("PayoutRequestReviewedByAdmin")
+  // Self-relation back-reference for payoutApprovalReviewedBy above — every
+  // admin's own payoutApprovalReviewedBy* fields stay null; this array is
+  // populated on the ORGANIZER rows an admin has reviewed.
+  payoutApprovalReviewsGiven User[] @relation("PayoutApprovalReviewedBy")
 
   @@index([phoneNumber])
   @@index([email])
@@ -135,7 +149,7 @@ model PayoutRequest {
   id            String               @id @default(uuid())
 
   organizerId   String
-  organizer     User                 @relation(fields: [organizerId], references: [id])
+  organizer     User                 @relation("PayoutRequestOrganizer", fields: [organizerId], references: [id])
 
   // Snapshot of what was requested; the source of truth for "available
   // balance" stays the real ticket-sales earnings calculation (see
@@ -167,6 +181,14 @@ model PayoutRequest {
   // real transfer.
   reference     String?
   adminNote     String?
+
+  // Audit trail: which admin last transitioned this request's status and
+  // when — required for AML/compliance traceability on a decision that moves
+  // real money. Set by every branch of payout.service.ts#updatePayoutRequestStatus
+  // from the authenticated admin's id; never written by anything else.
+  reviewedByAdminId String?
+  reviewedByAdmin   User?    @relation("PayoutRequestReviewedByAdmin", fields: [reviewedByAdminId], references: [id])
+  reviewedAt        DateTime?
 
   // Destination SNAPSHOT, copied off the organizer's User row at request time.
   // The User fields are editable, so without this an admin fulfilling an old

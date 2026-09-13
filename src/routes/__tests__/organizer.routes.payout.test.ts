@@ -118,6 +118,24 @@ describe('PATCH /organizers/admin/payout-requests/:id — admin-only', () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it('stamps the authenticated admin as reviewedByAdminId, not a body-supplied value', async () => {
+    prismaMock.payoutRequest.findUnique.mockResolvedValue({ id: 'pr-1', status: 'pending' } as any);
+    prismaMock.payoutRequest.update.mockResolvedValue({ id: 'pr-1', status: 'approved' } as any);
+
+    const res = await fetch(`${baseUrl}/organizers/admin/payout-requests/pr-1`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prismaMock.payoutRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ reviewedByAdminId: 'user-1' }),
+      })
+    );
+  });
 });
 
 describe('PATCH /organizers/admin/organizers/:id/payout-approval — admin-only', () => {
@@ -163,6 +181,23 @@ describe('PATCH /organizers/admin/organizers/:id/payout-approval — admin-only'
     });
     expect(res.status).toBe(400);
     expect(prismaMock.user.update).not.toHaveBeenCalled();
+  });
+
+  it('stamps the authenticated admin as payoutApprovalReviewedByAdminId', async () => {
+    prismaMock.user.update.mockResolvedValue({ id: 'org-1', payoutApprovalStatus: 'approved' } as any);
+
+    const res = await fetch(`${baseUrl}/organizers/admin/organizers/org-1/payout-approval`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prismaMock.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ payoutApprovalReviewedByAdminId: 'user-1' }),
+      })
+    );
   });
 });
 

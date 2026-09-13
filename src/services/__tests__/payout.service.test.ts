@@ -23,6 +23,7 @@ import { ApiError } from '../../middleware/error.middleware';
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 
 const ORG = 'org-1';
+const ADMIN = 'admin-1';
 /** Long past / far future, so the eligibility boundary holds against real `now`. */
 const FINISHED = new Date('2020-01-02T00:00:00Z');
 const UPCOMING = new Date('2099-01-02T00:00:00Z');
@@ -217,7 +218,7 @@ describe('createPayoutRequest — guarding the balance', () => {
   it('allows a fresh request once the previous one is rejected', async () => {
     wireSales(1000);
     const first = await createPayoutRequest(ORG, 200);
-    await rejectPayoutRequest(first.id, 'Wrong account number');
+    await rejectPayoutRequest(first.id, ADMIN, 'Wrong account number');
 
     await expect(createPayoutRequest(ORG, 200)).resolves.toMatchObject({ status: 'pending' });
   });
@@ -281,12 +282,12 @@ describe('admin fulfilment — approve, pay, reject', () => {
     const requested = await getOrganizerBalance(ORG);
     expect(requested).toMatchObject({ reserved: 400, paidOut: 0, availableBalance: 600 });
 
-    await approvePayoutRequest(request.id);
+    await approvePayoutRequest(request.id, ADMIN);
     const approved = await getOrganizerBalance(ORG);
     // Still reserved, not yet paid — and crucially NOT counted twice.
     expect(approved).toMatchObject({ reserved: 400, paidOut: 0, availableBalance: 600 });
 
-    await markPayoutRequestPaid(request.id, 'FT24081900123');
+    await markPayoutRequestPaid(request.id, ADMIN, 'FT24081900123');
     const paid = await getOrganizerBalance(ORG);
     expect(paid).toMatchObject({ reserved: 0, paidOut: 400, availableBalance: 600 });
   });
@@ -294,23 +295,25 @@ describe('admin fulfilment — approve, pay, reject', () => {
   it('records when the money moved and the transfer reference', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await approvePayoutRequest(request.id);
+    await approvePayoutRequest(request.id, ADMIN);
 
-    const paid = await markPayoutRequestPaid(request.id, '  FT24081900123  ', 'Wired via Standard Bank');
+    const paid = await markPayoutRequestPaid(request.id, ADMIN, '  FT24081900123  ', 'Wired via Standard Bank');
 
     expect(paid.status).toBe('paid');
     expect(paid.reference).toBe('FT24081900123');
     expect(paid.adminNote).toBe('Wired via Standard Bank');
     expect(paid.approvedAt).toBeInstanceOf(Date);
     expect(paid.paidAt).toBeInstanceOf(Date);
+    expect(paid.reviewedByAdminId).toBe(ADMIN);
+    expect(paid.reviewedAt).toBeInstanceOf(Date);
   });
 
   it('REFUSES to mark a payout paid without an external reference', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await approvePayoutRequest(request.id);
+    await approvePayoutRequest(request.id, ADMIN);
 
-    await expect(markPayoutRequestPaid(request.id, '   ')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(markPayoutRequestPaid(request.id, ADMIN, '   ')).rejects.toMatchObject({ statusCode: 400 });
     expect(store[0].status).toBe('approved');
   });
 
@@ -318,26 +321,26 @@ describe('admin fulfilment — approve, pay, reject', () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
 
-    await expect(markPayoutRequestPaid(request.id, 'FT1')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT1')).rejects.toMatchObject({ statusCode: 400 });
     expect(store[0].status).toBe('pending');
   });
 
   it('refuses to re-pay an already paid request', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await approvePayoutRequest(request.id);
-    await markPayoutRequestPaid(request.id, 'FT1');
+    await approvePayoutRequest(request.id, ADMIN);
+    await markPayoutRequestPaid(request.id, ADMIN, 'FT1');
 
-    await expect(markPayoutRequestPaid(request.id, 'FT2')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT2')).rejects.toMatchObject({ statusCode: 400 });
     expect(await getOrganizerBalance(ORG)).toMatchObject({ paidOut: 400 });
   });
 
   it('refuses to approve a request twice', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await approvePayoutRequest(request.id);
+    await approvePayoutRequest(request.id, ADMIN);
 
-    await expect(approvePayoutRequest(request.id)).rejects.toMatchObject({ statusCode: 400 });
+    await expect(approvePayoutRequest(request.id, ADMIN)).rejects.toMatchObject({ statusCode: 400 });
   });
 
   it('RELEASES the amount back to the balance when a request is rejected', async () => {
@@ -345,7 +348,7 @@ describe('admin fulfilment — approve, pay, reject', () => {
     const request = await createPayoutRequest(ORG, 400);
     expect(await getOrganizerBalance(ORG)).toMatchObject({ availableBalance: 600 });
 
-    await rejectPayoutRequest(request.id, 'Account details did not match');
+    await rejectPayoutRequest(request.id, ADMIN, 'Account details did not match');
 
     expect(await getOrganizerBalance(ORG)).toMatchObject({
       reserved: 0,
@@ -357,14 +360,46 @@ describe('admin fulfilment — approve, pay, reject', () => {
   it('can reject a request that was approved but never paid', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await approvePayoutRequest(request.id);
+    await approvePayoutRequest(request.id, ADMIN);
 
-    await expect(rejectPayoutRequest(request.id)).resolves.toMatchObject({ status: 'rejected' });
+    await expect(rejectPayoutRequest(request.id, ADMIN)).resolves.toMatchObject({ status: 'rejected' });
     expect(await getOrganizerBalance(ORG)).toMatchObject({ availableBalance: 1000 });
   });
 
   it('404s on an unknown payout request', async () => {
-    await expect(approvePayoutRequest('nope')).rejects.toMatchObject({ statusCode: 404 } as Partial<ApiError>);
+    await expect(approvePayoutRequest('nope', ADMIN)).rejects.toMatchObject({ statusCode: 404 } as Partial<ApiError>);
+  });
+});
+
+describe('payout request audit trail — WHO changed the status and WHEN', () => {
+  it('stamps reviewedByAdminId/reviewedAt on approve', async () => {
+    wireSales(1000);
+    const request = await createPayoutRequest(ORG, 400);
+
+    const approved = await approvePayoutRequest(request.id, 'admin-alice');
+
+    expect(approved).toMatchObject({ reviewedByAdminId: 'admin-alice' });
+    expect(approved.reviewedAt).toBeInstanceOf(Date);
+  });
+
+  it('stamps reviewedByAdminId/reviewedAt on reject', async () => {
+    wireSales(1000);
+    const request = await createPayoutRequest(ORG, 400);
+
+    const rejected = await rejectPayoutRequest(request.id, 'admin-bob', 'Bad account details');
+
+    expect(rejected).toMatchObject({ reviewedByAdminId: 'admin-bob' });
+    expect(rejected.reviewedAt).toBeInstanceOf(Date);
+  });
+
+  it('overwrites the reviewer on each transition — the paying admin need not be the approving admin', async () => {
+    wireSales(1000);
+    const request = await createPayoutRequest(ORG, 400);
+
+    await approvePayoutRequest(request.id, 'admin-alice');
+    const paid = await markPayoutRequestPaid(request.id, 'admin-carol', 'FT1');
+
+    expect(paid.reviewedByAdminId).toBe('admin-carol');
   });
 });
 
@@ -373,19 +408,20 @@ describe('updatePayoutRequestStatus — the admin PATCH entry point', () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
 
-    await updatePayoutRequestStatus(request.id, 'approved', { adminNote: 'Cleared' });
+    await updatePayoutRequestStatus(request.id, 'approved', ADMIN, { adminNote: 'Cleared' });
     expect(store[0].status).toBe('approved');
+    expect(store[0].reviewedByAdminId).toBe(ADMIN);
 
-    await updatePayoutRequestStatus(request.id, 'paid', { reference: 'FT99' });
-    expect(store[0]).toMatchObject({ status: 'paid', reference: 'FT99' });
+    await updatePayoutRequestStatus(request.id, 'paid', ADMIN, { reference: 'FT99' });
+    expect(store[0]).toMatchObject({ status: 'paid', reference: 'FT99', reviewedByAdminId: ADMIN });
   });
 
   it('rejects a paid transition with no reference', async () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
-    await updatePayoutRequestStatus(request.id, 'approved');
+    await updatePayoutRequestStatus(request.id, 'approved', ADMIN);
 
-    await expect(updatePayoutRequestStatus(request.id, 'paid', {})).rejects.toMatchObject({
+    await expect(updatePayoutRequestStatus(request.id, 'paid', ADMIN, {})).rejects.toMatchObject({
       statusCode: 400,
     });
   });
@@ -395,7 +431,7 @@ describe('updatePayoutRequestStatus — the admin PATCH entry point', () => {
     const request = await createPayoutRequest(ORG, 400);
 
     await expect(
-      updatePayoutRequestStatus(request.id, 'settled' as any, {})
+      updatePayoutRequestStatus(request.id, 'settled' as any, ADMIN, {})
     ).rejects.toMatchObject({ statusCode: 400 });
   });
 });
@@ -460,18 +496,22 @@ describe('listPayoutRequests — admin listing', () => {
 
 describe('setPayoutApprovalStatus — admin review gate', () => {
   it('rejects an unknown status without touching the database', async () => {
-    await expect(setPayoutApprovalStatus(ORG, 'trusted')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(setPayoutApprovalStatus(ORG, 'trusted', ADMIN)).rejects.toMatchObject({ statusCode: 400 });
     expect(prismaMock.user.update).not.toHaveBeenCalled();
   });
 
   it.each(['unreviewed', 'approved', 'rejected'])('accepts %s and scopes the update to organizers', async (status) => {
     prismaMock.user.update.mockResolvedValue({ id: ORG, payoutApprovalStatus: status } as any);
 
-    await expect(setPayoutApprovalStatus(ORG, status)).resolves.toMatchObject({ payoutApprovalStatus: status });
+    await expect(setPayoutApprovalStatus(ORG, status, ADMIN)).resolves.toMatchObject({ payoutApprovalStatus: status });
     expect(prismaMock.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: ORG, role: 'organizer' },
-        data: { payoutApprovalStatus: status },
+        data: {
+          payoutApprovalStatus: status,
+          payoutApprovalReviewedByAdminId: ADMIN,
+          payoutApprovalReviewedAt: expect.any(Date),
+        },
       })
     );
   });
@@ -481,6 +521,20 @@ describe('setPayoutApprovalStatus — admin review gate', () => {
     notFound.code = 'P2025';
     prismaMock.user.update.mockRejectedValue(notFound);
 
-    await expect(setPayoutApprovalStatus('nope', 'approved')).rejects.toMatchObject({ statusCode: 404 });
+    await expect(setPayoutApprovalStatus('nope', 'approved', ADMIN)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it('records WHICH admin reviewed and WHEN — different admins land distinct audit trails', async () => {
+    prismaMock.user.update.mockResolvedValue({ id: ORG, payoutApprovalStatus: 'approved' } as any);
+    await setPayoutApprovalStatus(ORG, 'approved', 'admin-alice');
+    expect(prismaMock.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ payoutApprovalReviewedByAdminId: 'admin-alice' }) })
+    );
+
+    prismaMock.user.update.mockResolvedValue({ id: ORG, payoutApprovalStatus: 'rejected' } as any);
+    await setPayoutApprovalStatus(ORG, 'rejected', 'admin-bob');
+    expect(prismaMock.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ payoutApprovalReviewedByAdminId: 'admin-bob' }) })
+    );
   });
 });

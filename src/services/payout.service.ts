@@ -227,6 +227,7 @@ export const listPayoutRequests = async (status?: string) => {
           ...PAYOUT_METHOD_SELECT,
         },
       },
+      reviewedByAdmin: { select: { id: true, name: true } },
     },
   });
 };
@@ -238,8 +239,12 @@ const VALID_PAYOUT_APPROVAL_STATUSES = ['unreviewed', 'approved', 'rejected'];
  * {@link createPayoutRequest} checks, independent of phone-OTP `isVerified`.
  * Route-level `authorize(ADMIN)` is what restricts access; this function does
  * not re-check the role (mirrors listPayoutRequests's convention).
+ *
+ * `adminId` is the authenticated admin making the call (from `req.user.id`)
+ * — recorded alongside the transition so a fraud-review decision on real
+ * money movement is always traceable to a specific admin and timestamp.
  */
-export const setPayoutApprovalStatus = async (organizerId: string, status: string) => {
+export const setPayoutApprovalStatus = async (organizerId: string, status: string, adminId: string) => {
   if (!VALID_PAYOUT_APPROVAL_STATUSES.includes(status)) {
     throw new ApiError('payoutApprovalStatus must be unreviewed, approved or rejected', 400);
   }
@@ -247,7 +252,11 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
   try {
     return await prisma.user.update({
       where: { id: organizerId, role: 'organizer' },
-      data: { payoutApprovalStatus: status as any },
+      data: {
+        payoutApprovalStatus: status as any,
+        payoutApprovalReviewedByAdminId: adminId,
+        payoutApprovalReviewedAt: new Date(),
+      },
       select: {
         id: true,
         name: true,
@@ -256,6 +265,9 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
         role: true,
         companyName: true,
         payoutApprovalStatus: true,
+        payoutApprovalReviewedByAdminId: true,
+        payoutApprovalReviewedAt: true,
+        payoutApprovalReviewedBy: { select: { id: true, name: true } },
       },
     });
   } catch (error: any) {
@@ -283,24 +295,34 @@ const loadForTransition = async (id: string, allowedFrom: string[]) => {
 
 /** Admin: approve a requested payout — cleared to pay, money has NOT moved yet.
  *  Stays reserved against the balance, so approving changes nothing the
- *  organizer can withdraw. */
-export const approvePayoutRequest = async (id: string, adminNote?: string) => {
+ *  organizer can withdraw. `adminId` (the authenticated admin) is recorded as
+ *  the reviewer for compliance traceability. */
+export const approvePayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
   await loadForTransition(id, ['pending']);
   const now = new Date();
   return prisma.payoutRequest.update({
     where: { id },
-    data: { status: 'approved', approvedAt: now, processedAt: now, adminNote },
+    data: {
+      status: 'approved',
+      approvedAt: now,
+      processedAt: now,
+      adminNote,
+      reviewedByAdminId: adminId,
+      reviewedAt: now,
+    },
   });
 };
 
 /** Admin: reject a payout request, releasing its amount back to the
  *  organizer's available balance. Allowed while approved too — nothing has
- *  moved until it is marked paid. */
-export const rejectPayoutRequest = async (id: string, adminNote?: string) => {
+ *  moved until it is marked paid. `adminId` (the authenticated admin) is
+ *  recorded as the reviewer for compliance traceability. */
+export const rejectPayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
   await loadForTransition(id, ['pending', 'approved']);
+  const now = new Date();
   return prisma.payoutRequest.update({
     where: { id },
-    data: { status: 'rejected', processedAt: new Date(), adminNote },
+    data: { status: 'rejected', processedAt: now, adminNote, reviewedByAdminId: adminId, reviewedAt: now },
   });
 };
 
@@ -311,10 +333,12 @@ export const rejectPayoutRequest = async (id: string, adminNote?: string) => {
  * happens out of band and the admin supplies its reference, tomorrow this
  * function calls /v1/payouts and records the reference it returns. Either way
  * `reference` is mandatory — an untraceable settled payout cannot be
- * reconciled against the platform's own account.
+ * reconciled against the platform's own account. `adminId` (the authenticated
+ * admin) is recorded as the reviewer for compliance traceability.
  */
 export const markPayoutRequestPaid = async (
   id: string,
+  adminId: string,
   reference: string,
   adminNote?: string
 ) => {
@@ -331,6 +355,8 @@ export const markPayoutRequestPaid = async (
       processedAt: now,
       reference: reference.trim(),
       adminNote,
+      reviewedByAdminId: adminId,
+      reviewedAt: now,
     },
   });
 };
@@ -340,19 +366,22 @@ export interface PayoutStatusUpdate {
   reference?: string;
 }
 
-/** Admin: single entry point behind PATCH /organizers/admin/payout-requests/:id. */
+/** Admin: single entry point behind PATCH /organizers/admin/payout-requests/:id.
+ *  `adminId` (the authenticated admin from `req.user.id`) is threaded through
+ *  to every transition so it lands in `reviewedByAdminId`/`reviewedAt`. */
 export const updatePayoutRequestStatus = async (
   id: string,
   status: 'approved' | 'paid' | 'rejected',
+  adminId: string,
   { adminNote, reference }: PayoutStatusUpdate = {}
 ) => {
   switch (status) {
     case 'approved':
-      return approvePayoutRequest(id, adminNote);
+      return approvePayoutRequest(id, adminId, adminNote);
     case 'rejected':
-      return rejectPayoutRequest(id, adminNote);
+      return rejectPayoutRequest(id, adminId, adminNote);
     case 'paid':
-      return markPayoutRequestPaid(id, reference ?? '', adminNote);
+      return markPayoutRequestPaid(id, adminId, reference ?? '', adminNote);
     default:
       throw new ApiError('Status must be approved, paid or rejected', 400);
   }
