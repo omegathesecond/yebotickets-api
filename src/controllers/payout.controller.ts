@@ -94,3 +94,20 @@ export const updatePayoutRequestController = async (req: Request, res: Response,
     next(error);
   }
 };
+
+/**
+ * PATCH /api/organizers/admin/organizers/:id/payout-approval — admin sets an
+ * organizer's payout-approval review status. Separate from `PUT
+ * /organizers/:id/status` (which only toggles the auto-set phone-OTP
+ * `isVerified` flag) — this is the gate `createPayoutRequest` actually checks.
+ */
+export const updateOrganizerPayoutApprovalController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { payoutApprovalStatus } = req.body;
+    const data = await payoutService.setPayoutApprovalStatus(id, payoutApprovalStatus);
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+};

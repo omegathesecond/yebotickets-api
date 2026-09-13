@@ -277,6 +277,7 @@ export const getOrganizersController = async (req: Request, res: Response, next:
         email: true,
         role: true,
         isVerified: true,
+        payoutApprovalStatus: true,
         companyName: true,
         companyDescription: true,
         website: true,
@@ -284,7 +285,7 @@ export const getOrganizersController = async (req: Request, res: Response, next:
         updatedAt: true,
       },
     });
-    
+
     res.status(200).json({
       success: true,
       count: organizers.length,

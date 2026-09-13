@@ -16,6 +16,7 @@ import {
   markPayoutRequestPaid,
   updatePayoutRequestStatus,
   getOrganizerBalance,
+  setPayoutApprovalStatus,
 } from '../payout.service';
 import { ApiError } from '../../middleware/error.middleware';
 
@@ -36,6 +37,10 @@ const BANK_METHOD = {
   payoutBankBranch: 'Mbabane',
   payoutMobileProvider: null,
   payoutMobileNumber: null,
+  // Default every test to an already-reviewed organizer, matching the
+  // migration's backfill of pre-existing organizers — tests that care about
+  // the unreviewed/rejected gate override this explicitly.
+  payoutApprovalStatus: 'approved' as const,
 };
 
 /**
@@ -157,6 +162,29 @@ describe('createPayoutRequest — guarding the balance', () => {
     wireMethod({ ...BANK_METHOD, payoutMethod: null });
 
     await expect(createPayoutRequest(ORG, 100)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('BLOCKS a payout request when the organizer is unreviewed', async () => {
+    wireSales(1000);
+    wireMethod({ ...BANK_METHOD, payoutApprovalStatus: 'unreviewed' });
+
+    await expect(createPayoutRequest(ORG, 100)).rejects.toMatchObject({ statusCode: 403 });
+    expect(store).toHaveLength(0);
+  });
+
+  it('BLOCKS a payout request when the organizer was rejected on review', async () => {
+    wireSales(1000);
+    wireMethod({ ...BANK_METHOD, payoutApprovalStatus: 'rejected' });
+
+    await expect(createPayoutRequest(ORG, 100)).rejects.toMatchObject({ statusCode: 403 });
+    expect(store).toHaveLength(0);
+  });
+
+  it('allows a payout request once the organizer is approved', async () => {
+    wireSales(1000);
+    wireMethod({ ...BANK_METHOD, payoutApprovalStatus: 'approved' });
+
+    await expect(createPayoutRequest(ORG, 100)).resolves.toMatchObject({ amount: 100 });
   });
 
   it('rejects a non-positive amount', async () => {
@@ -427,5 +455,32 @@ describe('listPayoutRequests — admin listing', () => {
     expect(prismaMock.payoutRequest.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: undefined })
     );
+  });
+});
+
+describe('setPayoutApprovalStatus — admin review gate', () => {
+  it('rejects an unknown status without touching the database', async () => {
+    await expect(setPayoutApprovalStatus(ORG, 'trusted')).rejects.toMatchObject({ statusCode: 400 });
+    expect(prismaMock.user.update).not.toHaveBeenCalled();
+  });
+
+  it.each(['unreviewed', 'approved', 'rejected'])('accepts %s and scopes the update to organizers', async (status) => {
+    prismaMock.user.update.mockResolvedValue({ id: ORG, payoutApprovalStatus: status } as any);
+
+    await expect(setPayoutApprovalStatus(ORG, status)).resolves.toMatchObject({ payoutApprovalStatus: status });
+    expect(prismaMock.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: ORG, role: 'organizer' },
+        data: { payoutApprovalStatus: status },
+      })
+    );
+  });
+
+  it('404s on an unknown organizer', async () => {
+    const notFound: any = new Error('no record');
+    notFound.code = 'P2025';
+    prismaMock.user.update.mockRejectedValue(notFound);
+
+    await expect(setPayoutApprovalStatus('nope', 'approved')).rejects.toMatchObject({ statusCode: 404 });
   });
 });

@@ -36,3 +36,9 @@ export const payoutRequestStatusValidator = [
     .notEmpty()
     .withMessage('reference is required when marking a payout paid'),
 ];
+
+export const organizerPayoutApprovalValidator = [
+  body('payoutApprovalStatus')
+    .isIn(['unreviewed', 'approved', 'rejected'])
+    .withMessage('payoutApprovalStatus must be unreviewed, approved or rejected'),
+];

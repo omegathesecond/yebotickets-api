@@ -100,12 +100,14 @@ import {
   createPayoutRequestController,
   getPayoutRequestsController,
   listPayoutRequestsController,
-  updatePayoutRequestController
+  updatePayoutRequestController,
+  updateOrganizerPayoutApprovalController
 } from '../controllers/payout.controller';
 import {
   payoutMethodValidator,
   createPayoutRequestValidator,
-  payoutRequestStatusValidator
+  payoutRequestStatusValidator,
+  organizerPayoutApprovalValidator
 } from '../validators/payout.validator';
 
 const router = express.Router();
@@ -321,6 +323,51 @@ router.patch(
   authorize(UserRole.ADMIN),
   validate(payoutRequestStatusValidator),
   updatePayoutRequestController
+);
+
+/**
+ * @swagger
+ * /organizers/admin/organizers/{id}/payout-approval:
+ *   patch:
+ *     summary: Set an organizer's payout-approval review status (Admin only)
+ *     description: >
+ *       Separate from PUT /organizers/{id}/status (which only toggles the
+ *       auto-set phone-OTP isVerified flag) — this is the gate
+ *       createPayoutRequest actually checks before an organizer may withdraw.
+ *     tags: [Organizers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - payoutApprovalStatus
+ *             properties:
+ *               payoutApprovalStatus:
+ *                 type: string
+ *                 enum: [unreviewed, approved, rejected]
+ *     responses:
+ *       200:
+ *         description: Organizer payout-approval status updated
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Organizer not found
+ */
+router.patch(
+  '/admin/organizers/:id/payout-approval',
+  authorize(UserRole.ADMIN),
+  validate(organizerPayoutApprovalValidator),
+  updateOrganizerPayoutApprovalController
 );
 
 // Routes accessible by both admin and organizer
