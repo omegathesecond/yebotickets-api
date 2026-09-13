@@ -60,6 +60,7 @@ import {
   handleChargeWebhookEvent,
   reclaimExpiredReservations,
   getEventTicketsForCheckIn,
+  getTicketTypes,
 } from '../ticket.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
@@ -1245,5 +1246,49 @@ describe('getEventTicketsForCheckIn (offline scanner pre-sync)', () => {
 
     await expect(getEventTicketsForCheckIn('nope', requester)).rejects.toThrow('Event not found');
     expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('getTicketTypes (buyer-facing availability)', () => {
+  it('attaches availableQuantity computed from status:available, unowned tickets — not the original capacity', async () => {
+    prismaMock.ticketType.findMany.mockResolvedValue([
+      buildTicketType({ id: 'tt-1', quantity: 50 }),
+      buildTicketType({ id: 'tt-2', quantity: 20 }),
+    ] as any);
+    // tt-1 has 3 available rows left out of its original 50; tt-2 is sold out
+    // entirely (no groupBy row at all — must default to 0, not undefined).
+    (prismaMock.ticket.groupBy as jest.Mock).mockResolvedValue([
+      { ticketTypeId: 'tt-1', _count: { _all: 3 } },
+    ]);
+
+    const result = await getTicketTypes('event-1');
+
+    expect(prismaMock.ticket.groupBy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        by: ['ticketTypeId'],
+        where: expect.objectContaining({
+          ticketTypeId: { in: ['tt-1', 'tt-2'] },
+          status: 'available',
+          userId: null,
+        }),
+      })
+    );
+
+    const tt1 = result.find((tt) => tt.id === 'tt-1');
+    const tt2 = result.find((tt) => tt.id === 'tt-2');
+    // The organizer's original capacity is untouched...
+    expect(tt1?.quantity).toBe(50);
+    // ...but availableQuantity reflects what a purchase attempt would actually find.
+    expect(tt1?.availableQuantity).toBe(3);
+    expect(tt2?.availableQuantity).toBe(0);
+  });
+
+  it('returns an empty list without querying ticket availability when the event has no ticket types', async () => {
+    prismaMock.ticketType.findMany.mockResolvedValue([] as any);
+
+    const result = await getTicketTypes('event-1');
+
+    expect(result).toEqual([]);
+    expect(prismaMock.ticket.groupBy).not.toHaveBeenCalled();
   });
 });
