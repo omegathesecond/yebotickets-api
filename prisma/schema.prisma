@@ -43,6 +43,18 @@ enum PayoutRequestStatus {
   rejected
 }
 
+// Platform-staff identity review gating money movement — deliberately
+// SEPARATE from User.isVerified (which only means "confirmed their phone via
+// OTP" and is set automatically, with zero human review, the moment that OTP
+// check passes). createPayoutRequest requires `approved` here before an
+// organizer may withdraw real money; isVerified alone is not evidence anyone
+// looked at who they are.
+enum PayoutApprovalStatus {
+  unreviewed
+  approved
+  rejected
+}
+
 model User {
   id          String   @id @default(uuid())
   name        String
@@ -101,6 +113,11 @@ model User {
   payoutBankBranch         String?
   payoutMobileProvider     String?
   payoutMobileNumber       String?
+
+  // Staff review gate in front of createPayoutRequest — see the enum comment.
+  // Defaults `unreviewed` for new signups; existing organizers are backfilled
+  // to `approved` in this field's migration so they are not locked out.
+  payoutApprovalStatus PayoutApprovalStatus @default(unreviewed)
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

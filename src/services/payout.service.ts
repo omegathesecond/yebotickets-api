@@ -36,6 +36,7 @@ const PAYOUT_METHOD_SELECT = {
   payoutBankBranch: true,
   payoutMobileProvider: true,
   payoutMobileNumber: true,
+  payoutApprovalStatus: true,
 } as const;
 
 /** Postgres unique-violation. Raised by the partial unique index that allows at
@@ -139,6 +140,14 @@ export const createPayoutRequest = async (organizerId: string, amount: number) =
   }
 
   const method = await getPayoutMethod(organizerId);
+
+  // Staff review gate — deliberately independent of User.isVerified, which is
+  // set automatically by phone-OTP with no human review. See the schema
+  // comment on PayoutApprovalStatus.
+  if (method.payoutApprovalStatus !== 'approved') {
+    throw new ApiError('Your organizer account is pending approval before you can request a payout', 403);
+  }
+
   if (!method.payoutMethod) {
     throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
   }
@@ -220,6 +229,41 @@ export const listPayoutRequests = async (status?: string) => {
       },
     },
   });
+};
+
+const VALID_PAYOUT_APPROVAL_STATUSES = ['unreviewed', 'approved', 'rejected'];
+
+/**
+ * Admin: set an organizer's payout-approval review status — the gate
+ * {@link createPayoutRequest} checks, independent of phone-OTP `isVerified`.
+ * Route-level `authorize(ADMIN)` is what restricts access; this function does
+ * not re-check the role (mirrors listPayoutRequests's convention).
+ */
+export const setPayoutApprovalStatus = async (organizerId: string, status: string) => {
+  if (!VALID_PAYOUT_APPROVAL_STATUSES.includes(status)) {
+    throw new ApiError('payoutApprovalStatus must be unreviewed, approved or rejected', 400);
+  }
+
+  try {
+    return await prisma.user.update({
+      where: { id: organizerId, role: 'organizer' },
+      data: { payoutApprovalStatus: status as any },
+      select: {
+        id: true,
+        name: true,
+        phoneNumber: true,
+        email: true,
+        role: true,
+        companyName: true,
+        payoutApprovalStatus: true,
+      },
+    });
+  } catch (error: any) {
+    if (error?.code === 'P2025') {
+      throw new ApiError('Organizer not found', 404);
+    }
+    throw error;
+  }
 };
 
 /** Load a request for an admin transition, asserting the transition is legal. */

@@ -120,6 +120,52 @@ describe('PATCH /organizers/admin/payout-requests/:id — admin-only', () => {
   });
 });
 
+describe('PATCH /organizers/admin/organizers/:id/payout-approval — admin-only', () => {
+  const body = JSON.stringify({ payoutApprovalStatus: 'approved' });
+  const headers = { 'content-type': 'application/json' };
+
+  it('rejects an unauthenticated caller with 403', async () => {
+    const res = await fetch(`${baseUrl}/organizers/admin/organizers/org-1/payout-approval`, {
+      method: 'PATCH',
+      headers,
+      body,
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects a non-admin organizer with 403', async () => {
+    const res = await fetch(`${baseUrl}/organizers/admin/organizers/org-1/payout-approval`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'organizer' },
+      body,
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('lets an admin through to the handler (404 for a missing organizer, not 403)', async () => {
+    const notFound: any = new Error('no record');
+    notFound.code = 'P2025';
+    prismaMock.user.update.mockRejectedValue(notFound);
+
+    const res = await fetch(`${baseUrl}/organizers/admin/organizers/org-1/payout-approval`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body,
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects an unknown payoutApprovalStatus at validation', async () => {
+    const res = await fetch(`${baseUrl}/organizers/admin/organizers/org-1/payout-approval`, {
+      method: 'PATCH',
+      headers: { ...headers, 'x-test-role': 'admin' },
+      body: JSON.stringify({ payoutApprovalStatus: 'trusted' }),
+    });
+    expect(res.status).toBe(400);
+    expect(prismaMock.user.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('GET /organizers/payout-requests — organizer/admin self-service, not admin-only', () => {
   it('allows an organizer through (own history)', async () => {
     prismaMock.payoutRequest.findMany.mockResolvedValue([] as any);
