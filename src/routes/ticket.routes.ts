@@ -27,6 +27,7 @@ import {
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
+import { purchaseTicketLimiter, refundLimiter } from '../middleware/rateLimit.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
@@ -211,6 +212,7 @@ router.get('/payment-options', protect, getPaymentOptionsController);
 router.post(
   '/purchase/:ticketTypeId',
   protect,
+  purchaseTicketLimiter,
   validate(purchaseTicketValidator),
   purchaseTicketController
 );
@@ -758,6 +760,7 @@ router.post(
   '/refund/:ticketId',
   protect,
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  refundLimiter,
   validate(refundTicketValidator),
   refundTicketController
 );
@@ -798,6 +801,7 @@ router.post(
   '/events/:eventId/cancel',
   protect,
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  refundLimiter,
   validate(cancelEventValidator),
   cancelEventController
 );
