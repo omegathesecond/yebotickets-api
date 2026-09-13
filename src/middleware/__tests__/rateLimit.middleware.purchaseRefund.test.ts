@@ -1,6 +1,8 @@
 import express from 'express';
 import http from 'http';
 import type { AddressInfo } from 'net';
+import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
+import { AuthenticatedRequest } from '../../types/auth';
 import { purchaseTicketLimiter, refundLimiter } from '../rateLimit.middleware';
 
 /**
@@ -68,7 +70,7 @@ describe('purchaseTicketLimiter', () => {
 });
 
 describe('refundLimiter', () => {
-  it('allows 10 requests per organizer per window, then returns 429, and resets after the window', async () => {
+  it('allows 10 requests per organizer per window, then returns 429', async () => {
     const userId = 'organizer-refund-1';
     const { server, baseUrl } = await startLimitedServer(refundLimiter, userId);
     try {
@@ -79,13 +81,45 @@ describe('refundLimiter', () => {
       }
       expect(statuses.slice(0, 10).every((s) => s === 200)).toBe(true);
       expect(statuses[10]).toBe(429);
+    } finally {
+      await stopServer(server);
+    }
+  });
 
-      // Simulate the 5-minute window elapsing (the limiter's keyGenerator is
-      // just the user id, so resetKey(userId) clears that client's bucket
-      // exactly as the store would once windowMs has passed -- avoids
-      // actually waiting 5 real minutes or faking global timers around a
-      // live http server/fetch, which would risk destabilizing the test).
-      await refundLimiter.resetKey(userId);
+  it('resets after windowMs elapses, without relying on resetKey', async () => {
+    // Same shape/keying as refundLimiter (see rateLimit.middleware.ts) but with
+    // a short windowMs so the test can wait out real expiry instead of using
+    // the resetKey() escape hatch -- this proves the store naturally expires
+    // entries after windowMs, not just that resetKey() clears a bucket.
+    const WINDOW_MS = 200;
+    const userIdKey = (req: express.Request): string => {
+      const userId = (req as AuthenticatedRequest).user?.id;
+      return userId ?? ipKeyGenerator(req.ip ?? '');
+    };
+    const shortWindowLimiter = rateLimit({
+      windowMs: WINDOW_MS,
+      max: 10,
+      keyGenerator: userIdKey,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: {
+        success: false,
+        message: 'Too many refund/cancellation attempts. Please wait a few minutes and try again.',
+      },
+    });
+
+    const userId = 'organizer-refund-short-window';
+    const { server, baseUrl } = await startLimitedServer(shortWindowLimiter, userId);
+    try {
+      for (let i = 0; i < 10; i++) {
+        await fetch(`${baseUrl}/test`, { method: 'POST' });
+      }
+      const blocked = await fetch(`${baseUrl}/test`, { method: 'POST' });
+      expect(blocked.status).toBe(429);
+
+      // Wait past windowMs (with margin) so the store's own expiry -- not
+      // resetKey() -- is what unblocks the next request.
+      await new Promise((resolve) => setTimeout(resolve, WINDOW_MS + 100));
 
       const afterWindow = await fetch(`${baseUrl}/test`, { method: 'POST' });
       expect(afterWindow.status).toBe(200);
