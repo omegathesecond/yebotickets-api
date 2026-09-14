@@ -1756,7 +1756,13 @@ const refundAndCancelTicket = async (
   if (!paid) {
     const claimed = await prisma.ticket.updateMany({
       where: { id: ticket.id, status: { not: 'cancelled' } },
-      data: { status: 'cancelled', cancelledAt: new Date() },
+      data: {
+        status: 'cancelled',
+        cancelledAt: new Date(),
+        // Clear any pending buyer refund request — it's now handled.
+        refundRequestedAt: null,
+        refundRequestReason: null,
+      },
     });
     if (claimed.count === 0) {
       return { ...base, result: 'already_handled', notified: false };
@@ -1807,6 +1813,9 @@ const refundAndCancelTicket = async (
       refundRef: refund.refundRef,
       refundedAt: new Date(),
       cancelledAt: new Date(),
+      // Clear any pending buyer refund request — it's now handled.
+      refundRequestedAt: null,
+      refundRequestReason: null,
     },
   });
   if (claimed.count === 0) {
@@ -1871,6 +1880,124 @@ export const refundTicket = async (
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to refund ticket', 500);
   }
+};
+
+// ===========================================================================
+// Buyer self-service refund REQUEST (intent only — does not move money)
+// ===========================================================================
+
+export interface TicketRefundRequestOutcome {
+  ticketId: string;
+  uniqueCode: string;
+  refundRequestedAt: Date;
+  /** Whether the organizer was notified (a notify failure still records the request). */
+  organizerNotified: boolean;
+  organizerNotifyError?: string;
+}
+
+/** Compose the notice sent to the organizer when a buyer requests a refund. */
+const buildRefundRequestMessage = (ticket: any, reason?: string): string => {
+  const eventTitle = ticket.event?.title ?? 'your event';
+  const buyerName = ticket.user?.name ?? 'A buyer';
+  const lines = [
+    `🔔 ${buyerName} requested a refund for their ticket to ${eventTitle}.`,
+    `🔑 Ticket code: ${ticket.uniqueCode}`,
+  ];
+  if (reason) {
+    lines.push(`📝 Reason: ${reason}`);
+  }
+  lines.push('Review it in your dashboard and issue the refund from there if you approve.');
+  return lines.join('\n');
+};
+
+/**
+ * Buyer self-service: flag intent to refund a SOLD ticket the caller owns.
+ *
+ * Does NOT move money or touch the ticket's status/payment fields — it only
+ * records refundRequestedAt/refundRequestReason and notifies the organizer
+ * (best-effort, per {@link notifyHolderOfCancellation}'s pattern: a notify
+ * failure does not undo the request). The organizer/admin must still act on it
+ * via the existing {@link refundTicket} endpoint, which is the only path that
+ * actually refunds.
+ *
+ * Guards: the ticket must belong to `requester` (403 otherwise — prevents an
+ * IDOR requesting a refund on someone else's ticket), be `sold` (400), and its
+ * event must not already be cancelled (400). A second request while one is
+ * already pending is rejected with 409 — the finalizing write is a guarded
+ * updateMany so two concurrent requests for the same ticket can't both "win".
+ *
+ * @param ticketId Ticket database id
+ * @param requester Authenticated buyer (must be the ticket's owner)
+ * @param reason Optional buyer-supplied reason, forwarded to the organizer
+ */
+export const requestTicketRefund = async (
+  ticketId: string,
+  requester: { id: string },
+  reason?: string
+): Promise<TicketRefundRequestOutcome> => {
+  const ticket = await prisma.ticket.findUnique({
+    where: { id: ticketId },
+    include: {
+      event: {
+        select: {
+          id: true,
+          title: true,
+          isCancelled: true,
+          organizer: { select: { id: true, name: true, phoneNumber: true } },
+        },
+      },
+      user: { select: { id: true, name: true } },
+    },
+  });
+
+  if (!ticket) {
+    throw new ApiError('Ticket not found', 404);
+  }
+  if (ticket.userId !== requester.id) {
+    throw new ApiError('You do not own this ticket', 403);
+  }
+  if (ticket.status !== 'sold') {
+    throw new ApiError('Only a sold ticket can have a refund requested', 400);
+  }
+  if (ticket.event?.isCancelled) {
+    throw new ApiError('This event has already been cancelled', 400);
+  }
+  if (ticket.refundRequestedAt) {
+    throw new ApiError('A refund request is already pending for this ticket', 409);
+  }
+
+  const requestedAt = new Date();
+  const claimed = await prisma.ticket.updateMany({
+    where: { id: ticketId, refundRequestedAt: null },
+    data: { refundRequestedAt: requestedAt, refundRequestReason: reason ?? null },
+  });
+  if (claimed.count === 0) {
+    // A concurrent request for the same ticket won the race.
+    throw new ApiError('A refund request is already pending for this ticket', 409);
+  }
+
+  let organizerNotified = false;
+  let organizerNotifyError: string | undefined;
+  const organizerPhone = ticket.event?.organizer?.phoneNumber;
+  if (organizerPhone) {
+    try {
+      await sendTextMessage(organizerPhone, buildRefundRequestMessage(ticket, reason));
+      organizerNotified = true;
+    } catch (error) {
+      console.error('Failed to notify organizer of refund request:', ticketId, error);
+      organizerNotifyError = errorMessage(error);
+    }
+  } else {
+    organizerNotifyError = 'Organizer has no phone number on file';
+  }
+
+  return {
+    ticketId,
+    uniqueCode: ticket.uniqueCode,
+    refundRequestedAt: requestedAt,
+    organizerNotified,
+    organizerNotifyError,
+  };
 };
 
 /**

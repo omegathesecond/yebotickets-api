@@ -13,6 +13,7 @@ import {
   confirmCheckIn,
   getEventTicketsForCheckIn,
   refundTicket,
+  requestTicketRefund,
   cancelEvent,
   PurchasePaymentInput
 } from '../services/ticket.service';
@@ -340,6 +341,34 @@ export const refundTicketController = async (req: Request, res: Response, next: 
     );
 
     res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Buyer self-service: flag intent to refund a ticket THEY OWN. Does not refund
+ * anything itself — it records the request and notifies the organizer, who
+ * still acts on it via the existing organizer/admin refund endpoint. Rejects
+ * with 409 if a request is already pending for this ticket.
+ * POST /api/tickets/:ticketId/refund-request  body: { reason? }
+ */
+export const requestTicketRefundController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user || !authReq.user.id) {
+      return next(new ApiError('User not authenticated', 401));
+    }
+
+    const { ticketId } = req.params;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+
+    const result = await requestTicketRefund(ticketId, { id: authReq.user.id }, reason);
+
+    res.status(201).json({
       success: true,
       data: result,
     });

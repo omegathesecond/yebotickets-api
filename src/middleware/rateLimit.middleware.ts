@@ -131,3 +131,23 @@ export const refundLimiter = rateLimit({
     message: 'Too many refund/cancellation attempts. Please wait a few minutes and try again.',
   },
 });
+
+/**
+ * Throttle buyer self-service refund REQUESTS: max 10 per authenticated buyer
+ * per 5 minutes. Each call sends a WhatsApp notification to the organizer via
+ * YeboLink, so — same reasoning as `purchaseTicketLimiter` — this caps both the
+ * comms cost and the "spam an organizer" abuse vector. Requesting the same
+ * ticket twice is already rejected with 409 by the service, so this only bites
+ * a caller hammering distinct tickets/events.
+ */
+export const refundRequestLimiter = rateLimit({
+  windowMs: FIVE_MINUTES_MS,
+  max: 10,
+  keyGenerator: userIdKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many refund requests. Please wait a few minutes and try again.',
+  },
+});
