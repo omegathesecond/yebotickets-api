@@ -142,6 +142,24 @@ export const createTicketType = async (
 };
 
 /**
+ * Count still-purchasable tickets per ticket type — the same `status:
+ * 'available', userId: null` shape `claimAvailableTickets`/its
+ * `availableRemaining` fallback use, so what a buyer sees here always agrees
+ * with what a purchase attempt will actually find. `quantity` on TicketType is
+ * the organizer's original capacity and never shrinks as tickets sell, so it
+ * cannot be used to tell a buyer whether anything is left.
+ */
+const getAvailableQuantities = async (ticketTypeIds: string[]): Promise<Map<string, number>> => {
+  if (ticketTypeIds.length === 0) return new Map();
+  const counts = await prisma.ticket.groupBy({
+    by: ['ticketTypeId'],
+    where: { ticketTypeId: { in: ticketTypeIds }, status: 'available', userId: null },
+    _count: { _all: true },
+  });
+  return new Map(counts.map(c => [c.ticketTypeId, c._count._all]));
+};
+
+/**
  * Get all ticket types for an event
  * @param eventId Event ID
  * @returns List of ticket types
@@ -151,9 +169,11 @@ export const getTicketTypes = async (eventId: string) => {
     const ticketTypes = await prisma.ticketType.findMany({
       where: { eventId },
     });
+    const availableQuantities = await getAvailableQuantities(ticketTypes.map(tt => tt.id));
     return ticketTypes.map(tt => ({
       ...tt,
       type: mapTicketType(tt.type),
+      availableQuantity: availableQuantities.get(tt.id) ?? 0,
     }));
   } catch (error) {
     console.error('Error in getTicketTypes service:', error);
