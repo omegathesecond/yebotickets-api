@@ -1,6 +1,8 @@
 # Deploy path: GitHub push to `main` -> Cloud Build trigger `yebotickets-api-prod`
-# (id 04122141-7676-462e-9c1f-c6fcd142a405) -> this file -> Cloud Run
-# yebotickets-api-prod. `dev` -> trigger `yebotickets-api-dev` -> yebotickets-api-dev.
+# (id 5fb2c161-6583-4417-82a2-d9521a6e9cd2, region europe-west1) -> this file
+# -> Cloud Run yebotickets-api-prod. `dev` -> trigger `yebotickets-api-dev`
+# (id 48b75f9e-4186-4730-9792-68ccf10dd96c, region europe-west1) ->
+# yebotickets-api-dev.
 #
 # 2026-09-07: found this trigger had 0 successful runs since 2026-04-26 (both
 # builds that day failed on the `gcloud run deploy` step, back when this file
@@ -16,6 +18,39 @@
 # stopped delivering — re-verified working here: `gcloud builds triggers run
 # 04122141... --branch=main` built + deployed main HEAD cleanly to
 # yebotickets-api-prod-00007 (IAM, cloudbuild.yaml, secrets all correct).
+#
+# 2026-09-14: prod was broken again — api.yebotickets.com was 404ing on the
+# payment routes because 04122141 (a 1st-gen GitHub-App trigger, matched by
+# stored owner/name string) never fired after GitHub repo
+# omegathesecond/Yebo-tickets-api was renamed to omegathesecond/yebotickets-api
+# (same repo id 943240152). Cloud Build's 1st-gen "repository mapping" cache
+# doesn't follow a GitHub rename and `gcloud builds triggers update github
+# --repo-name=...` / recreating a 1st-gen trigger against the new name both
+# fail with FAILED_PRECONDITION "Repository mapping does not exist" — the
+# console's "Connect Repository" re-sync wizard is interactive-only, no gcloud
+# equivalent. Fixed by moving to a 2nd-gen Cloud Build connection instead
+# (mirrors the yebocars/yeboshops fix for the same GitHub-rename failure mode):
+# `builds connections create github yebotickets-gh` (region europe-west1,
+# reusing the already-authorized GitHub App installation 79785349 +
+# yeboshops-gh-github-oauthtoken-8cff79 secret) -> `builds repositories create
+# yebotickets-api --connection=yebotickets-gh
+# --remote-uri=https://github.com/omegathesecond/yebotickets-api.git` ->
+# recreated both triggers with `--repository=.../connections/yebotickets-gh/
+# repositories/yebotickets-api` in europe-west1, then deleted the dead 1st-gen
+# global triggers (04122141, 219c5f43). Verified live: a real `git push
+# origin main` (not just `triggers run`) fired build 0a016141 via the actual
+# GitHub webhook -> SUCCESS -> yebotickets-api-prod now serves
+# gcr.io/hiyebo/yebotickets-api:<COMMIT_SHA>, and
+# api.yebotickets.com/api/tickets/payment-options + POST /api/payments/webhook
+# both went from 404 to 401. NOTE: the `dev` trigger is now correctly wired
+# the same way (fires + builds + pushes images off a real push to `dev`), but
+# `dev` branch itself still carries an ancient, pre-Prisma cloudbuild.yaml
+# (hardcoded service name `yebotickets-api`, secret `yebotickets-database-url`,
+# destructive --set-secrets) — dev has diverged 54 commits behind / 12 commits
+# ahead of main since a very early MongoDB-era branch point, so the dev Cloud
+# Run deploy step still fails on secret permissions until someone decides how
+# to reconcile dev with main's history (out of scope here — this fix only
+# covers the trigger/repo binding, not dev's stale branch content).
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
