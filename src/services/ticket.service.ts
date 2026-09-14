@@ -149,7 +149,7 @@ export const createTicketType = async (
  * the organizer's original capacity and never shrinks as tickets sell, so it
  * cannot be used to tell a buyer whether anything is left.
  */
-const getAvailableQuantities = async (ticketTypeIds: string[]): Promise<Map<string, number>> => {
+export const getAvailableQuantities = async (ticketTypeIds: string[]): Promise<Map<string, number>> => {
   if (ticketTypeIds.length === 0) return new Map();
   const counts = await prisma.ticket.groupBy({
     by: ['ticketTypeId'],

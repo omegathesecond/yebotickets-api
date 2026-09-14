@@ -141,6 +141,42 @@ describe('getEvents — upcoming-only default', () => {
   });
 });
 
+describe('getEvents — ticket type availability for listing sold-out state', () => {
+  it('stamps each ticket type with a real availableQuantity computed from unsold tickets', async () => {
+    const eventRow = buildEventRow({
+      ticketTypes: [
+        { id: 'tt-1', name: 'General', price: 100, quantity: 50 },
+        { id: 'tt-2', name: 'VIP', price: 300, quantity: 10 },
+      ],
+    });
+    prismaMock.event.findMany.mockResolvedValue([eventRow] as any);
+    prismaMock.ticket.groupBy.mockResolvedValue([
+      { ticketTypeId: 'tt-1', _count: { _all: 3 } },
+    ] as any);
+
+    const { data: [event] } = await getEvents({});
+
+    expect(prismaMock.ticket.groupBy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { ticketTypeId: { in: ['tt-1', 'tt-2'] }, status: 'available', userId: null },
+      })
+    );
+    expect(event.ticketTypes).toEqual([
+      expect.objectContaining({ id: 'tt-1', availableQuantity: 3 }),
+      expect.objectContaining({ id: 'tt-2', availableQuantity: 0 }),
+    ]);
+  });
+
+  it('does not query ticket.groupBy when no event in the page has ticket types', async () => {
+    prismaMock.event.findMany.mockResolvedValue([buildEventRow({ ticketTypes: [] })] as any);
+
+    const { data: [event] } = await getEvents({});
+
+    expect(prismaMock.ticket.groupBy).not.toHaveBeenCalled();
+    expect(event.ticketTypes).toEqual([]);
+  });
+});
+
 describe('adminUnpublishEvent — admin takedown, unscoped by owning organizer', () => {
   it('unpublishes an event owned by a DIFFERENT organizer than the caller (no ownership check in the service; route-level authorize(ADMIN) is the gate)', async () => {
     prismaMock.event.findUnique.mockResolvedValue(
