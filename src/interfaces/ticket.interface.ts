@@ -24,6 +24,8 @@ export interface ITicketType {
   saleEndDate: Date;
   createdAt: Date;
   updatedAt: Date;
+  /** Still-purchasable count (status 'available', unowned) — set on read, never on write. */
+  availableQuantity?: number;
 }
 
 export interface ITicket {
