@@ -2,15 +2,26 @@ import prisma from '../config/prisma';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
+import { getAvailableQuantities } from './ticket.service';
 
 /**
  * Transform Prisma event to API response format.
  * `includeOrganizerEmail` defaults to true so every existing caller (create/
  * update/list) keeps its current shape; getEventById is the only caller that
  * passes false, for viewers who aren't the owning organizer or an admin.
+ * `availableQuantities` (ticketTypeId -> still-purchasable count), when
+ * supplied, is stamped onto each ticket type so callers like getEvents can
+ * report real sold-out state without a per-event N+1 query.
  */
-const transformEvent = (event: any, options: { includeOrganizerEmail?: boolean } = {}) => {
+const transformEvent = (
+  event: any,
+  options: { includeOrganizerEmail?: boolean; availableQuantities?: Map<string, number> } = {}
+) => {
   const includeOrganizerEmail = options.includeOrganizerEmail ?? true;
+  const availableQuantities = options.availableQuantities;
+  const ticketTypes = (event.ticketTypes || []).map((tt: any) =>
+    availableQuantities ? { ...tt, availableQuantity: availableQuantities.get(tt.id) ?? 0 } : tt
+  );
   return {
     id: event.id,
     title: event.title,
@@ -30,7 +41,7 @@ const transformEvent = (event: any, options: { includeOrganizerEmail?: boolean }
     cancelledAt: event.cancelledAt ?? null,
     coverImage: event.coverImage,
     category: event.category,
-    ticketTypes: event.ticketTypes || [],
+    ticketTypes,
     createdAt: event.createdAt,
     updatedAt: event.updatedAt,
   };
@@ -161,6 +172,7 @@ export const getEvents = async (query: Record<string, any> = {}) => {
           organizer: {
             select: { id: true, name: true, email: true },
           },
+          ticketTypes: true,
         },
         orderBy: { startDate: 'asc' },
         skip,
@@ -169,8 +181,13 @@ export const getEvents = async (query: Record<string, any> = {}) => {
       prisma.event.count({ where }),
     ]);
 
+    // One extra query for the whole page (not per-event) so the listing can
+    // show real sold-out state — see getAvailableQuantities' doc comment.
+    const ticketTypeIds = events.flatMap((event) => (event.ticketTypes || []).map((tt) => tt.id));
+    const availableQuantities = await getAvailableQuantities(ticketTypeIds);
+
     return {
-      data: events.map((event) => transformEvent(event)),
+      data: events.map((event) => transformEvent(event, { availableQuantities })),
       total,
       page,
       limit,
