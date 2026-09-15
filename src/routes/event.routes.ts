@@ -18,8 +18,10 @@ import {
   getEventPurchasesController,
   getEventTicketsController,
 } from '../controllers/organizer-event.controller';
+import { uploadEventCoverImageController } from '../controllers/upload.controller';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
+import { uploadEventCoverImageMiddleware } from '../middleware/upload.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
@@ -241,6 +243,61 @@ router.get(
   protect,
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
   getEventTicketsController
+);
+
+/**
+ * @swagger
+ * /api/events/cover-image:
+ *   post:
+ *     summary: Upload an event cover/poster image
+ *     tags: [Events]
+ *     description: >
+ *       Stores the uploaded image in R2 and returns its public CDN URL. Takes
+ *       no event id — the create wizard needs a URL before the event exists,
+ *       and the edit form reuses this same endpoint. The caller then sets the
+ *       returned URL as `coverImage` on the normal create/update event call.
+ *       Must be declared before POST /:id-shaped routes are ever added.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               coverImage:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       201:
+ *         description: Upload succeeded
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *       400:
+ *         description: No file provided, or an unsupported/oversized image
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Not authorized
+ */
+router.post(
+  '/cover-image',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  uploadEventCoverImageMiddleware,
+  uploadEventCoverImageController
 );
 
 /**
