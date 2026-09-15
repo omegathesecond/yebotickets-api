@@ -18,11 +18,69 @@ import {
   getEventPurchasesController,
   getEventTicketsController,
 } from '../controllers/organizer-event.controller';
+import { uploadEventCoverImageController } from '../controllers/media.controller';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
+import { coverImageUpload } from '../middleware/upload.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 const router = express.Router();
+
+/**
+ * @swagger
+ * /api/events/cover-image:
+ *   post:
+ *     summary: Upload an event cover image
+ *     tags: [Events]
+ *     description: >
+ *       Organizer/admin-only. Uploads an image (multipart field "file", JPEG
+ *       /PNG/WEBP/GIF, max 8MB) to R2 and returns its public CDN URL. Not
+ *       scoped to an event id — the create wizard has no event yet when the
+ *       organizer picks a poster; save the returned url as `coverImage` on
+ *       POST /api/events or PUT /api/events/:id.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       201:
+ *         description: Upload succeeded
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *       400:
+ *         description: No file uploaded
+ *       401:
+ *         description: Not authenticated
+ *       413:
+ *         description: File too large (max 8MB)
+ *       415:
+ *         description: Unsupported image type
+ */
+router.post(
+  '/cover-image',
+  protect,
+  authorize(UserRole.ORGANIZER, UserRole.ADMIN),
+  coverImageUpload.single('file'),
+  uploadEventCoverImageController
+);
 
 /**
  * @swagger

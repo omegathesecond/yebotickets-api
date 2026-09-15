@@ -1,14 +1,19 @@
 import { Request, Response, NextFunction } from 'express';
+import { MulterError } from 'multer';
 
 export class ApiError extends Error {
   statusCode: number;
-  
+
   constructor(message: string, statusCode: number) {
     super(message);
     this.statusCode = statusCode;
     Error.captureStackTrace(this, this.constructor);
   }
 }
+
+/** Multer's own error class has no statusCode — map its codes to real HTTP statuses. */
+const multerStatusCode = (err: MulterError): number =>
+  err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
 
 export const errorHandler = (
   err: Error | ApiError,
@@ -18,7 +23,8 @@ export const errorHandler = (
 ) => {
   console.error(err);
 
-  const statusCode = (err as ApiError).statusCode || 500;
+  const statusCode =
+    (err as ApiError).statusCode || (err instanceof MulterError ? multerStatusCode(err) : 500);
   const message = err.message || 'Internal Server Error';
 
   res.status(statusCode).json({
