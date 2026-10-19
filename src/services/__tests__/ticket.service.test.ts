@@ -78,6 +78,10 @@ beforeEach(() => {
   // Reset return-value stubs between tests (clearMocks in jest.config only
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
+  prismaMock.$transaction.mockImplementation(((callback: any) => callback(prismaMock)) as any);
+  prismaMock.$queryRaw.mockResolvedValue([{
+    isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
+  }]);
   // Default: no stale reservations to reclaim. purchaseTicket's paid path runs a
   // reclaim sweep up front (prisma.ticket.findMany); without this the call would
   // see `undefined` and throw. Tests that exercise reclaim (or a batch claim's
@@ -111,7 +115,7 @@ const buildTicketType = (over: Partial<any> = {}) => ({
   updatedAt: new Date('2026-01-01T00:00:00Z'),
   // Relation loaded by purchaseTicket's `include` to gate sales on a cancelled
   // event. Default: event is live. Override `event` to simulate a cancellation.
-  event: { isCancelled: false },
+  event: { isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000) },
   ...over,
 });
 
@@ -634,6 +638,60 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
     expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  describe.each([0, 100])('event eligibility (price %s)', (price) => {
+    const cases = [
+      ['unpublished', { isPublished: false }, 'not published'],
+      ['cancelled', { isCancelled: true }, 'cancelled'],
+      ['finished', { endDate: new Date(0) }, 'finished'],
+    ] as const;
+
+    it.each(['current', 'upcoming'])('allows a published %s event', async (timing) => {
+      const event = {
+        ...buildTicketType().event,
+        startDate: new Date(Date.now() + (timing === 'current' ? -86400000 : 86400000)),
+        endDate: new Date(Date.now() + 172800000),
+      };
+      prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price, event }) as any);
+      prismaMock.$queryRaw.mockResolvedValue([event]);
+      prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
+      prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+      prismaMock.ticket.findMany.mockResolvedValue([buildTicketWithRelations()] as any);
+      // Paid purchases first query stale reservations, then fetch their claim.
+      if (price > 0) prismaMock.ticket.findMany.mockResolvedValueOnce([]);
+      createChargeMock.mockResolvedValue(buildCharge() as any);
+
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).resolves.toBeDefined();
+      expect(prismaMock.ticket.updateMany).toHaveBeenCalled();
+      expect(createChargeMock).toHaveBeenCalledTimes(price > 0 ? 1 : 0);
+      const [sql, eventId] = prismaMock.$queryRaw.mock.calls[0];
+      expect((sql as TemplateStringsArray).join('')).toContain('FOR SHARE');
+      expect(eventId).toBe('event-1');
+    });
+
+    it.each(cases)('rejects %s before any mutation or charge', async (_name, changes, message) => {
+      const event = { ...buildTicketType().event, ...changes };
+      prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price, event }) as any);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+        statusCode: 400, message: expect.stringContaining(message),
+      });
+      expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+      expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+      expect(createChargeMock).not.toHaveBeenCalled();
+    });
+
+    it.each(cases)('rechecks %s under the event lock before claiming', async (_name, changes, message) => {
+      prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price }) as any);
+      prismaMock.$queryRaw.mockResolvedValue([{ ...buildTicketType().event, ...changes }]);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+        statusCode: 400, message: expect.stringContaining(message),
+      });
+      expect(prismaMock.$transaction).toHaveBeenCalledTimes(1);
+      expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+      expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+      expect(createChargeMock).not.toHaveBeenCalled();
+    });
   });
 
   it('rejects a purchase for a CANCELLED event before reserving or charging', async () => {
