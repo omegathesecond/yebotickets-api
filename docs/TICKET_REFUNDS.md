@@ -17,3 +17,13 @@ For reconciliation, inspect the lock (`ticketId`, `amount`, `refundedBefore`, `c
 - Otherwise retain the claim and resolve with the payment provider. Never resend an uncertain refund.
 
 Known pre-dispatch YeboPay rejections (400/401/403/404/409/501) release the claim without changing ticket state, allowing a corrected request to retry. Notifications occur only after confirmed refund and local commit.
+
+## Cancellation while payment is pending
+
+Cancellation flags the event before scanning both sold and reserved tickets. Its response includes `pending` and per-ticket `pending` outcomes for unsettled orders; these are retained, not reported as refunded. Reservations keep their buyer and payment reference until YeboPay reports a terminal result. Reclaim never treats an old `PENDING` charge as failed. An unreferenced `PROCESSING` hold identifies an in-flight create-charge call; a crash in that window requires manual payment reconciliation rather than recycling the seat.
+
+Settlement takes an Event row share lock in the same transaction as the ticket transition. The cancellation UPDATE conflicts with that lock: a sale committed first is included in cancellation's scan; cancellation committed first leaves the confirmed payment reserved for refund. Both synchronous charges and webhook/reclaim settlement use this transition. A second Event share lock gates ticket delivery and is held through the comms call, so cancellation waits for a delivery already started, or suppresses a delivery that has not started yet. No payment/refund gateway call holds a database transaction. Comms requests have a 10-second timeout per channel, within the delivery transaction’s 60-second budget.
+
+A cancelled-event paid hold stays `reserved/SUCCEEDED` until the existing refund helper confirms its exact allocation was returned. Cancellation, webhook retries and reclaim can retry definite rejections using the same charge-wide refund claim. Ambiguous outcomes retain that claim for the reconciliation procedure above. Check-in rejects cancelled events even when a pre-cancellation sold ticket's refund has failed, and offline sync excludes those events. Previously downloaded offline caches require a fresh sync to see cancellation.
+
+No new migration is needed for this lifecycle; the refund-lock migration above must already be installed.

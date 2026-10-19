@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
 import { 
   ITicket, 
@@ -34,14 +35,10 @@ const DEFAULT_COUNTRY = 'SZ';
  * land — that is the exact silent-failure this task fixes), so the sweep is
  * authoritative: it polls `GET /v1/charges/:id` and only reclaims a hold whose
  * charge YeboPay reports FAILED, finalizes one reported SUCCEEDED (reconciling a
- * missed webhook), and leaves a still-PENDING hold alone until the HARD cutoff.
- *
- * TTL (default 15 min) gates when we first poll; the HARD cutoff (default 60
- * min) is the only point at which a charge YeboPay STILL reports PENDING is
- * treated as dead and reclaimed — comfortably beyond any real USSD prompt
- * lifetime, which protects against overselling while preventing inventory from
- * being stranded reserved forever (e.g. against YeboPay's current stub MoMo
- * adapter, which leaves charges PENDING indefinitely).
+ * missed webhook), and retains PENDING payment references at any age.
+ * The hard cutoff only reclaims abandoned, unreferenced holds. PROCESSING
+ * holds represent an in-flight gateway call and require reconciliation if the
+ * process crashes; they must never be recycled underneath a live charge.
  */
 const RESERVATION_TTL_MS = Number.parseInt(process.env['RESERVATION_TTL_MS'] || '', 10) || 15 * 60 * 1000;
 const RESERVATION_HARD_EXPIRY_MS =
@@ -380,6 +377,7 @@ export const generateTickets = async (
 const PURCHASE_INCLUDE = {
   event: {
     select: {
+      isCancelled: true,
       id: true,
       title: true,
       startDate: true,
@@ -712,24 +710,67 @@ const claimAvailableTickets = async (
 const finalizeReservedTickets = async (
   ticketIds: string[],
   userId: string,
+  reservedEventId: string,
   payment: { paymentRef: string; paymentStatus: string; amountPaidPerTicket: number }
 ) => {
-  await prisma.ticket.updateMany({
-    where: { id: { in: ticketIds }, status: 'reserved', userId },
-    data: {
-      status: 'sold',
-      purchaseDate: new Date(),
-      reservedAt: null, // hold consumed — drop it out of the reclaim sweep
-      paymentRef: payment.paymentRef,
-      paymentStatus: payment.paymentStatus,
-      amountPaid: payment.amountPaidPerTicket,
-    },
-  });
+  const settled = await commitSettlement(reservedEventId, {
+    id: { in: ticketIds }, status: 'reserved', userId,
+  }, {
+    purchaseDate: new Date(), paymentRef: payment.paymentRef,
+    paymentStatus: payment.paymentStatus, amountPaid: payment.amountPaidPerTicket,
+  }, { id: { in: ticketIds } });
+  if (settled.cancelled) {
+    await refundCancelledSettlement(settled.tickets);
+    throw new ApiError('Event cancelled. Payment has been refunded; no ticket was issued.', 409);
+  }
+  return settled.tickets;
+};
 
-  return prisma.ticket.findMany({
-    where: { id: { in: ticketIds } },
-    include: PURCHASE_INCLUDE,
+/** Serialize the sale decision with Event cancellation, without holding a DB
+ * transaction over a gateway call. Cancelled paid holds remain reserved until
+ * the existing durable refund helper confirms the money was returned. */
+const commitSettlement = async (
+  eventId: string,
+  where: Prisma.TicketWhereInput,
+  data: Prisma.TicketUpdateManyMutationInput,
+  lookup: Prisma.TicketWhereInput
+) => prisma.$transaction(async (tx) => {
+  const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
+    SELECT "isCancelled" FROM "Event" WHERE "id" = ${eventId} FOR SHARE
+  `;
+  if (!events[0]) throw new ApiError('Event not found during settlement', 500);
+  const cancelled = events[0].isCancelled;
+  const claimed = await tx.ticket.updateMany({
+    where,
+    data: { ...data, status: cancelled ? 'reserved' : 'sold',
+      reservedAt: cancelled ? new Date() : null },
   });
+  const tickets = claimed.count ? await tx.ticket.findMany({ where: lookup, include: PURCHASE_INCLUDE }) : [];
+  return { cancelled, tickets, claimed: claimed.count };
+});
+
+const refundCancelledSettlement = async (tickets: any[]) => {
+  for (const ticket of tickets) {
+    const outcome = await refundAndCancelTicket(ticket, 'Event cancelled before payment settled');
+    if (outcome.result === 'refund_failed') throw new ApiError(outcome.error!, 502);
+  }
+};
+
+/** Cancellation's Event UPDATE must wait for any delivery already admitted
+ * here. If cancellation committed first, suppress delivery and refund instead.
+ * Payment/refund gateway calls are deliberately outside this transaction. */
+const deliverSettledOrder = async (tickets: any[]): Promise<TicketDeliveryResult> => {
+  const delivery = await prisma.$transaction(async (tx) => {
+    const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
+      SELECT "isCancelled" FROM "Event" WHERE "id" = ${tickets[0].eventId} FOR SHARE
+    `;
+    if (!events[0]) throw new ApiError('Event not found during delivery', 500);
+    if (events[0].isCancelled) return null;
+    return deliverOrderToBuyer(tickets);
+  }, { timeout: 60_000 });
+  if (delivery) return delivery;
+  await refundCancelledSettlement(tickets);
+  throw new ApiError('Event cancelled. No ticket was issued; payment has been refunded.', 409);
 };
 
 /**
@@ -771,7 +812,7 @@ const releaseReservedTicketsByPaymentRef = async (
 ): Promise<void> => {
   try {
     await prisma.ticket.updateMany({
-      where: { paymentRef, status: 'reserved', userId },
+      where: { paymentRef, status: 'reserved', userId, paymentStatus: { not: 'SUCCEEDED' } },
       data: {
         status: 'available',
         userId: null,
@@ -838,8 +879,9 @@ const buildPendingOrderResult = (tickets: any[], paymentRef: string) => ({
     ticketType: ticket.ticketType
       ? { ...ticket.ticketType, type: mapTicketType(ticket.ticketType.type) }
       : null,
-    message:
-      'Payment pending — approve the prompt on your phone. Your ticket will be issued automatically once payment is confirmed.',
+    message: ticket.event?.isCancelled
+      ? 'Event cancelled — awaiting payment outcome. Any successful payment will be refunded; no ticket will be issued.'
+      : 'Payment pending — approve the prompt on your phone. Your ticket will be issued automatically once payment is confirmed.',
   })),
 });
 
@@ -878,6 +920,11 @@ export const settleSucceededCharge = async (chargeId: string): Promise<WebhookCh
     console.error('YeboPay charge.succeeded matched no ticket(s) — needs reconciliation:', chargeId);
     return { result: 'unmatched' };
   }
+  if (tickets.some(t => t.event?.isCancelled) &&
+      tickets.some(t => t.paymentStatus === 'SUCCEEDED')) {
+    await refundCancelledSettlement(tickets.filter(t => t.status !== 'cancelled'));
+    return { result: 'already_final', ticketId: tickets[0].id, status: 'cancelled' };
+  }
   if (tickets.every((t) => t.status === 'sold')) {
     return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
   }
@@ -892,17 +939,19 @@ export const settleSucceededCharge = async (chargeId: string): Promise<WebhookCh
     return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
   }
 
-  const claimed = await prisma.ticket.updateMany({
-    where: { paymentRef: chargeId, status: 'reserved' },
-    data: { status: 'sold', purchaseDate: new Date(), reservedAt: null, paymentStatus: 'SUCCEEDED' },
-  });
-  if (claimed.count === 0) {
-    // A concurrent webhook/poll finalized first — exactly-once preserved.
+  const settled = await commitSettlement(tickets[0].eventId,
+    { paymentRef: chargeId, status: 'reserved' },
+    { purchaseDate: new Date(), paymentStatus: 'SUCCEEDED' },
+    { paymentRef: chargeId });
+  if (settled.claimed === 0) {
     return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
   }
-
-  const sold = await prisma.ticket.findMany({ where: { paymentRef: chargeId }, include: PURCHASE_INCLUDE });
-  const delivery = await deliverOrderToBuyer(sold);
+  if (settled.cancelled) {
+    await refundCancelledSettlement(settled.tickets);
+    return { result: 'already_final', ticketId: tickets[0].id, status: 'cancelled' };
+  }
+  const sold = settled.tickets;
+  const delivery = await deliverSettledOrder(sold);
   return { result: 'issued', ticketId: sold[0].id, delivery };
 };
 
@@ -916,7 +965,7 @@ export const settleSucceededCharge = async (chargeId: string): Promise<WebhookCh
 export const settleFailedCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
   const tickets = await findTicketsByPaymentRef(chargeId);
   if (tickets.length === 0) return { result: 'unmatched' };
-  if (tickets.some((t) => t.status === 'sold')) {
+  if (tickets.some((t) => t.status === 'sold' || t.paymentStatus === 'SUCCEEDED')) {
     console.error(
       `YeboPay charge.failed for an already-SOLD ticket in charge ${chargeId} — conflict, needs reconciliation:`,
       tickets.map((t) => t.id)
@@ -968,13 +1017,10 @@ export interface ReclaimSummary {
  * fire-and-forget with no retry, so polling is the documented backstop).
  *
  * Per stale reserved row (optionally scoped to one ticket type):
- *   - no paymentRef                    → never reached a charge; release at HARD expiry.
+ *   - no paymentRef, not PROCESSING    → abandoned hold; release at HARD expiry.
  *   - YeboPay SUCCEEDED                → finalize → sold + deliver (missed webhook).
  *   - YeboPay FAILED                   → release the hold.
- *   - PENDING & past HARD expiry       → release (charge is dead; USSD long gone).
- *   - PENDING within HARD expiry       → leave held (money may STILL land — never
- *                                        reclaim a live PENDING; that would oversell
- *                                        and orphan a real payment).
+ *   - PENDING (at any age)             → retain the reference; money can still land.
  *
  * Best-effort per row: a YeboPay error on one row is logged and the row left
  * held, never thrown — one bad charge can't wedge the sweep (or a purchase that
@@ -1011,7 +1057,7 @@ export const reclaimExpiredReservations = async (
       // No charge ref: the hold never reached a charge — nothing to reconcile
       // against YeboPay. Reclaim only once it is genuinely abandoned (hard expiry).
       if (!ticket.paymentRef) {
-        if (pastHardExpiry) {
+        if (pastHardExpiry && ticket.paymentStatus !== 'PROCESSING') {
           await releaseReservedTickets([ticket.id], ticket.userId!);
           summary.released++;
         } else {
@@ -1020,17 +1066,16 @@ export const reclaimExpiredReservations = async (
         continue;
       }
 
+      if (ticket.event?.isCancelled && ticket.paymentStatus === 'SUCCEEDED') {
+        await settleSucceededCharge(ticket.paymentRef);
+        summary.finalized++;
+        continue;
+      }
       const charge = await getCharge(ticket.paymentRef);
       if (charge.status === 'SUCCEEDED') {
         const outcome = await settleSucceededCharge(ticket.paymentRef);
         if (outcome.result === 'issued' || outcome.result === 'already_final') summary.finalized++;
       } else if (charge.status === 'FAILED') {
-        await releaseReservedTicketsByPaymentRef(ticket.paymentRef, ticket.userId!);
-        summary.released++;
-      } else if (pastHardExpiry) {
-        // Still PENDING (or a refund state) long past any real USSD lifetime —
-        // treat as dead and reclaim so the seat isn't stranded forever (every
-        // row sharing this order's charge ref, not just this one).
         await releaseReservedTicketsByPaymentRef(ticket.paymentRef, ticket.userId!);
         summary.released++;
       } else {
@@ -1178,7 +1223,7 @@ export const purchaseTicket = async (
       ticketType.eventId,
       userId,
       qty,
-      { status: 'reserved', reservedAt: new Date() }
+      { status: 'reserved', reservedAt: new Date(), paymentStatus: 'PROCESSING' }
     );
     if (reserved.length === 0) {
       throw new ApiError(
@@ -1248,7 +1293,7 @@ export const purchaseTicket = async (
     // 4. Payment confirmed synchronously — finalize every reservation into a
     //    sold ticket and persist the shared charge reference for
     //    reconciliation/refunds.
-    const sold = await finalizeReservedTickets(reservedIds, userId, {
+    const sold = await finalizeReservedTickets(reservedIds, userId, reserved[0].eventId, {
       paymentRef: charge.id,
       paymentStatus: charge.status,
       amountPaidPerTicket: price,
@@ -1272,7 +1317,7 @@ export const purchaseTicket = async (
  * shared delivery outcome.
  */
 const finishIssuedOrder = async (tickets: any[]) => {
-  const delivery = await deliverOrderToBuyer(tickets);
+  const delivery = await deliverSettledOrder(tickets);
   const withQr = await Promise.all(
     tickets.map(async (ticket) => {
       const qr = await withQrFields(ticket);
@@ -1371,6 +1416,7 @@ export const getUserTickets = async (userId: string) => {
 const CHECK_IN_INCLUDE = {
   event: {
     select: {
+      isCancelled: true,
       id: true,
       title: true,
       startDate: true,
@@ -1447,12 +1493,12 @@ const findTicketForCheckIn = async (ticketIdentifier: string, eventId: string) =
  * when it may not. Reused by verifyTicket, getCheckInDetails and confirmCheckIn.
  */
 const evaluateCheckIn = (
-  ticket: { status: string; isCheckedIn: boolean } | null
+  ticket: { status: string; isCheckedIn: boolean; event?: { isCancelled?: boolean } } | null
 ): { valid: boolean; message: string } => {
   if (!ticket) {
     return { valid: false, message: 'Invalid ticket code' };
   }
-  if (ticket.status !== 'sold') {
+  if (ticket.event?.isCancelled || ticket.status !== 'sold') {
     return { valid: false, message: 'Ticket is not valid for check-in' };
   }
   if (ticket.isCheckedIn) {
@@ -1645,7 +1691,7 @@ export const getEventTicketsForCheckIn = async (
     await assertEventAccess(eventId, requester);
 
     const tickets = await prisma.ticket.findMany({
-      where: { eventId, status: 'sold' },
+      where: { eventId, status: 'sold', event: { isCancelled: false } },
       include: CHECK_IN_INCLUDE,
       orderBy: { createdAt: 'asc' },
     });
@@ -1674,7 +1720,7 @@ export const getEventTicketsForCheckIn = async (
  * against YeboPay and notify the holder. Loaded per ticket by the refund flow.
  */
 const REFUND_INCLUDE = {
-  event: { select: { id: true, title: true, startDate: true } },
+  event: { select: { id: true, title: true, startDate: true, isCancelled: true } },
   ticketType: { select: { id: true, name: true } },
   user: { select: { id: true, name: true, phoneNumber: true } },
 } as const;
@@ -1693,8 +1739,9 @@ export interface TicketRefundOutcome {
    * - `cancelled_free`  free ticket voided, nothing to refund
    * - `already_handled` idempotent no-op (ticket was already cancelled/refunded)
    * - `refund_failed`   YeboPay refund did NOT succeed; ticket left untouched
+   * - `pending`         payment in flight; retained for later reconciliation
    */
-  result: 'refunded' | 'cancelled_free' | 'already_handled' | 'refund_failed';
+  result: 'refunded' | 'cancelled_free' | 'already_handled' | 'refund_failed' | 'pending';
   amountRefunded?: number;
   refundRef?: string | null;
   /** Whether the holder was notified (a notify failure does NOT undo a refund). */
@@ -1831,7 +1878,8 @@ const refundAndCancelTicket = async (
       await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } });
       return { ...base, result: 'already_handled', notified: false };
     }
-    if (!current || current.status !== 'sold' || current.paymentStatus !== 'SUCCEEDED' ||
+    if (!current || (current.status !== 'sold' &&
+        !(current.status === 'reserved' && ticket.event?.isCancelled)) || current.paymentStatus !== 'SUCCEEDED' ||
         current.paymentRef !== ticket.paymentRef || current.amountPaid !== amount) {
       throw new Error('ticket is not a confirmed paid sale');
     }
@@ -2074,6 +2122,7 @@ export interface EventCancellationSummary {
   alreadyHandled: number;
   failed: number;
   notifyFailures: number;
+  pending: number;
   outcomes: TicketRefundOutcome[];
 }
 
@@ -2108,10 +2157,10 @@ export const cancelEvent = async (
       data: { isCancelled: true, cancelledAt: new Date() },
     });
 
-    // Every ticket that still represents a live sale. Reserved rows are mid
-    // purchase (released/finalized by their own flow), so we target 'sold'.
+    // Paid sales and settled cancelled holds are refunded. Unsettled holds
+    // stay owned and referenced until their authoritative payment result arrives.
     const tickets = await prisma.ticket.findMany({
-      where: { eventId, status: 'sold' },
+      where: { eventId, status: { in: ['sold', 'reserved'] } },
       include: REFUND_INCLUDE,
     });
 
@@ -2121,7 +2170,14 @@ export const cancelEvent = async (
     // reconciliation and avoids hammering the YeboPay gateway in a burst.
     const outcomes: TicketRefundOutcome[] = [];
     for (const ticket of tickets) {
-      outcomes.push(await refundAndCancelTicket(ticket, reason));
+      if (ticket.status === 'reserved' && ticket.paymentStatus !== 'SUCCEEDED') {
+        // Keep ownership and the charge reference, including an in-flight
+        // createCharge with no reference yet. Its result/webhook owns settlement.
+        outcomes.push({ ticketId: ticket.id, uniqueCode: ticket.uniqueCode,
+          result: 'pending', notified: false });
+      } else {
+        outcomes.push(await refundAndCancelTicket(ticket, reason));
+      }
     }
 
     const summary: EventCancellationSummary = {
@@ -2133,6 +2189,7 @@ export const cancelEvent = async (
       alreadyHandled: outcomes.filter(o => o.result === 'already_handled').length,
       failed: outcomes.filter(o => o.result === 'refund_failed').length,
       notifyFailures: outcomes.filter(o => o.notifyError).length,
+      pending: outcomes.filter(o => o.result === 'pending').length,
       outcomes,
     };
 

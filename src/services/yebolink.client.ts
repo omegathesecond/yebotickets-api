@@ -58,6 +58,8 @@ const send = async (
 ): Promise<YeboLinkMessageResult> => {
   const res = await fetch(`${BASE_URL}/api/v1/messages/send`, {
     method: 'POST',
+    // Bound delivery so an event cancellation cannot wait on a hung comms call.
+    signal: AbortSignal.timeout(10_000),
     headers: {
       'x-api-key': getApiKey(),
       'Content-Type': 'application/json',
