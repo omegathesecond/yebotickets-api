@@ -93,6 +93,7 @@ beforeEach(() => {
   sendEmailMessageMock.mockResolvedValue({ ok: true } as any);
   createChargeMock.mockReset();
   getChargeMock.mockReset();
+  getChargeMock.mockResolvedValue(buildCharge());
   refundChargeMock.mockReset();
 });
 
@@ -771,7 +772,7 @@ const buildRefundResult = (over: Partial<any> = {}) => ({
   refunded_amount: '100',
   status: 'REFUNDED' as const,
   processor_ref: 'rfnd_1',
-  processor_status: 'reversed',
+  processor_status: 'SUCCEEDED',
   ...over,
 });
 
@@ -789,9 +790,9 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
     expect(refundChargeMock.mock.calls[0][0]).toMatchObject({ chargeId: 'chg_1' });
 
     // The write flips status->cancelled and records the refund outcome.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
-    const writeArg = prismaMock.ticket.updateMany.mock.calls[0][0];
-    expect(writeArg.where).toMatchObject({ id: 'ticket-1', status: { not: 'cancelled' } });
+    expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
+    const writeArg = prismaMock.ticket.update.mock.calls[0][0];
+    expect(writeArg.where).toMatchObject({ id: 'ticket-1' });
     expect(writeArg.data).toMatchObject({
       status: 'cancelled',
       paymentStatus: 'REFUNDED',
@@ -832,19 +833,14 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
     expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
-  it('treats a YeboPay 409 (already refunded at the gateway) as an idempotent success', async () => {
+  it.each([409, 400, 501])('surfaces gateway rejection %s without cancelling the ticket', async (status) => {
     prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
     prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
-    refundChargeMock.mockRejectedValue(
-      new YeboPayHttpError(409, { error: 'Cannot refund a charge in status REFUNDED' }, '/v1/refunds')
-    );
-    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
-
-    const result = await refundTicket('ticket-1', ORGANIZER);
-
-    expect(result.result).toBe('refunded');
-    expect(result.refundRef).toBe('chg_1'); // falls back to the charge ref
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    refundChargeMock.mockRejectedValue(new YeboPayHttpError(status, { error: 'rejected' }, '/v1/refunds'));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(prismaMock.ticketRefundLock.delete).toHaveBeenCalledTimes(1);
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
   });
 
   it('cancels a FREE ticket without any YeboPay refund', async () => {
@@ -1035,6 +1031,7 @@ describe('cancelEvent (refund all sold tickets + cancel)', () => {
       buildSoldPaidTicket({ id: 'paid-1', uniqueCode: 'PAID1' }),
       buildSoldPaidTicket({ id: 'free-1', uniqueCode: 'FREE1', paymentRef: null, paymentStatus: 'FREE', amountPaid: 0 }),
     ] as any);
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket({ id: 'paid-1' }) as any);
     refundChargeMock.mockResolvedValue(buildRefundResult() as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
 
@@ -1424,5 +1421,126 @@ describe('getTicketTypes (buyer-facing availability)', () => {
 
     expect(result).toEqual([]);
     expect(prismaMock.ticket.groupBy).not.toHaveBeenCalled();
+  });
+});
+
+// Stateful test doubles model the shared charge and the database unique claim.
+describe('shared-charge refund accounting', () => {
+  let tickets: any[];
+  let locked: boolean;
+  let refunded: number;
+  beforeEach(() => {
+    tickets = [1, 2, 3].map(n => buildSoldPaidTicket({ id: `ticket-${n}`, uniqueCode: `CODE${n}` }));
+    locked = false;
+    refunded = 0;
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+    prismaMock.event.update.mockResolvedValue({ id: 'event-1', title: 'Test Fest' } as any);
+    prismaMock.ticket.findUnique.mockImplementation(async ({ where }: any) => {
+      const row = tickets.find(t => t.id === where.id);
+      return row ? { ...row } : null;
+    });
+    prismaMock.ticket.findMany.mockImplementation(async () => tickets.filter(t => t.status === 'sold').map(t => ({ ...t })));
+    prismaMock.ticketRefundLock.create.mockImplementation(async () => {
+      if (locked) throw Object.assign(new Error('unique charge claim'), { code: 'P2002' });
+      locked = true;
+      return {} as any;
+    });
+    prismaMock.ticketRefundLock.delete.mockImplementation(async () => {
+      locked = false;
+      return {} as any;
+    });
+    prismaMock.ticket.update.mockImplementation(async ({ where, data }: any) => {
+      const row = tickets.find(t => t.id === where.id);
+      Object.assign(row, data);
+      return row;
+    });
+    getChargeMock.mockImplementation(async () => buildCharge({ amount: '300', refunded_amount: String(refunded), status: refunded ? 'PARTIAL_REFUNDED' : 'SUCCEEDED' }));
+    refundChargeMock.mockImplementation(async ({ amount }) => {
+      refunded += amount!;
+      return buildRefundResult({ refunded_amount: String(refunded), status: refunded === 300 ? 'REFUNDED' : 'PARTIAL_REFUNDED' });
+    });
+  });
+
+  it('refunds one of three tickets, leaves two valid, then cancels only the remaining paid amount', async () => {
+    const first = await refundTicket('ticket-1', ORGANIZER);
+    expect(first.amountRefunded).toBe(100);
+    expect(refunded).toBe(100);
+    expect(tickets.slice(1).map(t => [t.status, t.paymentStatus])).toEqual([['sold', 'SUCCEEDED'], ['sold', 'SUCCEEDED']]);
+    const summary = await cancelEvent('event-1', ORGANIZER);
+    expect(summary).toMatchObject({ refunded: 2, failed: 0 });
+    expect(summary.outcomes.map(o => o.amountRefunded)).toEqual([100, 100]);
+    expect(refundChargeMock.mock.calls.map(([args]) => args.amount)).toEqual([100, 100, 100]);
+    expect(refunded).toBe(300);
+    expect(tickets.every(t => t.status === 'cancelled' && t.paymentStatus === 'REFUNDED')).toBe(true);
+    expect((await refundTicket('ticket-1', ORGANIZER)).result).toBe('already_handled');
+    expect((await cancelEvent('event-1', ORGANIZER)).totalProcessed).toBe(0);
+    expect(refunded).toBe(300);
+  });
+
+  it.each(['ticket-1', 'ticket-2'])('serializes concurrent refunds on the same charge (%s)', async (second) => {
+    const outcomes = await Promise.allSettled([
+      refundTicket('ticket-1', ORGANIZER), refundTicket(second, ORGANIZER),
+    ]);
+    expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(1);
+    expect(refundChargeMock).toHaveBeenCalledTimes(1);
+    expect(refunded).toBe(100);
+    await refundTicket(second, ORGANIZER);
+    expect(refunded).toBe(second === 'ticket-1' ? 100 : 200);
+  });
+
+  it('re-reads after claiming so a stale retry cannot refund an already finalized ticket', async () => {
+    const stale = { ...tickets[0] };
+    Object.assign(tickets[0], { status: 'cancelled', paymentStatus: 'REFUNDED' });
+    prismaMock.ticket.findUnique.mockResolvedValueOnce(stale);
+    expect((await refundTicket('ticket-1', ORGANIZER)).result).toBe('already_handled');
+    expect(refundChargeMock).not.toHaveBeenCalled();
+    expect(locked).toBe(false);
+  });
+
+  it('retains the claim after an ambiguous network failure, blocking every ticket on that charge on retry', async () => {
+    refundChargeMock.mockImplementationOnce(async () => {
+      refunded += 100; // provider moves money but response is lost
+      throw new Error('connection lost');
+    });
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    await expect(refundTicket('ticket-2', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    expect(refundChargeMock).toHaveBeenCalledTimes(1);
+    expect(refunded).toBe(100);
+    expect(tickets.every(t => t.status === 'sold' && t.paymentStatus === 'SUCCEEDED')).toBe(true);
+    expect(locked).toBe(true);
+  });
+
+  it.each(['PENDING', 'FAILED'])('does not finalize a 2xx refund with processor status %s', async processor_status => {
+    refundChargeMock.mockResolvedValueOnce(buildRefundResult({ processor_status }));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    expect(tickets[0].status).toBe('sold');
+    expect(locked).toBe(true);
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not accept an incorrect cumulative amount as proof of the ticket refund', async () => {
+    refundChargeMock.mockResolvedValueOnce(buildRefundResult({ refunded_amount: '300' }));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    expect(tickets[0].status).toBe('sold');
+    expect(locked).toBe(true);
+  });
+
+  it('rejects a fully refunded charge at preflight without issuing another refund', async () => {
+    getChargeMock.mockResolvedValueOnce(buildCharge({ amount: '300', refunded_amount: '300', status: 'REFUNDED' }));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
+    expect(refundChargeMock).not.toHaveBeenCalled();
+    expect(tickets[0].status).toBe('sold');
+    expect(locked).toBe(false);
+  });
+
+  it('allows retry after a definite 409 rejection but never records it as refunded', async () => {
+    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, { error: 'conflict' }, '/v1/refunds'));
+    const summary = await cancelEvent('event-1', ORGANIZER);
+    expect(summary).toMatchObject({ refunded: 2, failed: 1 });
+    expect(tickets[0].status).toBe('sold');
+    expect(refunded).toBe(200);
+    await refundTicket('ticket-1', ORGANIZER);
+    expect(refunded).toBe(300);
   });
 });
