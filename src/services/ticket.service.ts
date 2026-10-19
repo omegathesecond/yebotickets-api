@@ -843,7 +843,7 @@ const markReservationsPending = async (
   payment: { paymentRef: string; amountPaidPerTicket: number }
 ) => {
   await prisma.ticket.updateMany({
-    where: { id: { in: ticketIds }, status: 'reserved', userId },
+    where: { id: { in: ticketIds }, status: 'reserved', userId, paymentStatus: { not: 'SUCCEEDED' } },
     data: {
       paymentRef: payment.paymentRef,
       paymentStatus: 'PENDING',
@@ -987,8 +987,22 @@ export const settleFailedCharge = async (chargeId: string): Promise<WebhookCharg
  */
 export const handleChargeWebhookEvent = async (
   eventType: string,
-  charge: { id: string }
+  charge: { id: string; description?: unknown }
 ): Promise<WebhookChargeOutcome | { result: 'ignored' }> => {
+  // The signed charge DTO echoes description (but does not echo metadata).
+  // Bind an accepted charge even if its create response was lost. The attempt
+  // reference is written before the network call and cannot match a reused seat.
+  if (eventType === 'charge.succeeded' || eventType === 'charge.failed') {
+    const key = typeof charge.description === 'string'
+      ? charge.description.match(/\[yebotickets:(attempt:[0-9a-f-]{36})\]$/)?.[1]
+      : undefined;
+    if (key) {
+      await prisma.ticket.updateMany({
+        where: { paymentRef: key, status: 'reserved', paymentStatus: 'PROCESSING' },
+        data: { paymentRef: charge.id },
+      });
+    }
+  }
   switch (eventType) {
     case 'charge.succeeded':
       return settleSucceededCharge(charge.id);
@@ -1218,12 +1232,14 @@ export const purchaseTicket = async (
     // 1. Reserve `qty` available rows atomically, all-or-nothing (held, not yet
     //    sold). reservedAt stamps each hold so the reclaim sweep can later
     //    resolve them if the async charge never confirms.
+    const attemptRef = `attempt:${crypto.randomUUID()}`;
     const { tickets: reserved, availableRemaining } = await claimAvailableTickets(
       ticketTypeId,
       ticketType.eventId,
       userId,
       qty,
-      { status: 'reserved', reservedAt: new Date(), paymentStatus: 'PROCESSING' }
+      { status: 'reserved', reservedAt: new Date(), paymentStatus: 'PROCESSING',
+        paymentRef: attemptRef, amountPaid: price }
     );
     if (reserved.length === 0) {
       throw new ApiError(
@@ -1233,9 +1249,8 @@ export const purchaseTicket = async (
     }
     const reservedIds = reserved.map((t) => t.id);
 
-    // 2. Charge BEFORE issuing — ONCE for the whole order. Any transport error
-    //    releases every reservation and surfaces loudly — we never issue a
-    //    ticket without confirmed money.
+    // 2. Persist an attempt reference BEFORE charging. An HTTP/transport error
+    //    cannot prove no charge was accepted; retain the hold for its webhook.
     let charge;
     try {
       charge = await createCharge({
@@ -1247,7 +1262,7 @@ export const purchaseTicket = async (
         providerCode: validPayment.providerCode,
         phone: validPayment.phone,
         cardToken: validPayment.cardToken,
-        description: `${qty}x ${ticketType.name} ticket — ${reserved[0].event?.title ?? 'event'}`,
+        description: `${qty}x ${ticketType.name} ticket — ${reserved[0].event?.title ?? 'event'} [yebotickets:${attemptRef}]`,
         metadata: {
           ticketIds: reservedIds,
           ticketTypeId,
@@ -1258,7 +1273,7 @@ export const purchaseTicket = async (
         idempotencyKey: validPayment.idempotencyKey || crypto.randomUUID(),
       });
     } catch (error) {
-      await releaseReservedTickets(reservedIds, userId);
+      console.error('Charge creation outcome unknown; retained reconciliation hold:', attemptRef, error);
       if (error instanceof YeboPayHttpError) {
         throw new ApiError(`Payment could not be processed (YeboPay ${error.status}).`, 502);
       }
@@ -2172,7 +2187,7 @@ export const cancelEvent = async (
     for (const ticket of tickets) {
       if (ticket.status === 'reserved' && ticket.paymentStatus !== 'SUCCEEDED') {
         // Keep ownership and the charge reference, including an in-flight
-        // createCharge with no reference yet. Its result/webhook owns settlement.
+        // createCharge with a durable attempt reference. Its webhook owns settlement.
         outcomes.push({ ticketId: ticket.id, uniqueCode: ticket.uniqueCode,
           result: 'pending', notified: false });
       } else {

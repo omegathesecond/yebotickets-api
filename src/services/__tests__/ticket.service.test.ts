@@ -478,7 +478,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.data).toMatchObject({ status: 'reserved' });
     const pendingArg = prismaMock.ticket.updateMany.mock.calls[1][0];
-    expect(pendingArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1' });
+    expect(pendingArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1', paymentStatus: { not: 'SUCCEEDED' } });
     expect(pendingArg.data).toMatchObject({ paymentRef: 'chg_1', paymentStatus: 'PENDING', amountPaid: 100 });
     // The mark-pending write must NOT flip status (no `status` key) — the seat
     // stays reserved.
@@ -1756,6 +1756,70 @@ describe('cancelled-event payment lifecycle', () => {
       await expect(purchase).rejects.toMatchObject({ statusCode: 409 });
     }
     expect(row).toMatchObject({ status: 'cancelled', paymentStatus: 'REFUNDED', paymentRef: 'chg_1' });
+    expect(refunded).toBe(100);
+  });
+
+  it.each(['SUCCEEDED', 'FAILED'])('lost create response after cancellation reconciles late %s using the durable attempt', async (status) => {
+    row = buildTicketWithRelations({ status: 'available', userId: null });
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    let rejectCharge!: (reason: Error) => void;
+    let entered!: () => void;
+    const charging = new Promise<void>(resolve => { entered = resolve; });
+    createChargeMock.mockImplementation(() => {
+      entered();
+      return new Promise((_resolve, reject) => { rejectCharge = reject; });
+    });
+    const purchase = purchaseTicket('tt-1', 'user-1', PAYMENT);
+    const rejected = expect(purchase).rejects.toMatchObject({ statusCode: 500 });
+    await charging;
+    const attempt = row.paymentRef;
+    expect(attempt).toMatch(/^attempt:/);
+    const description = createChargeMock.mock.calls[0][0].description;
+    expect(description).toContain(`[yebotickets:${attempt}]`);
+    await cancelEvent(event.id, ORGANIZER);
+    rejectCharge(new Error('response lost after gateway accepted charge'));
+    await rejected;
+    expect(row).toMatchObject({ status: 'reserved', paymentRef: attempt, paymentStatus: 'PROCESSING' });
+    // Reclaim cannot mistake an ambiguous accepted payment for an abandoned hold.
+    row.reservedAt = new Date(0);
+    getChargeMock.mockRejectedValueOnce(new Error('attempt is not a charge id'));
+    expect(await reclaimExpiredReservations()).toMatchObject({ errors: 1, released: 0 });
+    await handleChargeWebhookEvent(`charge.${status.toLowerCase()}`, { id: 'chg_1', description });
+    await handleChargeWebhookEvent(`charge.${status.toLowerCase()}`, { id: 'chg_1', description });
+    await cancelEvent(event.id, ORGANIZER);
+    if (status === 'SUCCEEDED') {
+      expect(row).toMatchObject({ status: 'cancelled', paymentStatus: 'REFUNDED', paymentRef: 'chg_1' });
+      expect(refunded).toBe(100);
+      expect(refundChargeMock).toHaveBeenCalledTimes(1);
+    } else {
+      expect(row).toMatchObject({ status: 'available', paymentRef: null, userId: null });
+      expect(refundChargeMock).not.toHaveBeenCalled();
+    }
+    expect(sendTextMessageMock.mock.calls.every(([, text]) => !text.includes('Show this QR'))).toBe(true);
+    expect(await verifyTicket(row.uniqueCode, event.id, ORGANIZER)).toMatchObject({ valid: false });
+  });
+
+  it('a delayed PENDING response cannot erase a webhook success awaiting refund retry', async () => {
+    row = buildTicketWithRelations({ status: 'available', userId: null });
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType() as any);
+    let complete!: (value: any) => void;
+    let entered!: () => void;
+    const charging = new Promise<void>(resolve => { entered = resolve; });
+    createChargeMock.mockImplementation(() => {
+      entered();
+      return new Promise(resolve => { complete = resolve; });
+    });
+    const purchase = purchaseTicket('tt-1', 'user-1', PAYMENT);
+    await charging;
+    await cancelEvent(event.id, ORGANIZER);
+    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, {}, '/v1/refunds'));
+    const description = createChargeMock.mock.calls[0][0].description;
+    await expect(handleChargeWebhookEvent('charge.succeeded', { id: 'chg_1', description }))
+      .rejects.toMatchObject({ statusCode: 502 });
+    complete(buildCharge({ status: 'PENDING' }));
+    await purchase;
+    expect(row).toMatchObject({ status: 'reserved', paymentStatus: 'SUCCEEDED', paymentRef: 'chg_1' });
+    expect(await cancelEvent(event.id, ORGANIZER)).toMatchObject({ refunded: 1 });
     expect(refunded).toBe(100);
   });
 
