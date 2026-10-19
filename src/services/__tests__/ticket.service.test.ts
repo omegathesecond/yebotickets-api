@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
 
@@ -50,6 +51,7 @@ jest.mock('../yebopay.service', () => ({
 
 // Imports must come AFTER the jest.mock calls so the mocked modules are wired in.
 import prisma from '../../config/prisma';
+import { processWebhook } from '../payment-webhook.service';
 import {
   purchaseTicket,
   verifyTicket,
@@ -1784,8 +1786,22 @@ describe('cancelled-event payment lifecycle', () => {
     row.reservedAt = new Date(0);
     getChargeMock.mockRejectedValueOnce(new Error('attempt is not a charge id'));
     expect(await reclaimExpiredReservations()).toMatchObject({ errors: 1, released: 0 });
-    await handleChargeWebhookEvent(`charge.${status.toLowerCase()}`, { id: 'chg_1', description });
-    await handleChargeWebhookEvent(`charge.${status.toLowerCase()}`, { id: 'chg_1', description });
+    // Exercise the real signed-webhook entrypoint: dropping description in
+    // verification/routing would orphan this accepted charge after response loss.
+    const previousSecret = process.env.YEBOPAY_WEBHOOK_SECRET;
+    process.env.YEBOPAY_WEBHOOK_SECRET = 'lost-response-regression-secret';
+    try {
+      const body = JSON.stringify({ id: 'evt_late', type: `charge.${status.toLowerCase()}`,
+        created: 1700000000, data: { id: 'chg_1', status, description } });
+      const signature = crypto.createHmac('sha256', process.env.YEBOPAY_WEBHOOK_SECRET)
+        .update(`1700000000.${body}`).digest('hex');
+      const header = `t=1700000000,v1=${signature}`;
+      await processWebhook(Buffer.from(body), header);
+      await processWebhook(Buffer.from(body), header);
+    } finally {
+      if (previousSecret === undefined) delete process.env.YEBOPAY_WEBHOOK_SECRET;
+      else process.env.YEBOPAY_WEBHOOK_SECRET = previousSecret;
+    }
     await cancelEvent(event.id, ORGANIZER);
     if (status === 'SUCCEEDED') {
       expect(row).toMatchObject({ status: 'cancelled', paymentStatus: 'REFUNDED', paymentRef: 'chg_1' });
