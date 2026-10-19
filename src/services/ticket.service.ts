@@ -612,67 +612,94 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
  *   relations) on success, or `{ tickets: [], availableRemaining }` when the
  *   pool could not cover the whole order.
  */
+type SaleEvent = { isCancelled: boolean; isPublished: boolean; endDate: Date };
+
+const assertEventOnSale = (event: SaleEvent | undefined): void => {
+  if (!event) throw new ApiError('Event not found', 404);
+  if (event.isCancelled) {
+    throw new ApiError('This event has been cancelled — tickets are no longer on sale.', 400);
+  }
+  if (!event.isPublished) {
+    throw new ApiError('This event is not published — tickets are not on sale.', 400);
+  }
+  // Match the public listing: an ongoing multi-day event remains on sale.
+  if (event.endDate < new Date()) {
+    throw new ApiError('This event has finished — tickets are no longer on sale.', 400);
+  }
+};
+
 const claimAvailableTickets = async (
   ticketTypeId: string,
+  eventId: string,
   userId: string,
   quantity: number,
   data: Record<string, unknown>
 ): Promise<{ tickets: any[]; availableRemaining: number }> => {
-  const claimedIds: string[] = [];
+  return prisma.$transaction(async (tx) => {
+    // Hold a shared row lock through the inventory claim. Unpublish/cancel
+    // updates take a conflicting lock: whichever commits first determines
+    // whether this purchase may claim inventory. Never hold it over YeboPay.
+    const events = await tx.$queryRaw<SaleEvent[]>`
+      SELECT "isCancelled", "isPublished", "endDate"
+      FROM "Event" WHERE "id" = ${eventId} FOR SHARE
+    `;
+    assertEventOnSale(events[0]);
+    const claimedIds: string[] = [];
 
-  while (claimedIds.length < quantity) {
-    const candidate = await prisma.ticket.findFirst({
-      where: { ticketTypeId, status: 'available', userId: null },
-      select: { id: true },
-    });
-
-    if (!candidate) {
-      break; // pool exhausted
-    }
-
-    // Conditional claim: only flips the row while it is STILL available and
-    // unowned. count === 1 -> we won; count === 0 -> another buyer beat us to
-    // this exact row between our find and our write.
-    const claim = await prisma.ticket.updateMany({
-      where: { id: candidate.id, status: 'available', userId: null },
-      data: { userId, ...data },
-    });
-
-    if (claim.count === 1) {
-      claimedIds.push(candidate.id);
-    }
-    // else lost this row; the next findFirst can never return it again.
-  }
-
-  if (claimedIds.length < quantity) {
-    // Never partially reserve: give back everything this attempt claimed.
-    if (claimedIds.length > 0) {
-      await prisma.ticket.updateMany({
-        where: { id: { in: claimedIds }, userId },
-        data: {
-          userId: null,
-          status: 'available',
-          reservedAt: null,
-          paymentRef: null,
-          paymentStatus: null,
-          amountPaid: null,
-          purchaseDate: null,
-        },
+    while (claimedIds.length < quantity) {
+      const candidate = await tx.ticket.findFirst({
+        where: { ticketTypeId, status: 'available', userId: null },
+        select: { id: true },
       });
-    }
-    const availableRemaining = await prisma.ticket.count({
-      where: { ticketTypeId, status: 'available', userId: null },
-    });
-    return { tickets: [], availableRemaining };
-  }
 
-  // We own every row; no other writer can match the guard now, so this read
-  // returns our committed claim with the relations needed for delivery.
-  const tickets = await prisma.ticket.findMany({
-    where: { id: { in: claimedIds } },
-    include: PURCHASE_INCLUDE,
+      if (!candidate) {
+        break; // pool exhausted
+      }
+
+      // Conditional claim: only flips the row while it is STILL available and
+      // unowned. count === 1 -> we won; count === 0 -> another buyer beat us to
+      // this exact row between our find and our write.
+      const claim = await tx.ticket.updateMany({
+        where: { id: candidate.id, status: 'available', userId: null },
+        data: { userId, ...data },
+      });
+
+      if (claim.count === 1) {
+        claimedIds.push(candidate.id);
+      }
+      // else lost this row; the next findFirst can never return it again.
+    }
+
+    if (claimedIds.length < quantity) {
+      // Never partially reserve: give back everything this attempt claimed.
+      if (claimedIds.length > 0) {
+        await tx.ticket.updateMany({
+          where: { id: { in: claimedIds }, userId },
+          data: {
+            userId: null,
+            status: 'available',
+            reservedAt: null,
+            paymentRef: null,
+            paymentStatus: null,
+            amountPaid: null,
+            purchaseDate: null,
+          },
+        });
+      }
+      const availableRemaining = await tx.ticket.count({
+        where: { ticketTypeId, status: 'available', userId: null },
+      });
+      return { tickets: [], availableRemaining };
+    }
+
+    // We own every row; no other writer can match the guard now, so this read
+    // returns our committed claim with the relations needed for delivery.
+    const tickets = await tx.ticket.findMany({
+      where: { id: { in: claimedIds } },
+      include: PURCHASE_INCLUDE,
+    });
+    return { tickets, availableRemaining: tickets.length };
   });
-  return { tickets, availableRemaining: tickets.length };
 };
 
 /**
@@ -1096,24 +1123,17 @@ export const purchaseTicket = async (
     }
     const qty = quantity;
 
-    // Find ticket type (with just the event's cancellation flag — needed to
-    // reject sales for a cancelled event before any reserve/charge happens).
+    // Reject off-sale events before any reclaim, inventory write or charge.
     const ticketType = await prisma.ticketType.findUnique({
       where: { id: ticketTypeId },
-      include: { event: { select: { isCancelled: true } } },
+      include: { event: { select: { isCancelled: true, isPublished: true, endDate: true } } },
     });
 
     if (!ticketType) {
       throw new ApiError('Ticket type not found', 404);
     }
 
-    // A cancelled event is off-sale. Reject BEFORE reserving or charging: a sale
-    // here would take the buyer's money via YeboPay for a dead event whose bulk
-    // refund has already run and will never revisit this new ticket — a silent
-    // failure (CLAUDE.md). cancelEvent flags isCancelled; this is what reads it.
-    if (ticketType.event?.isCancelled) {
-      throw new ApiError('This event has been cancelled — tickets are no longer on sale.', 400);
-    }
+    assertEventOnSale(ticketType.event);
 
     const price = ticketType.price;
 
@@ -1121,6 +1141,7 @@ export const purchaseTicket = async (
     if (!price || price <= 0) {
       const { tickets: freeTickets, availableRemaining } = await claimAvailableTickets(
         ticketTypeId,
+        ticketType.eventId,
         userId,
         qty,
         {
@@ -1154,6 +1175,7 @@ export const purchaseTicket = async (
     //    resolve them if the async charge never confirms.
     const { tickets: reserved, availableRemaining } = await claimAvailableTickets(
       ticketTypeId,
+      ticketType.eventId,
       userId,
       qty,
       { status: 'reserved', reservedAt: new Date() }
