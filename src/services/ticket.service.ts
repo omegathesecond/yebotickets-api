@@ -1749,11 +1749,9 @@ const notifyHolderOfCancellation = async (
  * refunded without the money moving, and a retry (or re-running the event
  * cancellation) picks the ticket up again.
  *
- * Idempotency: a ticket already `cancelled`/`REFUNDED` is a no-op
- * (`already_handled`); a YeboPay 409 (the charge is no longer in a refundable
- * state — i.e. it was already refunded) is treated as success so a partial
- * earlier run can be completed safely. The final write is a guarded updateMany
- * so two concurrent cancels can never both "win" the same row.
+ * A durable charge-wide claim serializes all tickets sharing a paymentRef.
+ * Ambiguous provider outcomes retain the claim for manual reconciliation; the
+ * gateway has no refund idempotency support, so retrying could move money twice.
  *
  * FREE tickets (no paymentRef / paymentStatus FREE / amountPaid 0) carry no
  * money, so they are simply voided and the holder notified — no YeboPay call.
@@ -1798,52 +1796,91 @@ const refundAndCancelTicket = async (
     };
   }
 
-  // --- Paid ticket: refund via YeboPay BEFORE marking cancelled. -----------
-  let refund: { refundRef: string | null; amount: number };
-  try {
-    const res = await refundCharge({ chargeId: ticket.paymentRef, reason });
-    refund = {
-      refundRef: res.processor_ref ?? res.charge_id,
-      amount: Number.parseFloat(res.refunded_amount),
-    };
-  } catch (error) {
-    // A 409 means the charge is no longer refundable; for a charge we previously
-    // SUCCEEDED-charged, that is YeboPay telling us it is ALREADY refunded.
-    // Treat as an idempotent success so a half-finished run can complete.
-    if (error instanceof YeboPayHttpError && error.status === 409) {
-      refund = { refundRef: ticket.paymentRef, amount: ticket.amountPaid ?? 0 };
-    } else {
-      console.error('YeboPay refund failed for ticket', ticket.id, error);
-      const detail =
-        error instanceof YeboPayHttpError ? `YeboPay ${error.status}` : errorMessage(error);
-      return {
-        ...base,
-        result: 'refund_failed',
-        notified: false,
-        error: `Refund failed (${detail}). Ticket left unchanged — no refund recorded.`,
-      };
-    }
+  const failed = (detail: string): TicketRefundOutcome => ({
+    ...base,
+    result: 'refund_failed',
+    notified: false,
+    error: `Refund failed: ${detail}. Ticket left unchanged.`,
+  });
+  const amount = Number(ticket.amountPaid);
+  const cents = (value: number) => Math.round(value * 100);
+  if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
+    return failed('invalid stored ticket amount');
   }
 
-  // Money is back — now (and only now) record CANCELLED + REFUNDED. Guarded on
-  // status so two concurrent cancels cannot both finalize the same row.
-  const claimed = await prisma.ticket.updateMany({
-    where: { id: ticket.id, status: { not: 'cancelled' } },
-    data: {
-      status: 'cancelled',
-      paymentStatus: 'REFUNDED',
-      refundRef: refund.refundRef,
-      refundedAt: new Date(),
-      cancelledAt: new Date(),
-      // Clear any pending buyer refund request — it's now handled.
-      refundRequestedAt: null,
-      refundRequestReason: null,
-    },
-  });
-  if (claimed.count === 0) {
-    // A concurrent cancel finalized this row first; the YeboPay 409 guard means
-    // the money was only ever returned once.
-    return { ...base, result: 'already_handled', notified: false };
+  // A unique DB key, not a process-local mutex: protects concurrent workers and
+  // different tickets on the same charge, including after a process restart.
+  try {
+    await prisma.ticketRefundLock.create({
+      data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount },
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === 'P2002') {
+      return failed('another refund is in progress or requires reconciliation for this charge');
+    }
+    throw error;
+  }
+
+  let dispatched = false;
+  let refund: { refundRef: string | null; amount: number };
+  try {
+    // The caller may have loaded a stale ticket before the previous owner of
+    // the charge lock committed. Re-read only AFTER acquiring the lock.
+    const current = await prisma.ticket.findUnique({ where: { id: ticket.id } });
+    if (current?.status === 'cancelled' || current?.paymentStatus === 'REFUNDED') {
+      await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } });
+      return { ...base, result: 'already_handled', notified: false };
+    }
+    if (!current || current.status !== 'sold' || current.paymentStatus !== 'SUCCEEDED' ||
+        current.paymentRef !== ticket.paymentRef || current.amountPaid !== amount) {
+      throw new Error('ticket is not a confirmed paid sale');
+    }
+    const charge = await getCharge(ticket.paymentRef);
+    const before = Number(charge.refunded_amount);
+    const total = Number(charge.amount);
+    if (charge.id !== ticket.paymentRef ||
+        !['SUCCEEDED', 'PARTIAL_REFUNDED'].includes(charge.status) ||
+        !Number.isFinite(before) || before < 0 || !Number.isFinite(total) ||
+        cents(before) + cents(amount) > cents(total)) {
+      throw new Error('gateway charge is not refundable for this ticket amount');
+    }
+    await prisma.ticketRefundLock.update({
+      where: { chargeId: ticket.paymentRef }, data: { refundedBefore: before },
+    });
+    dispatched = true;
+    const res = await refundCharge({ chargeId: ticket.paymentRef, amount, reason });
+    // refunded_amount is CUMULATIVE, not the amount returned for this ticket.
+    if (res.charge_id !== ticket.paymentRef || res.processor_status !== 'SUCCEEDED' ||
+        !['PARTIAL_REFUNDED', 'REFUNDED'].includes(res.status) ||
+        !Number.isFinite(Number(res.refunded_amount)) ||
+        cents(Number(res.refunded_amount)) !== cents(before) + cents(amount)) {
+      throw new Error('gateway did not confirm the exact refund; reconciliation required');
+    }
+    refund = { refundRef: res.processor_ref ?? res.charge_id, amount };
+
+    // Keep the claim if this transaction fails after the provider moved money.
+    // Ticket finalization and releasing the claim must commit together.
+    await prisma.$transaction([
+      prisma.ticket.update({
+        where: { id: ticket.id },
+        data: {
+          status: 'cancelled', paymentStatus: 'REFUNDED',
+          refundRef: refund.refundRef, refundedAt: new Date(), cancelledAt: new Date(),
+          refundRequestedAt: null, refundRequestReason: null,
+        },
+      }),
+      prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } }),
+    ]);
+  } catch (error) {
+    // These gateway responses reject BEFORE processor dispatch. A 409 is a
+    // rejection, never evidence that THIS ticket's refund succeeded.
+    const rejected = error instanceof YeboPayHttpError &&
+      [400, 401, 403, 404, 409, 501].includes(error.status);
+    if (!dispatched || rejected) {
+      await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } });
+    }
+    console.error('YeboPay refund failed for ticket', ticket.id, error);
+    return failed(`${errorMessage(error)}${dispatched && !rejected ? '; charge blocked pending reconciliation' : ''}`);
   }
 
   const notify = await notifyHolderOfCancellation(ticket, true, refund.amount);

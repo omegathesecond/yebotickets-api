@@ -332,3 +332,13 @@ model Ticket {
   @@index([uniqueCode])
   @@index([ticketTypeId])
 }
+
+// Durable charge-wide mutex. Never expire automatically: after dispatch, a
+// timeout/crash can mean money moved. Reconcile with YeboPay before removal.
+model TicketRefundLock {
+  chargeId       String   @id
+  ticketId       String
+  amount         Float
+  refundedBefore Float?
+  createdAt      DateTime @default(now())
+}

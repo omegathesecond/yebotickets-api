@@ -262,10 +262,10 @@ export interface RefundChargeArgs {
 
 export interface RefundResult {
   charge_id: string;
-  refunded_amount: string; // YeboPay returns Decimal as a string
+  refunded_amount: string; // Cumulative charge total, NOT this refund amount
   status: 'PARTIAL_REFUNDED' | 'REFUNDED';
   processor_ref: string | null;
-  processor_status: string;
+  processor_status: 'SUCCEEDED' | 'PENDING' | 'FAILED';
 }
 
 /**
@@ -274,8 +274,9 @@ export interface RefundResult {
  * Modelled on the yebodash reference (companies/yebodash/api/src/integrations/
  * yebopay.ts). YeboPay validates that the charge belongs to this merchant and
  * that its status allows refunding (SUCCEEDED or PARTIAL_REFUNDED) — a charge
- * already fully REFUNDED yields a 409 (YeboPayHttpError) which the caller can
- * treat as an idempotent "already refunded". A 501 means the charge was paid via
+ * already fully REFUNDED yields a 409 (YeboPayHttpError). This is NOT proof
+ * that any particular ticket was refunded. Refunds have no idempotency support.
+ * A 501 means the charge was paid via
  * a path with no refund adapter yet; surface that to the organizer so they know
  * to refund the holder manually rather than us pretending it worked.
  *
