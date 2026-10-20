@@ -28,6 +28,7 @@ beforeEach(() => {
     const id = ++transactionId;
     let release: (() => void) | undefined;
     const tx = mockDeep<PrismaClient>();
+    tx.ticket.count.mockResolvedValue(0);
     tx.$queryRaw.mockImplementation((async (strings: TemplateStringsArray) => {
       expect(strings.join('?')).toMatch(/FOR UPDATE/);
       const previous = queue;
@@ -50,7 +51,7 @@ for (const tier of [false, true]) {
     const start = tier ? 'saleStartDate' : 'startDate';
     const end = tier ? 'saleEndDate' : 'endDate';
     beforeEach(() => {
-      row = { id: tier ? 'tier' : 'event', eventId: 'event', type: 'standard', [start]: date(10), [end]: date(20) };
+      row = { id: tier ? 'tier' : 'event', eventId: 'event', type: 'standard', quantity: 5, [start]: date(10), [end]: date(20) };
     });
     it.each([
       { [start]: date(15) }, { [end]: date(15) },

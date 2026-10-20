@@ -180,6 +180,31 @@ export const getTicketTypes = async (eventId: string) => {
   }
 };
 
+/** Serialize inventory creation and capacity edits on the tier row. Count every
+ * record: selling, reserving or cancelling a ticket never frees a seat here. */
+const assertInventoryCapacity = async (
+  tx: Prisma.TransactionClient,
+  ticketTypeId: string,
+  capacity: number,
+  additional = 0
+) => {
+  if (!Number.isSafeInteger(capacity) || capacity < 0 ||
+      !Number.isSafeInteger(additional) || additional < 0) {
+    throw new ApiError('Ticket capacity and generation quantity must be non-negative integers', 400);
+  }
+  const existing = await tx.ticket.count({ where: { ticketTypeId } });
+  if (existing + additional > capacity) {
+    throw new ApiError(
+      `Ticket tier capacity exceeded: ${existing} tickets already exist; capacity is ${capacity}, remaining capacity is ${Math.max(0, capacity - existing)}`,
+      400
+    );
+  }
+};
+
+const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string) => {
+  await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
+};
+
 /**
  * Update a ticket type
  * @param ticketTypeId Ticket type ID
@@ -194,7 +219,7 @@ export const updateTicketType = async (
 ) => {
   try {
     return await prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
+      await lockTicketTier(tx, ticketTypeId);
       // Find ticket type
       const ticketType = await tx.ticketType.findUnique({
         where: { id: ticketTypeId },
@@ -221,6 +246,7 @@ export const updateTicketType = async (
         updateData.saleEndDate === undefined ? ticketType.saleEndDate : updateData.saleEndDate,
         'Sale end date must be after sale start date'
       );
+      await assertInventoryCapacity(tx, ticketTypeId, updateData.quantity ?? ticketType.quantity);
 
       // Build update object
       const updates: any = {};
@@ -328,51 +354,59 @@ export const generateTickets = async (
   organizerId: string
 ): Promise<{ message: string; count: number }> => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
-    });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to generate tickets for this event', 403);
-    }
-
-    // Generate tickets
-    const ticketsToCreate: {
-      ticketTypeId: string;
-      eventId: string;
-      status: 'available';
-      uniqueCode: string;
-    }[] = [];
-    for (let i = 0; i < quantity; i++) {
-      ticketsToCreate.push({
-        ticketTypeId,
-        eventId: ticketType.eventId,
-        status: 'available',
-        uniqueCode: crypto.randomBytes(8).toString('hex').toUpperCase(),
+    return await prisma.$transaction(async (tx) => {
+      await lockTicketTier(tx, ticketTypeId);
+      // Find ticket type
+      const ticketType = await tx.ticketType.findUnique({
+        where: { id: ticketTypeId },
       });
-    }
 
-    const result = await prisma.ticket.createMany({
-      data: ticketsToCreate,
+      if (!ticketType) {
+        throw new ApiError('Ticket type not found', 404);
+      }
+
+      // Verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: ticketType.eventId,
+          organizerId,
+        },
+      });
+
+      if (!event) {
+        throw new ApiError('You do not have permission to generate tickets for this event', 403);
+      }
+
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        throw new ApiError('Generation quantity must be a positive integer', 400);
+      }
+      await assertInventoryCapacity(tx, ticketTypeId, ticketType.quantity, quantity);
+
+      // Generate tickets
+      const ticketsToCreate: {
+        ticketTypeId: string;
+        eventId: string;
+        status: 'available';
+        uniqueCode: string;
+      }[] = [];
+      for (let i = 0; i < quantity; i++) {
+        ticketsToCreate.push({
+          ticketTypeId,
+          eventId: ticketType.eventId,
+          status: 'available',
+          uniqueCode: crypto.randomBytes(8).toString('hex').toUpperCase(),
+        });
+      }
+
+      const result = await tx.ticket.createMany({
+        data: ticketsToCreate,
+      });
+
+      return {
+        message: 'Tickets generated successfully',
+        count: result.count,
+      };
     });
-
-    return { 
-      message: 'Tickets generated successfully', 
-      count: result.count,
-    };
   } catch (error) {
     console.error('Error in generateTickets service:', error);
     if (error instanceof ApiError) throw error;
