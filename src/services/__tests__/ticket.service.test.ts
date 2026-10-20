@@ -83,7 +83,7 @@ beforeEach(() => {
   mockReset(prismaMock);
   prismaMock.$transaction.mockImplementation(((callback: any) => typeof callback === 'function' ? callback(prismaMock) : Promise.all(callback)) as any);
   prismaMock.$queryRaw.mockResolvedValue([{
-    isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
+    saleStartDate: new Date(0), saleEndDate: new Date('2099-01-01'), isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
   }]);
   // Default: no stale reservations to reclaim. purchaseTicket's paid path runs a
   // reclaim sweep up front (prisma.ticket.findMany); without this the call would
@@ -119,7 +119,7 @@ const buildTicketType = (over: Partial<any> = {}) => ({
   updatedAt: new Date('2026-01-01T00:00:00Z'),
   // Relation loaded by purchaseTicket's `include` to gate sales on a cancelled
   // event. Default: event is live. Override `event` to simulate a cancellation.
-  event: { isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000) },
+  event: { saleStartDate: new Date(0), saleEndDate: new Date('2099-01-01'), isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000) },
   ...over,
 });
 
@@ -642,6 +642,49 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
     expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  describe.each([0, 100])('tier sale windows (price %s)', price => {
+    const now = new Date('2026-06-01T12:00:00Z');
+    beforeEach(() => { jest.useFakeTimers().setSystemTime(now); });
+    afterEach(() => { jest.useRealTimers(); });
+    const closed = [
+      ['future', { saleStartDate: new Date(now.getTime() + 1) }, 'not yet on sale'],
+      ['expired', { saleEndDate: new Date(now.getTime() - 1) }, 'closed'],
+      ['exact end', { saleEndDate: now }, 'closed'],
+    ] as const;
+    describe.each([false, true])('racing edit: %s', racing => {
+      it.each(closed)('rejects %s without claim or charge', async (_label, dates, message) => {
+        const tier = buildTicketType({ price, ...dates });
+        prismaMock.ticketType.findUnique.mockResolvedValue((racing ? buildTicketType({ price }) : tier) as any);
+        prismaMock.$queryRaw.mockResolvedValueOnce([tier.event]).mockResolvedValueOnce([tier]);
+        await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+          statusCode: 400, message: expect.stringContaining(message),
+        });
+        expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+        expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+        expect(createChargeMock).not.toHaveBeenCalled();
+        if (!racing) expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+        else {
+          const [sql, tierId, eventId] = prismaMock.$queryRaw.mock.calls[1];
+          expect((sql as TemplateStringsArray).join('')).toContain('FROM "TicketType"');
+          expect((sql as TemplateStringsArray).join('')).toContain('FOR SHARE');
+          expect([tierId, eventId]).toEqual(['tt-1', 'event-1']);
+        }
+      });
+    });
+    it.each([0, -1])('allows exact start and open tier (offset %s)', async offset => {
+      const tier = buildTicketType({ price, saleStartDate: new Date(now.getTime() + offset), saleEndDate: new Date(now.getTime() + 1) });
+      prismaMock.ticketType.findUnique.mockResolvedValue(tier as any);
+      prismaMock.$queryRaw.mockResolvedValue([{ ...tier.event, ...tier }]);
+      prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
+      prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+      prismaMock.ticket.findMany.mockResolvedValue([buildTicketWithRelations()] as any);
+      if (price > 0) prismaMock.ticket.findMany.mockResolvedValueOnce([]);
+      createChargeMock.mockResolvedValue(buildCharge() as any);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).resolves.toBeDefined();
+      expect(createChargeMock).toHaveBeenCalledTimes(price > 0 ? 1 : 0);
+    });
   });
 
   describe.each([0, 100])('event eligibility (price %s)', (price) => {
