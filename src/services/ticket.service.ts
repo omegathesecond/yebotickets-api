@@ -1522,6 +1522,15 @@ const evaluateCheckIn = (
   return { valid: true, message: 'Ticket is valid for check-in' };
 };
 
+/** Claim admission only while the ticket remains sold and unused. */
+const claimTicketAdmission = async (ticketId: string) => {
+  const claim = await prisma.ticket.updateMany({
+    where: { id: ticketId, isCheckedIn: false, status: 'sold' },
+    data: { isCheckedIn: true, checkedInAt: new Date() },
+  });
+  return claim.count === 1;
+};
+
 /**
  * Flatten a ticket (with its relations) into the shape the gate scanner UI
  * reads directly: holder name, event name, ticket-type label and a `status`
@@ -1567,13 +1576,16 @@ export const verifyTicket = async (
       };
     }
 
-    // Mark ticket as checked in
-    const updatedTicket = await prisma.ticket.update({
+    if (!await claimTicketAdmission(ticket!.id)) {
+      return {
+        ticket: { ...ticket, status: mapTicketStatus(ticket!.status) },
+        valid: false,
+        message: 'Ticket is no longer available for check-in',
+      };
+    }
+
+    const updatedTicket = await prisma.ticket.findUniqueOrThrow({
       where: { id: ticket!.id },
-      data: {
-        isCheckedIn: true,
-        checkedInAt: new Date(),
-      },
       include: CHECK_IN_INCLUDE,
     });
 
@@ -1649,14 +1661,7 @@ export const confirmCheckIn = async (
       throw new ApiError(evaluation.message, ticket ? 400 : 404);
     }
 
-    // Atomically claim the check-in: only succeeds while still un-checked-in and
-    // sold, guarding against a double check-in race between preview and commit.
-    const claim = await prisma.ticket.updateMany({
-      where: { id: ticket!.id, isCheckedIn: false, status: 'sold' },
-      data: { isCheckedIn: true, checkedInAt: new Date() },
-    });
-
-    if (claim.count === 0) {
+    if (!await claimTicketAdmission(ticket!.id)) {
       throw new ApiError('Ticket has already been used for check-in', 400);
     }
 
