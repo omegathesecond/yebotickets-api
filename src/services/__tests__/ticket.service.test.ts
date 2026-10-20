@@ -57,6 +57,8 @@ import {
   verifyTicket,
   confirmCheckIn,
   refundTicket,
+  reconcileRefundAttempt,
+  listRefundRecovery,
   requestTicketRefund,
   cancelEvent,
   settleSucceededCharge,
@@ -77,10 +79,30 @@ const createChargeMock = createCharge as jest.MockedFunction<typeof createCharge
 const getChargeMock = getCharge as jest.MockedFunction<typeof getCharge>;
 const refundChargeMock = refundCharge as jest.MockedFunction<typeof refundCharge>;
 
+let recoveryLock: any;
 beforeEach(() => {
   // Reset return-value stubs between tests (clearMocks in jest.config only
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
+  recoveryLock = null;
+  prismaMock.ticketRefundLock.create.mockImplementation(async ({data}: any) => {
+    recoveryLock = { ...data, refundedBefore: null }; return recoveryLock;
+  });
+  prismaMock.ticketRefundLock.findUnique.mockImplementation(async () => recoveryLock);
+  prismaMock.ticketRefundLock.update.mockImplementation(async ({where, data}: any) => {
+    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId) throw new Error('attempt no longer owns lock');
+    Object.assign(recoveryLock, data); return recoveryLock;
+  });
+  prismaMock.ticketRefundLock.updateMany.mockImplementation(async ({where, data}: any) => {
+    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && recoveryLock.phase !== where.phase)) return {count: 0};
+    Object.assign(recoveryLock, data); return {count: 1};
+  });
+  prismaMock.ticketRefundLock.deleteMany.mockImplementation(async ({where}: any) => {
+    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && recoveryLock.phase !== where.phase)) return {count: 0};
+    recoveryLock = null;
+    await prismaMock.ticketRefundLock.delete({where: {chargeId: where.chargeId}});
+    return {count: 1};
+  });
   prismaMock.$transaction.mockImplementation(((callback: any) => typeof callback === 'function' ? callback(prismaMock) : Promise.all(callback)) as any);
   prismaMock.$queryRaw.mockResolvedValue([{
     saleStartDate: new Date(0), saleEndDate: new Date('2099-01-01'), isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
@@ -1641,10 +1663,11 @@ describe('shared-charge refund accounting', () => {
       return row ? { ...row } : null;
     });
     prismaMock.ticket.findMany.mockImplementation(async () => tickets.filter(t => t.status === 'sold').map(t => ({ ...t })));
-    prismaMock.ticketRefundLock.create.mockImplementation(async () => {
+    prismaMock.ticketRefundLock.create.mockImplementation(async ({data}: any) => {
       if (locked) throw Object.assign(new Error('unique charge claim'), { code: 'P2002' });
       locked = true;
-      return {} as any;
+      recoveryLock = { ...data, refundedBefore: null };
+      return recoveryLock;
     });
     prismaMock.ticketRefundLock.delete.mockImplementation(async () => {
       locked = false;
@@ -1660,6 +1683,17 @@ describe('shared-charge refund accounting', () => {
       refunded += amount!;
       return buildRefundResult({ refunded_amount: String(refunded), status: refunded === 300 ? 'REFUNDED' : 'PARTIAL_REFUNDED' });
     });
+  });
+
+  it('recovery of a confirmed refund unblocks other tickets on the shared charge', async () => {
+    prismaMock.$transaction.mockRejectedValueOnce(new Error('commit failed'));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode:502});
+    expect(refunded).toBe(100);
+    expect(recoveryLock.phase).toBe('CONFIRMED');
+    expect(await reconcileRefundAttempt('chg_1', recoveryLock.attemptId)).toMatchObject({status:'FINALIZED'});
+    expect((await cancelEvent('event-1', ORGANIZER)).refunded).toBe(2);
+    expect(refunded).toBe(300);
+    expect(refundChargeMock).toHaveBeenCalledTimes(3);
   });
 
   it('refunds one of three tickets, leaves two valid, then cancels only the remaining paid amount', async () => {
@@ -1780,10 +1814,11 @@ describe('cancelled-event payment lifecycle', () => {
       return { count: 1 };
     });
     prismaMock.ticket.update.mockImplementation(async ({ data }: any) => Object.assign(row, data));
-    prismaMock.ticketRefundLock.create.mockImplementation(async () => {
+    prismaMock.ticketRefundLock.create.mockImplementation(async ({data}: any) => {
       if (locked) throw Object.assign(new Error('refund locked'), { code: 'P2002' });
       locked = true;
-      return {} as any;
+      recoveryLock = { ...data, refundedBefore: null };
+      return recoveryLock;
     });
     prismaMock.ticketRefundLock.delete.mockImplementation(async () => { locked = false; return {} as any; });
     getChargeMock.mockImplementation(async () => buildCharge({ refunded_amount: String(refunded),
@@ -2020,5 +2055,94 @@ describe('cancelled-event payment lifecycle', () => {
     expect(row).toMatchObject({ status: 'reserved', paymentStatus: 'SUCCEEDED' });
     expect(refundChargeMock).toHaveBeenCalledTimes(1);
     expect(locked).toBe(true);
+  });
+});
+
+describe('durable refund recovery', () => {
+  const attempt = (over: any = {}) => ({ chargeId: 'chg_1', ticketId: 'ticket-1', amount: 100,
+    refundedBefore: 0, attemptId: 'attempt-1', phase: 'DISPATCHING', confirmedRef: null, ...over });
+
+  it.each(['PREPARED', 'REJECTED'])('recovers %s without dispatching or querying the gateway', async phase => {
+    recoveryLock = attempt({ phase });
+    expect(await reconcileRefundAttempt('chg_1', 'attempt-1')).toMatchObject({status: 'RETRYABLE'});
+    expect(recoveryLock).toBeNull();
+    expect(getChargeMock).not.toHaveBeenCalled();
+    expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('cannot release an attempt that starts dispatch during recovery', async () => {
+    recoveryLock = attempt({phase: 'PREPARED'});
+    prismaMock.ticketRefundLock.deleteMany.mockImplementationOnce(async () => {
+      recoveryLock.phase = 'DISPATCHING'; return {count: 0};
+    });
+    await expect(reconcileRefundAttempt('chg_1', 'attempt-1')).rejects.toMatchObject({statusCode: 409});
+    expect(recoveryLock.phase).toBe('DISPATCHING');
+    expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['0', '100', '150'])('retains an ambiguous lost response with cumulative total %s', async total => {
+    recoveryLock = attempt();
+    getChargeMock.mockResolvedValue(buildCharge({refunded_amount: total, status: 'PARTIAL_REFUNDED'}));
+    expect(await reconcileRefundAttempt('chg_1', 'attempt-1')).toMatchObject({status: 'REVIEW_REQUIRED'});
+    expect(recoveryLock.detail).toContain('Inspect processor');
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('a crash saving the successful response retains an actionable ambiguous block', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
+    prismaMock.event.findUnique.mockResolvedValue({id:'event-1', organizerId:'org-1'} as any);
+    refundChargeMock.mockResolvedValue(buildRefundResult());
+    prismaMock.ticketRefundLock.update.mockImplementation(async ({data}: any) => {
+      if (data.phase === 'CONFIRMED') throw new Error('confirmation write lost');
+      Object.assign(recoveryLock, data); return recoveryLock;
+    });
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode:502});
+    getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
+    expect(await reconcileRefundAttempt('chg_1', recoveryLock.attemptId)).toMatchObject({status:'REVIEW_REQUIRED'});
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(refundChargeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('finalizes durable provider confirmation exactly once after a local transaction failure', async () => {
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
+    prismaMock.event.findUnique.mockResolvedValue({id:'event-1', organizerId:'org-1'} as any);
+    refundChargeMock.mockResolvedValue(buildRefundResult());
+    prismaMock.$transaction.mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode: 502});
+    expect(recoveryLock.phase).toBe('CONFIRMED');
+    const token = recoveryLock.attemptId;
+    getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
+    expect(await reconcileRefundAttempt('chg_1', token)).toMatchObject({status:'FINALIZED'});
+    expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
+    await expect(reconcileRefundAttempt('chg_1', token)).rejects.toMatchObject({statusCode:409});
+    expect(refundChargeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('concurrent reconcilers finalize only once', async () => {
+    recoveryLock = attempt({phase:'CONFIRMED', confirmedRef:'refund-1'});
+    getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
+    const outcomes = await Promise.allSettled([reconcileRefundAttempt('chg_1','attempt-1'), reconcileRefundAttempt('chg_1','attempt-1')]);
+    expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(1);
+    expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
+    expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('a stale recovery token cannot release a replacement attempt', async () => {
+    recoveryLock = attempt({attemptId:'replacement', phase:'PREPARED'});
+    await expect(reconcileRefundAttempt('chg_1','attempt-1')).rejects.toMatchObject({statusCode:409});
+    expect(recoveryLock.attemptId).toBe('replacement');
+  });
+
+  it('gateway failures surface and retain the lock', async () => {
+    recoveryLock = attempt();
+    getChargeMock.mockRejectedValue(new Error('gateway unavailable'));
+    await expect(reconcileRefundAttempt('chg_1','attempt-1')).rejects.toThrow('gateway unavailable');
+    expect(recoveryLock).not.toBeNull();
+  });
+
+  it('lists actionable unresolved status', async () => {
+    prismaMock.ticketRefundLock.findMany.mockResolvedValue([attempt()] as any);
+    expect(await listRefundRecovery()).toEqual([expect.objectContaining({recoveryStatus:'REVIEW_REQUIRED', attemptId:'attempt-1'})]);
   });
 });

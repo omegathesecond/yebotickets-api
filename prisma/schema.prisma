@@ -340,5 +340,9 @@ model TicketRefundLock {
   ticketId       String
   amount         Float
   refundedBefore Float?
+  attemptId      String   @default(uuid())
+  phase          String   @default("REVIEW")
+  confirmedRef   String?
+  detail         String?
   createdAt      DateTime @default(now())
 }

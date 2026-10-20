@@ -1899,9 +1899,10 @@ const refundAndCancelTicket = async (
 
   // A unique DB key, not a process-local mutex: protects concurrent workers and
   // different tickets on the same charge, including after a process restart.
+  const attemptId = crypto.randomUUID();
   try {
     await prisma.ticketRefundLock.create({
-      data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount },
+      data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED' },
     });
   } catch (error) {
     if ((error as { code?: string }).code === 'P2002') {
@@ -1917,7 +1918,7 @@ const refundAndCancelTicket = async (
     // the charge lock committed. Re-read only AFTER acquiring the lock.
     const current = await prisma.ticket.findUnique({ where: { id: ticket.id } });
     if (current?.status === 'cancelled' || current?.paymentStatus === 'REFUNDED') {
-      await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } });
+      await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef, attemptId } });
       return { ...base, result: 'already_handled', notified: false };
     }
     if (!current || (current.status !== 'sold' &&
@@ -1935,8 +1936,13 @@ const refundAndCancelTicket = async (
       throw new Error('gateway charge is not refundable for this ticket amount');
     }
     await prisma.ticketRefundLock.update({
-      where: { chargeId: ticket.paymentRef }, data: { refundedBefore: before },
+      where: { chargeId: ticket.paymentRef, attemptId }, data: { refundedBefore: before },
     });
+    const claimed = await prisma.ticketRefundLock.updateMany({
+      where: { chargeId: ticket.paymentRef, attemptId, phase: 'PREPARED' },
+      data: { phase: 'DISPATCHING' },
+    });
+    if (claimed.count !== 1) throw new Error('refund attempt was recovered before dispatch');
     dispatched = true;
     const res = await refundCharge({ chargeId: ticket.paymentRef, amount, reason });
     // refunded_amount is CUMULATIVE, not the amount returned for this ticket.
@@ -1948,26 +1954,25 @@ const refundAndCancelTicket = async (
     }
     refund = { refundRef: res.processor_ref ?? res.charge_id, amount };
 
+    await prisma.ticketRefundLock.update({
+      where: { chargeId: ticket.paymentRef, attemptId },
+      data: { phase: 'CONFIRMED', confirmedRef: refund.refundRef },
+    });
+
     // Keep the claim if this transaction fails after the provider moved money.
     // Ticket finalization and releasing the claim must commit together.
-    await prisma.$transaction([
-      prisma.ticket.update({
-        where: { id: ticket.id },
-        data: {
-          status: 'cancelled', paymentStatus: 'REFUNDED',
-          refundRef: refund.refundRef, refundedAt: new Date(), cancelledAt: new Date(),
-          refundRequestedAt: null, refundRequestReason: null,
-        },
-      }),
-      prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } }),
-    ]);
+    await finalizeRefundAttempt(ticket.paymentRef, attemptId, refund.refundRef);
   } catch (error) {
     // These gateway responses reject BEFORE processor dispatch. A 409 is a
     // rejection, never evidence that THIS ticket's refund succeeded.
     const rejected = error instanceof YeboPayHttpError &&
       [400, 401, 403, 404, 409, 501].includes(error.status);
+    if (dispatched && rejected) {
+      await prisma.ticketRefundLock.update({ where: { chargeId: ticket.paymentRef, attemptId },
+        data: { phase: 'REJECTED', detail: errorMessage(error) } });
+    }
     if (!dispatched || rejected) {
-      await prisma.ticketRefundLock.delete({ where: { chargeId: ticket.paymentRef } });
+      await prisma.ticketRefundLock.deleteMany({ where: { chargeId: ticket.paymentRef, attemptId } });
     }
     console.error('YeboPay refund failed for ticket', ticket.id, error);
     return failed(`${errorMessage(error)}${dispatched && !rejected ? '; charge blocked pending reconciliation' : ''}`);
@@ -2248,4 +2253,57 @@ export const cancelEvent = async (
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to cancel event', 500);
   }
+};
+
+
+// Claim deletion and ticket accounting commit together. The attempt token fences
+// stale owners: a replacement attempt can never be released by this one.
+const finalizeRefundAttempt = async (chargeId: string, attemptId: string, refundRef: string | null) => {
+  return prisma.$transaction(async tx => {
+    const lock = await tx.ticketRefundLock.findUnique({ where: { chargeId } });
+    if (!lock || lock.attemptId !== attemptId || lock.phase !== 'CONFIRMED') {
+      throw new ApiError('Refund attempt changed; reload recovery status', 409);
+    }
+    const released = await tx.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: 'CONFIRMED' } });
+    if (released.count !== 1) throw new ApiError('Refund recovery already in progress', 409);
+    await tx.ticket.update({ where: { id: lock.ticketId }, data: {
+      status: 'cancelled', paymentStatus: 'REFUNDED', refundRef,
+      refundedAt: new Date(), cancelledAt: new Date(),
+      refundRequestedAt: null, refundRequestReason: null,
+    } });
+  });
+};
+
+export const listRefundRecovery = async () => {
+  const locks = await prisma.ticketRefundLock.findMany({ orderBy: { createdAt: 'asc' } });
+  return locks.map(lock => ({ ...lock,
+    recoveryStatus: ['PREPARED', 'REJECTED'].includes(lock.phase) ? 'RETRYABLE_AFTER_RECONCILIATION'
+      : lock.phase === 'CONFIRMED' ? 'READY_TO_RECONCILE' : 'REVIEW_REQUIRED',
+    action: 'POST /api/tickets/refund-recovery/' + encodeURIComponent(lock.chargeId) + '/reconcile with attemptId',
+  }));
+};
+
+/** Never dispatch money from recovery. An unchanged cumulative total cannot
+ * prove that an in-flight processor request will not settle later. */
+export const reconcileRefundAttempt = async (chargeId: string, attemptId: string) => {
+  const lock = await prisma.ticketRefundLock.findUnique({ where: { chargeId } });
+  if (!lock || lock.attemptId !== attemptId) throw new ApiError('Refund attempt changed; reload recovery status', 409);
+  if (['PREPARED', 'REJECTED'].includes(lock.phase)) {
+    const released = await prisma.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: lock.phase } });
+    if (released.count !== 1) throw new ApiError('Refund dispatch started; reload recovery status', 409);
+    return { status: 'RETRYABLE', ticketId: lock.ticketId };
+  }
+  const charge = await getCharge(chargeId);
+  const expected = Number(lock.refundedBefore) + lock.amount;
+  if (lock.phase === 'CONFIRMED' && lock.refundedBefore !== null &&
+      charge.id === chargeId && charge.currency === TICKET_CURRENCY &&
+      ['REFUNDED', 'PARTIAL_REFUNDED'].includes(charge.status) &&
+      Number.isFinite(Number(charge.refunded_amount)) &&
+      Math.round(Number(charge.refunded_amount) * 100) === Math.round(expected * 100)) {
+    await finalizeRefundAttempt(chargeId, attemptId, lock.confirmedRef);
+    return { status: 'FINALIZED', ticketId: lock.ticketId };
+  }
+  const detail = 'Gateway cumulative totals cannot attribute this attempt. Inspect processor refund records for this charge; do not retry money movement. Escalate to payment operations for authoritative attempt evidence.';
+  await prisma.ticketRefundLock.updateMany({ where: { chargeId, attemptId }, data: { detail } });
+  return { status: 'REVIEW_REQUIRED', ticketId: lock.ticketId, detail, charge };
 };
