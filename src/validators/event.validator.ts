@@ -1,3 +1,4 @@
+import { assertDateInterval } from '../utils/dateInterval';
 import { body } from 'express-validator';
 
 export const moderateEventValidator = [
@@ -68,9 +69,7 @@ export const createEventValidator = [
     .isISO8601()
     .withMessage('End date must be a valid date in ISO 8601 format')
     .custom((value, { req }) => {
-      if (new Date(value) <= new Date(req.body.startDate)) {
-        throw new Error('End date must be after start date');
-      }
+      assertDateInterval(req.body.startDate, value, 'End date must be after start date');
       return true;
     }),
   
@@ -134,8 +133,8 @@ export const updateEventValidator = [
     .isISO8601()
     .withMessage('End date must be a valid date in ISO 8601 format')
     .custom((value, { req }) => {
-      if (req.body.startDate && new Date(value) <= new Date(req.body.startDate)) {
-        throw new Error('End date must be after start date');
+      if (req.body.startDate !== undefined) {
+        assertDateInterval(req.body.startDate, value, 'End date must be after start date');
       }
       return true;
     }),

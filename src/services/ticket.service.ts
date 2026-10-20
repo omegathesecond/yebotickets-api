@@ -1,3 +1,4 @@
+import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
 import { 
@@ -97,6 +98,7 @@ export const createTicketType = async (
   eventId: string,
   organizerId: string
 ) => {
+  assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
     // First verify the event belongs to this organizer
     const event = await prisma.event.findFirst({
@@ -191,47 +193,56 @@ export const updateTicketType = async (
   organizerId: string
 ) => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
+    return await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
+      // Find ticket type
+      const ticketType = await tx.ticketType.findUnique({
+        where: { id: ticketTypeId },
+      });
+
+      if (!ticketType) {
+        throw new ApiError('Ticket type not found', 404);
+      }
+
+      // Verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: ticketType.eventId,
+          organizerId,
+        },
+      });
+
+      if (!event) {
+        throw new ApiError('You do not have permission to update this ticket type', 403);
+      }
+
+      assertDateInterval(
+        updateData.saleStartDate === undefined ? ticketType.saleStartDate : updateData.saleStartDate,
+        updateData.saleEndDate === undefined ? ticketType.saleEndDate : updateData.saleEndDate,
+        'Sale end date must be after sale start date'
+      );
+
+      // Build update object
+      const updates: any = {};
+      if (updateData.name) updates.name = updateData.name;
+      if (updateData.description !== undefined) updates.description = updateData.description;
+      if (updateData.price !== undefined) updates.price = updateData.price;
+      if (updateData.quantity !== undefined) updates.quantity = updateData.quantity;
+      if (updateData.type) updates.type = updateData.type.toLowerCase();
+      if (updateData.saleStartDate) updates.saleStartDate = new Date(updateData.saleStartDate);
+      if (updateData.saleEndDate) updates.saleEndDate = new Date(updateData.saleEndDate);
+
+      // Update the ticket type
+      const updated = await tx.ticketType.update({
+        where: { id: ticketTypeId },
+        data: updates,
+      });
+
+      return {
+        ...updated,
+        type: mapTicketType(updated.type),
+      };
     });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to update this ticket type', 403);
-    }
-
-    // Build update object
-    const updates: any = {};
-    if (updateData.name) updates.name = updateData.name;
-    if (updateData.description !== undefined) updates.description = updateData.description;
-    if (updateData.price !== undefined) updates.price = updateData.price;
-    if (updateData.quantity !== undefined) updates.quantity = updateData.quantity;
-    if (updateData.type) updates.type = updateData.type.toLowerCase();
-    if (updateData.saleStartDate) updates.saleStartDate = new Date(updateData.saleStartDate);
-    if (updateData.saleEndDate) updates.saleEndDate = new Date(updateData.saleEndDate);
-
-    // Update the ticket type
-    const updated = await prisma.ticketType.update({
-      where: { id: ticketTypeId },
-      data: updates,
-    });
-
-    return {
-      ...updated,
-      type: mapTicketType(updated.type),
-    };
   } catch (error) {
     console.error('Error in updateTicketType service:', error);
     if (error instanceof ApiError) throw error;

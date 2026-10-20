@@ -1,4 +1,5 @@
 import prisma from '../config/prisma';
+import { assertDateInterval } from '../utils/dateInterval';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
@@ -54,6 +55,7 @@ const transformEvent = (
  * @returns Created event
  */
 export const createEvent = async (eventData: IEventInput, organizerId: string) => {
+  assertDateInterval(eventData.startDate, eventData.endDate, 'End date must be after start date');
   try {
     const event = await prisma.event.create({
       data: {
@@ -258,43 +260,53 @@ export const updateEvent = async (
   organizerId: string
 ) => {
   try {
-    // First check if the event exists and belongs to this organizer
-    const existingEvent = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
-    });
-
-    if (!existingEvent) {
-      throw new ApiError('Event not found or you do not have permission to update it', 404);
-    }
-
-    // Build update object
-    const updateObj: any = {};
-    if (updateData.title) updateObj.title = updateData.title;
-    if (updateData.description) updateObj.description = updateData.description;
-    if (updateData.location) {
-      Object.assign(updateObj, flattenEventLocation(updateData.location));
-    }
-    if (updateData.startDate) updateObj.startDate = new Date(updateData.startDate);
-    if (updateData.endDate) updateObj.endDate = new Date(updateData.endDate);
-    if (updateData.isPublished !== undefined) updateObj.isPublished = updateData.isPublished;
-    if (updateData.coverImage !== undefined) updateObj.coverImage = updateData.coverImage;
-    if (updateData.category) updateObj.category = updateData.category;
-
-    // Update the event
-    const event = await prisma.event.update({
-      where: { id: eventId },
-      data: updateObj,
-      include: {
-        organizer: {
-          select: { id: true, name: true, email: true },
+    return await prisma.$transaction(async (tx) => {
+      // Lock before reading: opposing partial edits must validate the committed pair.
+      await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
+      // First check if the event exists and belongs to this organizer
+      const existingEvent = await tx.event.findFirst({
+        where: {
+          id: eventId,
+          organizerId,
         },
-      },
-    });
+      });
 
-    return transformEvent(event);
+      if (!existingEvent) {
+        throw new ApiError('Event not found or you do not have permission to update it', 404);
+      }
+
+      assertDateInterval(
+        updateData.startDate === undefined ? existingEvent.startDate : updateData.startDate,
+        updateData.endDate === undefined ? existingEvent.endDate : updateData.endDate,
+        'End date must be after start date'
+      );
+
+      // Build update object
+      const updateObj: any = {};
+      if (updateData.title) updateObj.title = updateData.title;
+      if (updateData.description) updateObj.description = updateData.description;
+      if (updateData.location) {
+        Object.assign(updateObj, flattenEventLocation(updateData.location));
+      }
+      if (updateData.startDate) updateObj.startDate = new Date(updateData.startDate);
+      if (updateData.endDate) updateObj.endDate = new Date(updateData.endDate);
+      if (updateData.isPublished !== undefined) updateObj.isPublished = updateData.isPublished;
+      if (updateData.coverImage !== undefined) updateObj.coverImage = updateData.coverImage;
+      if (updateData.category) updateObj.category = updateData.category;
+
+      // Update the event
+      const event = await tx.event.update({
+        where: { id: eventId },
+        data: updateObj,
+        include: {
+          organizer: {
+            select: { id: true, name: true, email: true },
+          },
+        },
+      });
+
+      return transformEvent(event);
+    });
   } catch (error) {
     console.error('Error in updateEvent service:', error);
     if (error instanceof ApiError) throw error;
