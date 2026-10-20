@@ -626,6 +626,20 @@ const assertEventOnSale = (event: SaleEvent | undefined): void => {
   }
 };
 
+type SaleTier = { saleStartDate: Date; saleEndDate: Date };
+
+// Sale windows are start-inclusive and end-exclusive, in absolute UTC time.
+const assertTierOnSale = (tier: SaleTier | undefined): void => {
+  if (!tier) throw new ApiError('Ticket type not found', 404);
+  const now = new Date();
+  if (now < tier.saleStartDate) {
+    throw new ApiError('This ticket type is not yet on sale.', 400);
+  }
+  if (now >= tier.saleEndDate) {
+    throw new ApiError('Sales for this ticket type have closed.', 400);
+  }
+};
+
 const claimAvailableTickets = async (
   ticketTypeId: string,
   eventId: string,
@@ -642,6 +656,13 @@ const claimAvailableTickets = async (
       FROM "Event" WHERE "id" = ${eventId} FOR SHARE
     `;
     assertEventOnSale(events[0]);
+    // Tier edits use a conflicting row lock. Re-read after acquiring it so an
+    // edit committed since the initial lookup cannot bypass the sale window.
+    const tiers = await tx.$queryRaw<SaleTier[]>`
+      SELECT "saleStartDate", "saleEndDate"
+      FROM "TicketType" WHERE "id" = ${ticketTypeId} AND "eventId" = ${eventId} FOR SHARE
+    `;
+    assertTierOnSale(tiers[0]);
     const claimedIds: string[] = [];
 
     while (claimedIds.length < quantity) {
@@ -1193,6 +1214,7 @@ export const purchaseTicket = async (
     }
 
     assertEventOnSale(ticketType.event);
+    assertTierOnSale(ticketType);
 
     const price = ticketType.price;
 
