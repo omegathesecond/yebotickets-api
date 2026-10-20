@@ -32,7 +32,22 @@ import { protect, authorize } from '../middleware/auth.middleware';
 import { purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
+import { listRefundRecovery, reconcileRefundAttempt } from '../services/ticket.service';
+
 const router = express.Router();
+
+router.get('/refund-recovery', protect, authorize(UserRole.ADMIN), async (_req, res, next) => {
+  try { res.json({ success: true, data: await listRefundRecovery() }); } catch (error) { next(error); }
+});
+router.post('/refund-recovery/:chargeId/reconcile', protect, authorize(UserRole.ADMIN), async (req, res, next) => {
+  try {
+    if (typeof req.body.attemptId !== 'string' || !req.body.attemptId) {
+      res.status(400).json({ success: false, message: 'attemptId is required from recovery status' });
+      return;
+    }
+    res.json({ success: true, data: await reconcileRefundAttempt(req.params.chargeId, req.body.attemptId) });
+  } catch (error) { next(error); }
+});
 
 /**
  * @swagger
