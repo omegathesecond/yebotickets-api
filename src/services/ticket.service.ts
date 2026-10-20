@@ -626,6 +626,19 @@ const assertEventOnSale = (event: SaleEvent | undefined): void => {
   }
 };
 
+type SaleTier = { saleStartDate: Date; saleEndDate: Date };
+
+const assertTierOnSale = (tier: SaleTier): void => {
+  const now = new Date();
+  // Half-open interval: the start instant is eligible; the end instant is closed.
+  if (now < tier.saleStartDate) {
+    throw new ApiError('This ticket tier is not yet on sale.', 400);
+  }
+  if (now >= tier.saleEndDate) {
+    throw new ApiError('Sales for this ticket tier have closed.', 400);
+  }
+};
+
 const claimAvailableTickets = async (
   ticketTypeId: string,
   eventId: string,
@@ -634,14 +647,18 @@ const claimAvailableTickets = async (
   data: Record<string, unknown>
 ): Promise<{ tickets: any[]; availableRemaining: number }> => {
   return prisma.$transaction(async (tx) => {
-    // Hold a shared row lock through the inventory claim. Unpublish/cancel
-    // updates take a conflicting lock: whichever commits first determines
+    // Hold shared event and tier locks through the inventory claim. Sale-date,
+    // unpublish and cancel updates take a conflicting lock: whichever commits first determines
     // whether this purchase may claim inventory. Never hold it over YeboPay.
-    const events = await tx.$queryRaw<SaleEvent[]>`
-      SELECT "isCancelled", "isPublished", "endDate"
-      FROM "Event" WHERE "id" = ${eventId} FOR SHARE
+    const events = await tx.$queryRaw<(SaleEvent & SaleTier)[]>`
+      SELECT e."isCancelled", e."isPublished", e."endDate",
+             t."saleStartDate", t."saleEndDate"
+      FROM "Event" e JOIN "TicketType" t ON t."eventId" = e."id"
+      WHERE e."id" = ${eventId} AND t."id" = ${ticketTypeId}
+      FOR SHARE OF e, t
     `;
     assertEventOnSale(events[0]);
+    assertTierOnSale(events[0]);
     const claimedIds: string[] = [];
 
     while (claimedIds.length < quantity) {
@@ -1193,6 +1210,7 @@ export const purchaseTicket = async (
     }
 
     assertEventOnSale(ticketType.event);
+    assertTierOnSale(ticketType);
 
     const price = ticketType.price;
 

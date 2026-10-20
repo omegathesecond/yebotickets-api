@@ -644,6 +644,58 @@ describe('purchaseTicket — payment + atomic claim', () => {
     expect(createChargeMock).not.toHaveBeenCalled();
   });
 
+  describe.each([0, 100])('tier sale window (price %s)', (price) => {
+    const now = new Date('2026-06-01T12:00:00Z');
+    beforeEach(() => { jest.useFakeTimers(); jest.setSystemTime(now); });
+    afterEach(() => { jest.useRealTimers(); });
+
+    const cases = [
+      ['future start', { saleStartDate: new Date(now.getTime() + 1) }, 'not yet on sale'],
+      ['past end', { saleEndDate: new Date(now.getTime() - 1) }, 'have closed'],
+      ['exact end', { saleEndDate: now }, 'have closed'],
+    ] as const;
+
+    it.each(cases)('rejects %s before inventory or payment', async (_name, dates, message) => {
+      prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price, ...dates }) as any);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+        statusCode: 400, message: expect.stringContaining(message),
+      });
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+      expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+      expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+      expect(createChargeMock).not.toHaveBeenCalled();
+    });
+
+    it.each(cases)('rejects a racing edit to %s under both row locks', async (_name, dates, message) => {
+      const tier = buildTicketType({ price });
+      prismaMock.ticketType.findUnique.mockResolvedValue(tier as any);
+      prismaMock.$queryRaw.mockResolvedValue([{ ...tier.event, ...tier, ...dates }]);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({
+        statusCode: 400, message: expect.stringContaining(message),
+      });
+      const [sql, eventId, tierId] = prismaMock.$queryRaw.mock.calls[0];
+      expect((sql as TemplateStringsArray).join('')).toContain('FOR SHARE OF e, t');
+      expect([eventId, tierId]).toEqual(['event-1', 'tt-1']);
+      expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+      expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+      expect(createChargeMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['exact start', 'open'])('allows an %s tier', async timing => {
+      const tier = buildTicketType({ price, saleStartDate: new Date(now.getTime() - (timing === 'open' ? 1 : 0)) });
+      prismaMock.ticketType.findUnique.mockResolvedValue(tier as any);
+      prismaMock.$queryRaw.mockResolvedValue([{ ...tier.event, ...tier }]);
+      prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
+      prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+      prismaMock.ticket.findMany.mockResolvedValue([buildTicketWithRelations()] as any);
+      if (price > 0) prismaMock.ticket.findMany.mockResolvedValueOnce([]);
+      createChargeMock.mockResolvedValue(buildCharge() as any);
+      await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).resolves.toBeDefined();
+      expect(prismaMock.ticket.updateMany).toHaveBeenCalled();
+      expect(createChargeMock).toHaveBeenCalledTimes(price > 0 ? 1 : 0);
+    });
+  });
+
   describe.each([0, 100])('event eligibility (price %s)', (price) => {
     const cases = [
       ['unpublished', { isPublished: false }, 'not published'],
