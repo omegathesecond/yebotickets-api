@@ -1,3 +1,4 @@
+import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
 import { 
@@ -97,6 +98,7 @@ export const createTicketType = async (
   eventId: string,
   organizerId: string
 ) => {
+  assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
     // First verify the event belongs to this organizer
     const event = await prisma.event.findFirst({
@@ -239,6 +241,11 @@ export const updateTicketType = async (
         throw new ApiError('You do not have permission to update this ticket type', 403);
       }
 
+      assertDateInterval(
+        updateData.saleStartDate === undefined ? ticketType.saleStartDate : updateData.saleStartDate,
+        updateData.saleEndDate === undefined ? ticketType.saleEndDate : updateData.saleEndDate,
+        'Sale end date must be after sale start date'
+      );
       await assertInventoryCapacity(tx, ticketTypeId, updateData.quantity ?? ticketType.quantity);
 
       // Build update object

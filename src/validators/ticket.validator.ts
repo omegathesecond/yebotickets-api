@@ -1,3 +1,4 @@
+import { assertDateInterval } from '../utils/dateInterval';
 import { body, param } from 'express-validator';
 import { TicketType as TicketTypeEnum } from '../interfaces/ticket.interface';
 
@@ -50,9 +51,7 @@ export const createTicketTypeValidator = [
     .isISO8601()
     .withMessage('Sale end date must be a valid date in ISO 8601 format')
     .custom((value, { req }) => {
-      if (new Date(value) <= new Date(req.body.saleStartDate)) {
-        throw new Error('Sale end date must be after sale start date');
-      }
+      assertDateInterval(req.body.saleStartDate, value, 'Sale end date must be after sale start date');
       return true;
     }),
 ];
@@ -101,8 +100,8 @@ export const updateTicketTypeValidator = [
     .isISO8601()
     .withMessage('Sale end date must be a valid date in ISO 8601 format')
     .custom((value, { req }) => {
-      if (req.body.saleStartDate && new Date(value) <= new Date(req.body.saleStartDate)) {
-        throw new Error('Sale end date must be after sale start date');
+      if (req.body.saleStartDate !== undefined) {
+        assertDateInterval(req.body.saleStartDate, value, 'Sale end date must be after sale start date');
       }
       return true;
     }),

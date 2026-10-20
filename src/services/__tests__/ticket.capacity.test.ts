@@ -12,7 +12,7 @@ describe('ticket tier capacity', () => {
   let tail: Promise<void>;
   beforeEach(() => {
     mockReset(db);
-    tier = { id: 'tier', eventId: 'event', quantity: 5, type: 'standard' };
+    tier = { id: 'tier', eventId: 'event', quantity: 5, type: 'standard', saleStartDate: new Date('2030-01-01'), saleEndDate: new Date('2030-02-01') };
     inventory = [];
     tail = Promise.resolve();
     // Model PostgreSQL's row lock, acquired by the production SELECT FOR UPDATE.
@@ -51,6 +51,11 @@ describe('ticket tier capacity', () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => jest.restoreAllMocks());
+
+  it('rejects generating six tickets for a capacity of five without writes', async () => {
+    await expect(generateTickets('tier', 6, 'owner')).rejects.toMatchObject({ statusCode: 400 });
+    expect(inventory).toHaveLength(0);
+  });
 
   it('generates initial inventory, then only remaining capacity; retries and excess do not write', async () => {
     await expect(generateTickets('tier', 3, 'owner')).resolves.toMatchObject({ count: 3 });

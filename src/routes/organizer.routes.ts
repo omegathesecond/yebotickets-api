@@ -85,6 +85,7 @@ import {
   deleteOrganizerController,
   changePasswordController
 } from '../controllers/organizer.controller';
+import { createEventValidator } from '../validators/event.validator';
 import { validate } from '../middleware/validate.middleware';
 import {
   organizerProfileValidator,
@@ -611,6 +612,6 @@ router.get('/events', (req: Request, res: Response, next: NextFunction) => {
   next();
 }, getEventsController);
 
-router.post('/events', createEventController);
+router.post('/events', validate(createEventValidator), createEventController);
 
 export default router; 
