@@ -127,6 +127,6 @@ export const processWebhook = async (
   signatureHeader: string | undefined
 ): Promise<{ event: YeboPayWebhookEvent; outcome: WebhookChargeOutcome | { result: 'ignored' } }> => {
   const event = verifyAndParseWebhook(rawBody, signatureHeader);
-  const outcome = await handleChargeWebhookEvent(event.type, { id: event.data.id });
+  const outcome = await handleChargeWebhookEvent(event.type, { id: event.data.id, description: event.data.description });
   return { event, outcome };
 };
