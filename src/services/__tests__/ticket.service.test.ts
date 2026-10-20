@@ -55,6 +55,7 @@ import { processWebhook } from '../payment-webhook.service';
 import {
   purchaseTicket,
   verifyTicket,
+  confirmCheckIn,
   refundTicket,
   requestTicketRefund,
   cancelEvent,
@@ -724,7 +725,8 @@ describe('verifyTicket (gate check-in guard)', () => {
   it('checks in a sold, un-checked ticket and sets isCheckedIn/checkedInAt', async () => {
     grantEventAccess();
     prismaMock.ticket.findFirst.mockResolvedValue(buildCheckInTicket() as any);
-    prismaMock.ticket.update.mockResolvedValue(
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.ticket.findUniqueOrThrow.mockResolvedValue(
       buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date() }) as any
     );
 
@@ -732,9 +734,9 @@ describe('verifyTicket (gate check-in guard)', () => {
 
     expect(result.valid).toBe(true);
     expect(result.message).toBe('Check-in successful');
-    expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
-    const updateArg = prismaMock.ticket.update.mock.calls[0][0];
-    expect(updateArg.where).toEqual({ id: 'ticket-1' });
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    const updateArg = prismaMock.ticket.updateMany.mock.calls[0][0];
+    expect(updateArg.where).toEqual({ id: 'ticket-1', status: 'sold', isCheckedIn: false });
     expect(updateArg.data).toMatchObject({
       isCheckedIn: true,
       checkedInAt: expect.any(Date),
@@ -750,7 +752,7 @@ describe('verifyTicket (gate check-in guard)', () => {
     expect(result.valid).toBe(false);
     expect(result.message).toBe('Ticket has already been used for check-in');
     // The double-entry guard must never re-stamp an already-used ticket.
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
   });
 
   it("REJECTS a ticket whose status is not 'sold'", async () => {
@@ -761,7 +763,7 @@ describe('verifyTicket (gate check-in guard)', () => {
 
     expect(result.valid).toBe(false);
     expect(result.message).toBe('Ticket is not valid for check-in');
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
   });
 
   it('REJECTS an unknown ticket code', async () => {
@@ -772,13 +774,14 @@ describe('verifyTicket (gate check-in guard)', () => {
 
     expect(result.valid).toBe(false);
     expect(result.message).toBe('Invalid ticket code');
-    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
   });
 
   it('scopes the ticket lookup by eventId (no cross-event check-in)', async () => {
     grantEventAccess();
     prismaMock.ticket.findFirst.mockResolvedValue(buildCheckInTicket() as any);
-    prismaMock.ticket.update.mockResolvedValue(
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.ticket.findUniqueOrThrow.mockResolvedValue(
       buildCheckInTicket({ isCheckedIn: true, checkedInAt: new Date() }) as any
     );
 
@@ -789,6 +792,100 @@ describe('verifyTicket (gate check-in guard)', () => {
     expect(findArg.where.eventId).toBe('event-99');
     // The code may be matched as either the db id or the uniqueCode.
     expect(findArg.where.OR).toEqual([{ id: 'ABC123' }, { uniqueCode: 'ABC123' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('atomic admission across scanners', () => {
+  const requester = { id: 'org-1', role: 'organizer' };
+
+  // Hold every lookup until all competing requests have read the unused row.
+  const interleave = (readers: number) => {
+    const row = buildCheckInTicket();
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+    prismaMock.ticket.findFirst.mockImplementation(async () => {
+      const snapshot = { ...row };
+      if (++reads === readers) release();
+      await barrier;
+      return snapshot as any;
+    });
+    prismaMock.ticket.updateMany.mockImplementation(async ({ where, data }: any) => {
+      if (where.id !== row.id || where.status !== row.status || where.isCheckedIn !== row.isCheckedIn) {
+        return { count: 0 };
+      }
+      Object.assign(row, data);
+      return { count: 1 };
+    });
+    prismaMock.ticket.findUnique.mockImplementation(async () => ({ ...row }) as any);
+    prismaMock.ticket.findUniqueOrThrow.mockImplementation(async () => ({ ...row }) as any);
+    return row;
+  };
+
+  it('allows exactly one of two verifications after both read an unused ticket', async () => {
+    const row = interleave(2);
+    const results = await Promise.all([
+      verifyTicket('ABC123', 'event-1', requester),
+      verifyTicket('ABC123', 'event-1', requester),
+    ]);
+    expect(results.map(result => result.valid).sort()).toEqual([false, true]);
+    expect(results.find(result => !result.valid)?.message).not.toBe('Check-in successful');
+    expect(row.isCheckedIn).toBe(true);
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('allows exactly one verify/confirm winner (verify starts first: %s)', async verifyFirst => {
+    interleave(2);
+    const verify = () => verifyTicket('ABC123', 'event-1', requester);
+    const confirm = () => confirmCheckIn('ticket-1', 'event-1', requester);
+    const results = await Promise.allSettled(verifyFirst ? [verify(), confirm()] : [confirm(), verify()]);
+    expect(results.filter(result => result.status === 'fulfilled' && result.value.valid)).toHaveLength(1);
+    const verifyResult = results[verifyFirst ? 0 : 1];
+    expect(verifyResult.status).toBe('fulfilled');
+    if (verifyResult.status === 'fulfilled' && !verifyResult.value.valid) {
+      expect(verifyResult.value.message).not.toBe('Check-in successful');
+    }
+    const confirmResult = results[verifyFirst ? 1 : 0];
+    if (confirmResult.status === 'rejected') expect(confirmResult.reason.statusCode).toBe(400);
+  });
+
+  it.each(['verify', 'confirm'])('does not admit a ticket cancelled between lookup and %s claim', async path => {
+    const row = interleave(1);
+    const claim = prismaMock.ticket.updateMany.getMockImplementation()!;
+    prismaMock.ticket.updateMany.mockImplementation(async args => {
+      row.status = 'cancelled';
+      return claim(args);
+    });
+    if (path === 'verify') {
+      expect(await verifyTicket('ABC123', 'event-1', requester)).toMatchObject({ valid: false });
+    } else {
+      await expect(confirmCheckIn('ABC123', 'event-1', requester)).rejects.toMatchObject({ statusCode: 400 });
+    }
+    expect(row.status).toBe('cancelled');
+    expect(row.isCheckedIn).toBe(false);
+    expect(prismaMock.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it.each([verifyTicket, confirmCheckIn])('rejects a wrong organiser before looking up or claiming a ticket', async admit => {
+    interleave(1);
+    await expect(admit('ABC123', 'event-1', { id: 'other-org', role: 'organizer' }))
+      .rejects.toMatchObject({ statusCode: 403 });
+    expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [null, 404],
+    [buildCheckInTicket({ isCheckedIn: true }), 400],
+    [buildCheckInTicket({ status: 'cancelled' }), 400],
+  ])('confirm rejects invalid or used tickets without claiming', async (ticket, statusCode) => {
+    interleave(1);
+    prismaMock.ticket.findFirst.mockResolvedValue(ticket as any);
+    await expect(confirmCheckIn('ABC123', 'event-1', requester)).rejects.toMatchObject({ statusCode });
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
   });
 });
 
