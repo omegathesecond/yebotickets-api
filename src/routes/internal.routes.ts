@@ -2,7 +2,12 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { verifyInternalApiKey } from '../middleware/auth.middleware';
 import { runReclaimSweep } from '../services/reservationReclaim.service';
 
+import { recoverOrderDeliveries } from '../services/ticket.service';
+
 const router = Router();
+router.post('/recover-ticket-deliveries', verifyInternalApiKey, async (_req, res, next) => {
+  try { await recoverOrderDeliveries(); res.json({ success: true }); } catch (error) { next(error); }
+});
 
 /**
  * @swagger

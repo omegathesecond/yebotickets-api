@@ -1,3 +1,4 @@
+import { startOrderDeliveryRecovery, stopOrderDeliveryRecovery } from './services/orderDeliveryRecovery.service';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -78,6 +79,7 @@ app.use(errorHandler);
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Shutting down gracefully...');
   stopReservationReclaimScheduler();
+  stopOrderDeliveryRecovery();
   await prisma.$disconnect();
   process.exit(0);
 });
@@ -98,6 +100,7 @@ const startServer = async () => {
     // across ALL ticket types (otherwise a hold is only ever reclaimed lazily
     // when another buyer happens to hit the same ticket type).
     startReservationReclaimScheduler();
+    startOrderDeliveryRecovery();
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);

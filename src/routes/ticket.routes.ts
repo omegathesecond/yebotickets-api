@@ -1,5 +1,6 @@
 import express from 'express';
 import { 
+  retryTicketDeliveryController,
   createTicketTypeController,
   getTicketTypesController,
   updateTicketTypeController,
@@ -29,12 +30,14 @@ import {
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
-import { purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
+import { deliveryRetryLimiter, purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
 import { listRefundRecovery, reconcileRefundAttempt } from '../services/ticket.service';
 
 const router = express.Router();
+
+router.post('/:ticketId/delivery/retry', protect, deliveryRetryLimiter, retryTicketDeliveryController);
 
 router.get('/refund-recovery', protect, authorize(UserRole.ADMIN), async (_req, res, next) => {
   try { res.json({ success: true, data: await listRefundRecovery() }); } catch (error) { next(error); }

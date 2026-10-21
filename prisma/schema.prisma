@@ -301,6 +301,9 @@ model Ticket {
   // used for reconciliation/refunds; paymentStatus is its status at sale time
   // (SUCCEEDED for a paid ticket, FREE for a price-0 ticket); amountPaid is what
   // was actually charged (0 for free tickets).
+  deliveryOrderId String?
+  deliveryOrder TicketOrderDelivery? @relation(fields: [deliveryOrderId], references: [id])
+
   paymentRef    String?
   paymentStatus String?
   amountPaid    Float?
@@ -329,6 +332,7 @@ model Ticket {
 
   @@index([eventId, status])
   @@index([userId])
+  @@index([deliveryOrderId])
   @@index([uniqueCode])
   @@index([ticketTypeId])
 }
@@ -345,4 +349,22 @@ model TicketRefundLock {
   confirmedRef   String?
   detail         String?
   createdAt      DateTime @default(now())
+}
+
+// One durable work item per paid charge or free purchase. A sending attempt is
+// never automatically reclaimed: its external acknowledgement may be lost.
+model TicketOrderDelivery {
+  id String @id
+  status String @default("pending")
+  channel String?
+  error String?
+  attemptId String?
+  attempts Int @default(0)
+  attemptedAt DateTime?
+  sentAt DateTime?
+  nextAttemptAt DateTime @default(now())
+  tickets Ticket[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status, nextAttemptAt])
 }

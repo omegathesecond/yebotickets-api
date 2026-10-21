@@ -151,3 +151,9 @@ export const refundRequestLimiter = rateLimit({
     message: 'Too many refund requests. Please wait a few minutes and try again.',
   },
 });
+
+export const deliveryRetryLimiter = rateLimit({
+  windowMs: FIVE_MINUTES_MS, max: 5, keyGenerator: userIdKey,
+  standardHeaders: true, legacyHeaders: false,
+  message: { success: false, message: 'Too many delivery retries. Please wait five minutes.' },
+});

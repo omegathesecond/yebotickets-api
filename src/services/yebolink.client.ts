@@ -17,7 +17,7 @@ type Channel = 'sms' | 'whatsapp' | 'email';
 const getApiKey = (): string => {
   const key = process.env.YEBOLINK_API_KEY;
   if (!key) {
-    throw new Error('YEBOLINK_API_KEY env var is not set');
+    throw new YeboLinkSendError('YEBOLINK_API_KEY env var is not set', false);
   }
   return key;
 };
@@ -50,6 +50,10 @@ export interface SendEmailInput {
   metadata?: Record<string, string>;
 }
 
+export class YeboLinkSendError extends Error {
+  constructor(message: string, public readonly ambiguous: boolean) { super(message); }
+}
+
 const send = async (
   channel: Channel,
   to: string,
@@ -74,10 +78,16 @@ const send = async (
   };
 
   if (!res.ok || !body.success) {
-    throw new Error(`YeboLink /messages/send ${res.status}: ${body.error ?? 'unknown error'}`);
+    // A server error may occur after enqueueing. Only an explicit client
+    // rejection proves no message was accepted.
+    throw new YeboLinkSendError(`YeboLink /messages/send ${res.status}: ${body.error ?? 'unknown error'}`,
+      res.status >= 500 || res.status === 408 || res.ok);
   }
 
-  return { messageId: body.data?.id ?? '', status: body.data?.status ?? '' };
+  if (!body.data?.id || !body.data.status || ['failed', 'rejected', 'cancelled'].includes(body.data.status.toLowerCase())) {
+    throw new YeboLinkSendError('YeboLink did not acknowledge message acceptance', true);
+  }
+  return { messageId: body.data.id, status: body.data.status };
 };
 
 export class YeboLinkClient {

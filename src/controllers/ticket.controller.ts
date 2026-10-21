@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { 
+  retryTicketOrderDelivery,
   createTicketType,
   getTicketTypes,
   updateTicketType,
@@ -404,4 +405,16 @@ export const cancelEventController = async (req: Request, res: Response, next: N
   } catch (error) {
     next(error);
   }
+};
+
+export const retryTicketDeliveryController = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.id;
+    if (!userId) throw new ApiError('User not authenticated', 401);
+    if (req.body.acknowledgeDuplicateRisk !== undefined && typeof req.body.acknowledgeDuplicateRisk !== 'boolean') {
+      throw new ApiError('acknowledgeDuplicateRisk must be a boolean', 400);
+    }
+    const delivery = await retryTicketOrderDelivery(req.params.ticketId, userId, req.body.acknowledgeDuplicateRisk === true);
+    res.json({ success: true, data: delivery });
+  } catch (error) { next(error); }
 };
