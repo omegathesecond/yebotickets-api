@@ -838,7 +838,7 @@ describe('verifyTicket (gate check-in guard)', () => {
     expect(result.message).toBe('Check-in successful');
     expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
     const updateArg = prismaMock.ticket.updateMany.mock.calls[0][0];
-    expect(updateArg.where).toEqual({ id: 'ticket-1', status: 'sold', isCheckedIn: false });
+    expect(updateArg.where).toEqual({ id: 'ticket-1', eventId: 'event-1', status: 'sold', isCheckedIn: false });
     expect(updateArg.data).toMatchObject({
       isCheckedIn: true,
       checkedInAt: expect.any(Date),
@@ -2260,5 +2260,141 @@ describe('atomic delivery work creation', () => {
     prismaMock.ticket.findMany.mockResolvedValueOnce([held] as any).mockResolvedValueOnce([sold] as any);
     expect(await settleSucceededCharge('chg_1')).toMatchObject({ result: 'issued', delivery: { status: 'sent' } });
     expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('admission serializes against event cancellation', () => {
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    return { promise, resolve };
+  };
+
+  const setup = () => {
+    const event = { id: 'event-1', organizerId: 'org-1', title: 'Festival', isCancelled: false };
+    const row = buildSoldPaidTicket();
+    let tail = Promise.resolve();
+    const lock = async () => {
+      const previous = tail;
+      const next = deferred();
+      tail = next.promise;
+      await previous;
+      return next.resolve;
+    };
+    const lookup = deferred();
+    const resume = deferred();
+    prismaMock.event.findUnique.mockImplementation(async () => ({ ...event }) as any);
+    prismaMock.event.update.mockImplementation(async ({ data }: any) => {
+      const release = await lock();
+      try { Object.assign(event, data); return { ...event } as any; }
+      finally { release(); }
+    });
+    prismaMock.ticket.findFirst.mockImplementation(async () => {
+      const snapshot = { ...row, event: { ...event } };
+      lookup.resolve();
+      await resume.promise;
+      return snapshot as any;
+    });
+    prismaMock.ticket.findMany.mockImplementation(async () => [{ ...row }] as any);
+    prismaMock.ticket.findUnique.mockImplementation(async () => ({ ...row }) as any);
+    prismaMock.ticket.findUniqueOrThrow.mockImplementation(async () => ({ ...row }) as any);
+    prismaMock.ticket.updateMany.mockImplementation(async ({ where, data }: any) => {
+      if (where.id !== row.id || where.status !== row.status || where.isCheckedIn !== row.isCheckedIn) return { count: 0 };
+      Object.assign(row, data);
+      return { count: 1 };
+    });
+    // Only admission locks Event here. Other short refund transactions use the
+    // standard mock; network calls must run after the admission lock releases.
+    prismaMock.$transaction.mockImplementation((async (callback: any) => {
+      let release: (() => void) | undefined;
+      const tx = new Proxy(prismaMock, { get(target, key) {
+        if (key !== '$queryRaw') return target[key as keyof typeof target];
+        return async (sql: TemplateStringsArray, ...values: unknown[]) => {
+          expect(sql.join('?')).toMatch(/SELECT "isCancelled" FROM "Event".*FOR UPDATE/);
+          expect(values).toEqual([event.id]);
+          release = await lock();
+          return [{ isCancelled: event.isCancelled }];
+        };
+      } });
+      try {
+        // Refund transactions do not query Event, and can use this same client.
+        return await callback(tx);
+      } finally { release?.(); }
+    }) as any);
+    return { event, row, lookup, resume };
+  };
+
+  it.each([
+    ['verify', 'failed'], ['confirm', 'failed'],
+    ['verify', 'pending'], ['confirm', 'pending'],
+  ])('rejects paused %s after cancellation with %s refund leaves ticket sold', async (path, outcome) => {
+    const { event, row, lookup, resume } = setup();
+    refundChargeMock.mockImplementation(async () => {
+      if (outcome === 'failed') throw new Error('gateway unavailable');
+      return buildRefundResult({ processor_status: 'PENDING' }) as any;
+    });
+    const admission = Promise.allSettled([
+      (path === 'verify' ? verifyTicket : confirmCheckIn)('ABC123', event.id, ORGANIZER),
+    ]);
+    await lookup.promise;
+    const summary = await cancelEvent(event.id, ORGANIZER);
+    expect(summary).toMatchObject({ failed: 1, refunded: 0 });
+    // An unconfirmed processor refund is reported as failed and retained for
+    // reconciliation; it must never make this still-sold ticket admissible.
+    if (outcome === 'pending') expect(recoveryLock.phase).toBe('DISPATCHING');
+    expect(event.isCancelled).toBe(true);
+    expect(row.status).toBe('sold');
+    resume.resolve();
+    const [result] = await admission;
+    if (path === 'verify') expect(result).toMatchObject({ status: 'fulfilled', value: { valid: false } });
+    else expect(result).toMatchObject({ status: 'rejected', reason: { statusCode: 400 } });
+    expect(row.isCheckedIn).toBe(false);
+    expect(prismaMock.ticket.updateMany.mock.calls.filter(([args]) => args.data.isCheckedIn)).toHaveLength(0);
+  });
+
+  it('holds the Event lock through the admission write, making cancellation wait', async () => {
+    const { event, row, resume } = setup();
+    const claiming = deferred();
+    const finishClaim = deferred();
+    const cancelling = deferred();
+    const updateTicket = prismaMock.ticket.updateMany.getMockImplementation()!;
+    prismaMock.ticket.updateMany.mockImplementation(async args => {
+      claiming.resolve();
+      await finishClaim.promise;
+      return updateTicket(args);
+    });
+    const updateEvent = prismaMock.event.update.getMockImplementation()!;
+    prismaMock.event.update.mockImplementation((async (args: any) => {
+      cancelling.resolve();
+      return updateEvent(args);
+    }) as any);
+    resume.resolve();
+    const admission = verifyTicket('ABC123', event.id, ORGANIZER);
+    await claiming.promise;
+    refundChargeMock.mockImplementation(async () => {
+      expect(row.isCheckedIn).toBe(true);
+      expect(event.isCancelled).toBe(true);
+      throw new Error('gateway unavailable');
+    });
+    const cancellation = cancelEvent(event.id, ORGANIZER);
+    await cancelling.promise;
+    expect(event.isCancelled).toBe(false);
+    finishClaim.resolve();
+    expect(await admission).toMatchObject({ valid: true });
+    await cancellation;
+    expect(event.isCancelled).toBe(true);
+    expect(refundChargeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([verifyTicket, confirmCheckIn])('allows admission that commits before cancellation', async admit => {
+    const { event, row, resume } = setup();
+    resume.resolve();
+    expect(await admit('ABC123', event.id, ORGANIZER)).toMatchObject({ valid: true });
+    expect(row.isCheckedIn).toBe(true);
+    refundChargeMock.mockRejectedValue(new Error('gateway unavailable'));
+    await cancelEvent(event.id, ORGANIZER);
+    expect(event.isCancelled).toBe(true);
+    expect(row.isCheckedIn).toBe(true);
   });
 });

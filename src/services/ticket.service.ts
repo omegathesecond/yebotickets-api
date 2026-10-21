@@ -1688,13 +1688,22 @@ const evaluateCheckIn = (
   return { valid: true, message: 'Ticket is valid for check-in' };
 };
 
-/** Claim admission only while the ticket remains sold and unused. */
-const claimTicketAdmission = async (ticketId: string) => {
-  const claim = await prisma.ticket.updateMany({
-    where: { id: ticketId, isCheckedIn: false, status: 'sold' },
-    data: { isCheckedIn: true, checkedInAt: new Date() },
+/** Serialize admission with cancelEvent's Event update, then claim once. */
+const claimTicketAdmission = async (ticketId: string, eventId: string) => {
+  return prisma.$transaction(async tx => {
+    // The lookup above is only a preview. Cancellation's UPDATE takes this same
+    // row lock, so re-read its committed flag while holding it until admission
+    // commits. Never include payment or notification calls in this transaction.
+    const events = await tx.$queryRaw<Array<{ isCancelled: boolean }>>`
+      SELECT "isCancelled" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
+    if (!events.length || events[0].isCancelled) return false;
+
+    const claim = await tx.ticket.updateMany({
+      where: { id: ticketId, eventId, isCheckedIn: false, status: 'sold' },
+      data: { isCheckedIn: true, checkedInAt: new Date() },
+    });
+    return claim.count === 1;
   });
-  return claim.count === 1;
 };
 
 /**
@@ -1742,7 +1751,7 @@ export const verifyTicket = async (
       };
     }
 
-    if (!await claimTicketAdmission(ticket!.id)) {
+    if (!await claimTicketAdmission(ticket!.id, eventId)) {
       return {
         ticket: { ...ticket, status: mapTicketStatus(ticket!.status) },
         valid: false,
@@ -1827,7 +1836,7 @@ export const confirmCheckIn = async (
       throw new ApiError(evaluation.message, ticket ? 400 : 404);
     }
 
-    if (!await claimTicketAdmission(ticket!.id)) {
+    if (!await claimTicketAdmission(ticket!.id, eventId)) {
       throw new ApiError('Ticket has already been used for check-in', 400);
     }
 
