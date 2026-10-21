@@ -1457,6 +1457,7 @@ export const getUserTickets = async (userId: string) => {
         event: {
           select: {
             id: true,
+            isCancelled: true,
             title: true,
             startDate: true,
             locationAddress: true,
@@ -1477,7 +1478,10 @@ export const getUserTickets = async (userId: string) => {
     
     return Promise.all(
       tickets.map(async t => ({
-        ...(await withQrFields(t)),
+        ...(t.status === 'sold' && !t.isCheckedIn && !t.event.isCancelled &&
+          (t.paymentStatus === 'SUCCEEDED' || t.paymentStatus === 'FREE')
+          ? await withQrFields(t)
+          : { ...t, qrCode: null, qrPayload: null }),
         status: mapTicketStatus(t.status),
         ticketType: t.ticketType ? {
           ...t.ticketType,

@@ -67,6 +67,7 @@ import {
   reclaimExpiredReservations,
   getEventTicketsForCheckIn,
   getTicketTypes,
+  getUserTickets,
 } from '../ticket.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
@@ -2144,5 +2145,38 @@ describe('durable refund recovery', () => {
   it('lists actionable unresolved status', async () => {
     prismaMock.ticketRefundLock.findMany.mockResolvedValue([attempt()] as any);
     expect(await listRefundRecovery()).toEqual([expect.objectContaining({recoveryStatus:'REVIEW_REQUIRED', attemptId:'attempt-1'})]);
+  });
+});
+
+
+describe('buyer wallet admission and payment state', () => {
+  it.each([
+    ['reserved', 'PENDING', false, false, false],
+    ['sold', 'SUCCEEDED', false, false, true],
+    ['sold', 'FREE', false, false, true],
+    ['sold', 'SUCCEEDED', true, false, false],
+    ['cancelled', 'REFUNDED', false, false, false],
+    ['cancelled', 'FAILED', false, false, false],
+    ['sold', 'SUCCEEDED', false, true, false],
+    ['sold', 'PENDING', false, false, false],
+  ])('%s/%s checkedIn=%s cancelledEvent=%s QR=%s', async (status, paymentStatus, isCheckedIn, isCancelled, eligible) => {
+    prismaMock.ticket.findMany.mockResolvedValue([{
+      id: 'ticket', eventId: 'event', uniqueCode: 'CODE', status, paymentStatus,
+      isCheckedIn, amountPaid: 0, event: { isCancelled }, ticketType: { price: 999, type: 'standard' },
+    }] as any);
+    const [ticket] = await getUserTickets('buyer');
+    expect(ticket.amountPaid).toBe(0);
+    expect(ticket.event.isCancelled).toBe(isCancelled);
+    expect(ticket.qrCode).toBe(eligible ? 'data:image/png;base64,FAKEQR' : null);
+    expect(ticket.qrPayload).toEqual(eligible ? { eventId: 'event', ticketId: 'CODE' } : null);
+    expect(prismaMock.ticket.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId: 'buyer' }, include: expect.objectContaining({
+        event: { select: expect.objectContaining({ isCancelled: true }) },
+      }),
+    }));
+  });
+  it('surfaces database failures', async () => {
+    prismaMock.ticket.findMany.mockRejectedValue(new Error('database down'));
+    await expect(getUserTickets('buyer')).rejects.toThrow('Failed to fetch user tickets');
   });
 });
