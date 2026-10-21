@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { YeboLinkSendError } from '../yebolink.client';
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
 
@@ -86,6 +87,25 @@ beforeEach(() => {
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
   recoveryLock = null;
+  // Model the durable delivery table independently of ticket.findMany's
+  // sequential reservation/settlement fixtures. Dispatch re-reads its members.
+  const orders = new Map<string, any>();
+  const members = new Map<string, any[]>();
+  let latestTickets: any[] = [];
+  prismaMock.ticketOrderDelivery.upsert.mockImplementation(async ({where}: any) => {
+    const row = orders.get(where.id) || { id: where.id, status: 'pending', attempts: 0,
+      attemptId: null, attemptedAt: null, channel: null, error: null, nextAttemptAt: new Date(0) };
+    orders.set(where.id, row); members.set(where.id, latestTickets); return row;
+  });
+  prismaMock.ticketOrderDelivery.findUnique.mockImplementation(async ({where}: any) => orders.get(where.id) || null);
+  prismaMock.ticketOrderDelivery.findUniqueOrThrow.mockImplementation(async ({where}: any) => orders.get(where.id));
+  prismaMock.ticketOrderDelivery.updateMany.mockImplementation(async ({where, data}: any) => {
+    const row = orders.get(where.id);
+    if (!row || row.status !== where.status || ('attemptId' in where && row.attemptId !== where.attemptId)) return {count: 0};
+    Object.assign(row, data, { attempts: row.attempts + (data.attempts?.increment || 0) });
+    return {count: 1};
+  });
+
   prismaMock.ticketRefundLock.create.mockImplementation(async ({data}: any) => {
     recoveryLock = { ...data, refundedBefore: null }; return recoveryLock;
   });
@@ -104,7 +124,22 @@ beforeEach(() => {
     await prismaMock.ticketRefundLock.delete({where: {chargeId: where.chargeId}});
     return {count: 1};
   });
-  prismaMock.$transaction.mockImplementation(((callback: any) => typeof callback === 'function' ? callback(prismaMock) : Promise.all(callback)) as any);
+  prismaMock.$transaction.mockImplementation(((callback: any) => {
+    if (typeof callback !== 'function') return Promise.all(callback);
+    const tx = new Proxy(prismaMock, { get(target, key) {
+      if (key !== 'ticket') return target[key as keyof typeof target];
+      return new Proxy(target.ticket, { get(ticket, operation) {
+        if (operation !== 'findMany') return ticket[operation as keyof typeof ticket];
+        return async (args: any) => {
+          if (args.where?.deliveryOrderId) return members.get(args.where.deliveryOrderId) || [];
+          const rows = await prismaMock.ticket.findMany(args);
+          if (rows?.length) latestTickets = rows;
+          return rows;
+        };
+      } });
+    } });
+    return callback(tx);
+  }) as any);
   prismaMock.$queryRaw.mockResolvedValue([{
     saleStartDate: new Date(0), saleEndDate: new Date('2099-01-01'), isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
   }]);
@@ -259,10 +294,10 @@ describe('purchaseTicket — payment + atomic claim', () => {
       idempotencyKey: 'idem-1',
     });
 
-    // Two guarded writes: first reserves (available -> reserved), then finalizes
-    // (reserved -> sold + payment ref). Both are conditional updateMany — a plain
-    // update by id would reintroduce the oversell race.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    // Reserve and settle use conditional writes; the third write attaches
+    // the delivery order inside the settlement transaction.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(3); // reserve, settle, attach durable order
+    expect(prismaMock.ticketOrderDelivery.upsert).toHaveBeenCalledWith({ where: { id: 'paid:chg_1' }, create: { id: 'paid:chg_1' }, update: {} });
     expect(prismaMock.ticket.update).not.toHaveBeenCalled();
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
@@ -532,8 +567,9 @@ describe('purchaseTicket — payment + atomic claim', () => {
 
     // No money is moved for a free ticket.
     expect(createChargeMock).not.toHaveBeenCalled();
-    // One guarded claim straight to sold, tagged FREE.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    // One guarded claim straight to sold plus the atomic free-order grouping.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticketOrderDelivery.upsert.mock.calls[0][0].where.id).toMatch(/^free:/);
     const claimArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(claimArg.data).toMatchObject({
       userId: 'user-1',
@@ -1220,7 +1256,7 @@ describe('requestTicketRefund (buyer self-service refund request)', () => {
   it('still records the request when the organizer notify fails (best-effort, not thrown)', async () => {
     prismaMock.ticket.findUnique.mockResolvedValue(buildRefundRequestTicket() as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
-    sendTextMessageMock.mockRejectedValue(new Error('YeboLink down'));
+    sendTextMessageMock.mockRejectedValue(new YeboLinkSendError('YeboLink down', false));
 
     const result = await requestTicketRefund('ticket-1', BUYER);
 
@@ -1362,8 +1398,9 @@ describe('charge webhook settlement (async mobile-money)', () => {
     const outcome = await settleSucceededCharge('chg_1');
 
     expect(outcome).toMatchObject({ result: 'issued' });
-    // ONE guarded write flips every row sharing the charge ref — no per-row loop.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    // One guarded settlement plus one durable-order attachment, never per-ticket work.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticketOrderDelivery.upsert).toHaveBeenCalledTimes(1);
     expect(prismaMock.ticket.updateMany.mock.calls[0][0].where).toEqual({
       paymentRef: 'chg_1',
       status: 'reserved',
@@ -1472,8 +1509,9 @@ describe('charge webhook settlement (async mobile-money)', () => {
 
     expect(first).toMatchObject({ result: 'issued' });
     expect(second).toMatchObject({ result: 'already_final', status: 'sold' });
-    // Exactly one flip-to-sold and one QR delivery, never two.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(1);
+    // Exactly one settlement, one outbox attachment and one delivery despite redelivery.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.ticketOrderDelivery.upsert).toHaveBeenCalledTimes(1);
     expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
   });
 });
@@ -1687,7 +1725,9 @@ describe('shared-charge refund accounting', () => {
   });
 
   it('recovery of a confirmed refund unblocks other tickets on the shared charge', async () => {
-    prismaMock.$transaction.mockRejectedValueOnce(new Error('commit failed'));
+    prismaMock.$transaction
+      .mockImplementationOnce(((fn: any) => fn(prismaMock)) as any) // refund claim admission
+      .mockRejectedValueOnce(new Error('commit failed')); // post-provider finalization
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode:502});
     expect(refunded).toBe(100);
     expect(recoveryLock.phase).toBe('CONFIRMED');
@@ -1852,7 +1892,7 @@ describe('cancelled-event payment lifecycle', () => {
         expect(await cancelEvent(event.id, ORGANIZER)).toMatchObject({ refunded: 1 });
         return [{ ...event }];
       });
-    await expect(settleSucceededCharge('chg_1')).rejects.toMatchObject({ statusCode: 409 });
+    expect(await settleSucceededCharge('chg_1')).toMatchObject({ delivery: { status: 'suppressed' } });
     expect(row).toMatchObject({ status: 'cancelled', paymentStatus: 'REFUNDED' });
     expect(refundChargeMock).toHaveBeenCalledTimes(1);
     expect(sendTextMessageMock.mock.calls.every(([, text]) => !text.includes('Show this QR'))).toBe(true);
@@ -2109,7 +2149,9 @@ describe('durable refund recovery', () => {
     prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
     prismaMock.event.findUnique.mockResolvedValue({id:'event-1', organizerId:'org-1'} as any);
     refundChargeMock.mockResolvedValue(buildRefundResult());
-    prismaMock.$transaction.mockRejectedValueOnce(new Error('database unavailable'));
+    prismaMock.$transaction
+      .mockImplementationOnce(((fn: any) => fn(prismaMock)) as any) // refund claim admission
+      .mockRejectedValueOnce(new Error('database unavailable')); // post-provider finalization
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode: 502});
     expect(recoveryLock.phase).toBe('CONFIRMED');
     const token = recoveryLock.attemptId;
@@ -2178,5 +2220,45 @@ describe('buyer wallet admission and payment state', () => {
   it('surfaces database failures', async () => {
     prismaMock.ticket.findMany.mockRejectedValue(new Error('database down'));
     await expect(getUserTickets('buyer')).rejects.toThrow('Failed to fetch user tickets');
+  });
+});
+
+describe('atomic delivery work creation', () => {
+  it('gives each free purchase one distinct shared order group', async () => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price: 0 }) as any);
+    prismaMock.ticket.findFirst
+      .mockResolvedValueOnce({ id: 'free-1' } as any)
+      .mockResolvedValueOnce({ id: 'free-2' } as any)
+      .mockResolvedValueOnce({ id: 'free-3' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+    const free = (id: string) => buildTicketWithRelations({ id, uniqueCode: id, status: 'sold', paymentStatus: 'FREE', amountPaid: 0 });
+    prismaMock.ticket.findMany.mockResolvedValueOnce([free('free-1'), free('free-2')] as any)
+      .mockResolvedValueOnce([free('free-3')] as any);
+    const first = await purchaseTicket('tt-1', 'user-1', undefined, 2);
+    const second = await purchaseTicket('tt-1', 'user-1', undefined, 1);
+    const ids = prismaMock.ticketOrderDelivery.upsert.mock.calls.map(([args]) => args.where.id);
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(first.tickets.map(t => t.deliveryOrderId)).toEqual([ids[0], ids[0]]);
+    expect(second.tickets.map(t => t.deliveryOrderId)).toEqual([ids[1]]);
+    expect(createChargeMock).not.toHaveBeenCalled();
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(2);
+    expect(sendTextMessageMock.mock.calls[0][1]).toContain('free-2');
+    expect(sendTextMessageMock.mock.calls[0][1]).not.toContain('free-3');
+  });
+
+  it('fails settlement if its transactional delivery insert fails, permitting a later webhook retry', async () => {
+    const held = buildTicketWithRelations({ status: 'reserved', paymentRef: 'chg_1', paymentStatus: 'PENDING' });
+    const sold = buildTicketWithRelations({ status: 'sold', paymentRef: 'chg_1', paymentStatus: 'SUCCEEDED' });
+    prismaMock.ticket.findMany.mockResolvedValueOnce([held] as any).mockResolvedValueOnce([sold] as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.ticketOrderDelivery.upsert.mockRejectedValueOnce(new Error('outbox unavailable'));
+    await expect(settleSucceededCharge('chg_1')).rejects.toThrow('outbox unavailable');
+    expect(sendTextMessageMock).not.toHaveBeenCalled();
+    // A real transaction rolls the sale back with the failed outbox write.
+    // Model the persisted reserved rows seen by the next webhook delivery.
+    prismaMock.ticket.findMany.mockResolvedValueOnce([held] as any).mockResolvedValueOnce([sold] as any);
+    expect(await settleSucceededCharge('chg_1')).toMatchObject({ result: 'issued', delivery: { status: 'sent' } });
+    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
   });
 });

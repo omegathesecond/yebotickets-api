@@ -9,6 +9,7 @@ import {
 } from '../interfaces/ticket.interface';
 import { ApiError } from '../middleware/error.middleware';
 import crypto from 'crypto';
+import { YeboLinkSendError } from './yebolink.client';
 import {
   buildTicketQrPayload,
   generateTicketQrDataUrl,
@@ -457,8 +458,8 @@ const PURCHASE_INCLUDE = {
  */
 export interface TicketDeliveryResult {
   /** The channel that actually delivered (or was attempted last on failure). */
-  channel: 'whatsapp' | 'email';
-  status: 'sent' | 'failed';
+  channel?: string | null;
+  status: 'pending' | 'sending' | 'sent' | 'failed' | 'unknown' | 'suppressed';
   error?: string;
 }
 
@@ -590,6 +591,9 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via WhatsApp:', error);
+      if (!(error instanceof YeboLinkSendError) || error.ambiguous) {
+        return { channel: 'whatsapp', status: 'unknown', error: 'Delivery acknowledgement was lost. A message may already have been sent.' };
+      }
       errors.push(`whatsapp: ${errorMessage(error)}`);
     }
   } else {
@@ -611,6 +615,9 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
       return { channel: 'email', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via email:', error);
+      if (!(error instanceof YeboLinkSendError) || error.ambiguous) {
+        return { channel: 'email', status: 'unknown', error: 'Delivery acknowledgement was lost. A message may already have been sent.' };
+      }
       errors.push(`email: ${errorMessage(error)}`);
     }
   }
@@ -762,6 +769,7 @@ const claimAvailableTickets = async (
       where: { id: { in: claimedIds } },
       include: PURCHASE_INCLUDE,
     });
+    if (data.status === 'sold') await enqueueOrderDelivery(tx, tickets);
     return { tickets, availableRemaining: tickets.length };
   });
 };
@@ -812,6 +820,7 @@ const commitSettlement = async (
       reservedAt: cancelled ? new Date() : null },
   });
   const tickets = claimed.count ? await tx.ticket.findMany({ where: lookup, include: PURCHASE_INCLUDE }) : [];
+  if (!cancelled && tickets.length) await enqueueOrderDelivery(tx, tickets);
   return { cancelled, tickets, claimed: claimed.count };
 });
 
@@ -822,21 +831,105 @@ const refundCancelledSettlement = async (tickets: any[]) => {
   }
 };
 
-/** Cancellation's Event UPDATE must wait for any delivery already admitted
- * here. If cancellation committed first, suppress delivery and refund instead.
- * Payment/refund gateway calls are deliberately outside this transaction. */
-const deliverSettledOrder = async (tickets: any[]): Promise<TicketDeliveryResult> => {
-  const delivery = await prisma.$transaction(async (tx) => {
-    const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
-      SELECT "isCancelled" FROM "Event" WHERE "id" = ${tickets[0].eventId} FOR SHARE
-    `;
-    if (!events[0]) throw new ApiError('Event not found during delivery', 500);
-    if (events[0].isCancelled) return null;
-    return deliverOrderToBuyer(tickets);
-  }, { timeout: 60_000 });
-  if (delivery) return delivery;
-  await refundCancelledSettlement(tickets);
-  throw new ApiError('Event cancelled. No ticket was issued; payment has been refunded.', 409);
+/** Called inside the issuance transaction: sold tickets and their one durable
+ * delivery work item commit together, or neither does. */
+const enqueueOrderDelivery = async (tx: Prisma.TransactionClient, tickets: any[]) => {
+  const id = tickets[0].paymentRef ? `paid:${tickets[0].paymentRef}` : `free:${crypto.randomUUID()}`;
+  await tx.ticketOrderDelivery.upsert({ where: { id }, create: { id }, update: {} });
+  await tx.ticket.updateMany({ where: { id: { in: tickets.map(t => t.id) } }, data: { deliveryOrderId: id } });
+  tickets.forEach(t => { t.deliveryOrderId = id; });
+};
+
+const deliveryView = (row: { status: string; channel: string | null; error: string | null; attemptedAt: Date | null }) => ({
+  status: row.status as TicketDeliveryResult['status'], channel: row.channel,
+  error: row.error || undefined, attemptedAt: row.attemptedAt,
+});
+
+/** A DB compare-and-set owns dispatch across workers and buyer retries.
+ * Never reclaim sending automatically: after a crash the provider may have
+ * accepted the message. Only an explicit buyer retry accepts that risk. */
+export const dispatchOrderDelivery = async (id: string, manual = false, acknowledgeDuplicateRisk = false): Promise<TicketDeliveryResult> => {
+  const row = await prisma.ticketOrderDelivery.findUnique({ where: { id } });
+  if (!row) throw new ApiError('Delivery record not found', 404);
+  if (row.status === 'sent' || row.status === 'suppressed') return deliveryView(row);
+  const stale = row.status === 'sending' && row.attemptedAt && Date.now() - row.attemptedAt.getTime() > 120_000;
+  if (row.status === 'sending' && !stale) return deliveryView(row);
+  if ((row.status === 'unknown' || stale) && (!manual || !acknowledgeDuplicateRisk)) {
+    if (manual) throw new ApiError('Delivery is unconfirmed. Confirm that retrying may send a duplicate message.', 409);
+    return { ...deliveryView(row), status: 'unknown' };
+  }
+  if (manual && row.attemptedAt && Date.now() - row.attemptedAt.getTime() < 60_000) {
+    throw new ApiError('Please wait one minute before retrying delivery.', 429);
+  }
+  const attemptId = crypto.randomUUID();
+  const claim = await prisma.ticketOrderDelivery.updateMany({
+    where: { id, status: row.status, attemptId: row.attemptId,
+      ...(!manual ? { nextAttemptAt: { lte: new Date() } } : {}) },
+    data: { status: 'sending', attemptId, attemptedAt: new Date(), attempts: { increment: 1 }, error: null },
+  });
+  if (!claim.count) return deliveryView((await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } })));
+  let outcome: TicketDeliveryResult;
+  try {
+    // Lock Event then Ticket in the same order as cancellation. Re-read tickets
+    // under row locks so individual refunds cannot race an admission message.
+    outcome = await prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${id} FOR UPDATE`;
+      const owner = await tx.ticketOrderDelivery.findUniqueOrThrow({ where: { id } });
+      if (owner.status !== 'sending' || owner.attemptId !== attemptId) return deliveryView(owner);
+      const members = await tx.ticket.findMany({ where: { deliveryOrderId: id }, select: { eventId: true } });
+      if (!members.length) return { status: 'suppressed', error: 'No tickets remain in this order.' };
+      const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
+        SELECT "isCancelled" FROM "Event" WHERE "id" = ${members[0].eventId} FOR SHARE
+      `;
+      await tx.$queryRaw`SELECT "id" FROM "Ticket" WHERE "deliveryOrderId" = ${id} ORDER BY "id" FOR UPDATE`;
+      const tickets = await tx.ticket.findMany({ where: { deliveryOrderId: id }, include: PURCHASE_INCLUDE });
+      const chargeId = tickets[0]?.paymentRef;
+      if (chargeId && await tx.ticketRefundLock.findUnique({ where: { chargeId } })) {
+        return { status: 'failed', error: 'A refund is in progress or awaiting reconciliation. Delivery will be checked again.' };
+      }
+      const eligible = tickets.filter(t => t.status === 'sold' && !t.refundedAt && !t.cancelledAt &&
+        (t.paymentStatus === 'SUCCEEDED' || t.paymentStatus === 'FREE'));
+      if (!events[0]) throw new ApiError('Event missing during order delivery', 500);
+      if (events[0].isCancelled || !eligible.length) {
+        return { status: 'suppressed', error: 'Order cancelled or refunded. No admission message sent.' };
+      }
+      return deliverOrderToBuyer(eligible);
+    }, { timeout: 60_000 });
+  } catch (error) {
+    console.error('Order delivery outcome unconfirmed:', id, error);
+    outcome = { status: 'unknown', error: 'Delivery could not be confirmed. A message may already have been sent.' };
+  }
+  const recorded = await prisma.ticketOrderDelivery.updateMany({ where: { id, attemptId, status: 'sending' }, data: {
+    status: outcome.status, channel: outcome.channel, error: outcome.error || null,
+    sentAt: outcome.status === 'sent' ? new Date() : null,
+    nextAttemptAt: new Date(Date.now() + Math.min(60, 2 ** Math.min(row.attempts, 6)) * 60_000),
+  } });
+  if (!recorded.count) return deliveryView(await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }));
+  return outcome;
+};
+
+const deliverSettledOrder = async (tickets: any[]): Promise<TicketDeliveryResult> =>
+  dispatchOrderDelivery(tickets[0].deliveryOrderId);
+
+export const retryTicketOrderDelivery = async (ticketId: string, userId: string, acknowledgeDuplicateRisk = false) => {
+  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, include: { event: true } });
+  if (!ticket || ticket.userId !== userId) throw new ApiError('Ticket not found', 404);
+  if (ticket.status !== 'sold' || ticket.event.isCancelled || ticket.refundedAt || ticket.cancelledAt) {
+    throw new ApiError('Delivery is unavailable for this ticket.', 409);
+  }
+  if (!ticket.deliveryOrderId) throw new ApiError('This ticket has no tracked delivery order.', 409);
+  // Reject corrupted/mixed ownership groups rather than leaking another buyer's QR.
+  const others = await prisma.ticket.count({ where: { deliveryOrderId: ticket.deliveryOrderId, userId: { not: userId } } });
+  if (others) throw new ApiError('Order ownership could not be verified', 409);
+  return dispatchOrderDelivery(ticket.deliveryOrderId, true, acknowledgeDuplicateRisk);
+};
+
+export const recoverOrderDeliveries = async () => {
+  await prisma.ticketOrderDelivery.updateMany({ where: { status: 'sending', attemptedAt: { lt: new Date(Date.now() - 120_000) } },
+    data: { status: 'unknown', error: 'Delivery was interrupted. A message may already have been sent.' } });
+  const work = await prisma.ticketOrderDelivery.findMany({ where: { status: { in: ['pending', 'failed'] }, nextAttemptAt: { lte: new Date() } },
+    orderBy: { nextAttemptAt: 'asc' }, take: 20 });
+  for (const row of work) await dispatchOrderDelivery(row.id);
 };
 
 /**
@@ -976,7 +1069,7 @@ const findTicketsByPaymentRef = (paymentRef: string) =>
  *
  * Idempotent (webhooks may be redelivered, and the reclaim poll can race the
  * webhook): the flip is a guarded `updateMany` requiring `status: 'reserved'`,
- * so rows already sold match 0 rows and the order is delivered EXACTLY once. An
+ * so rows already sold match 0 rows and cannot enqueue duplicate delivery work. An
  * unmatched charge is logged loudly (money moved with no ticket to attach) — a
  * reconciliation signal, never a silent swallow.
  */
@@ -1454,6 +1547,7 @@ export const getUserTickets = async (userId: string) => {
     const tickets = await prisma.ticket.findMany({
       where: { userId },
       include: {
+        deliveryOrder: true,
         event: {
           select: {
             id: true,
@@ -1477,11 +1571,12 @@ export const getUserTickets = async (userId: string) => {
     });
     
     return Promise.all(
-      tickets.map(async t => ({
+      tickets.map(async ({ deliveryOrder, ...t }) => ({
         ...(t.status === 'sold' && !t.isCheckedIn && !t.event.isCancelled &&
           (t.paymentStatus === 'SUCCEEDED' || t.paymentStatus === 'FREE')
           ? await withQrFields(t)
           : { ...t, qrCode: null, qrPayload: null }),
+        delivery: deliveryOrder ? deliveryView(deliveryOrder) : null,
         status: mapTicketStatus(t.status),
         ticketType: t.ticketType ? {
           ...t.ticketType,
@@ -1950,8 +2045,15 @@ const refundAndCancelTicket = async (
   // different tickets on the same charge, including after a process restart.
   const attemptId = crypto.randomUUID();
   try {
-    await prisma.ticketRefundLock.create({
-      data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED' },
+    await prisma.$transaction(async tx => {
+      // Serialize refund dispatch admission with delivery. Once this durable
+      // refund claim exists, delivery defers until it has been reconciled.
+      if (ticket.deliveryOrderId) {
+        await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${ticket.deliveryOrderId} FOR UPDATE`;
+      }
+      await tx.ticketRefundLock.create({
+        data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED' },
+      });
     });
   } catch (error) {
     if ((error as { code?: string }).code === 'P2002') {
