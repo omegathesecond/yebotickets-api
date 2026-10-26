@@ -24,6 +24,7 @@ import {
   purchaseTicketValidator,
   verifyTicketValidator,
   checkInLookupValidator,
+  confirmCheckInValidator,
   refundTicketValidator,
   requestTicketRefundValidator,
   cancelEventValidator
@@ -668,13 +669,17 @@ router.post(
  *         application/json:
  *           schema:
  *             type: object
- *             required: [eventId, ticketId]
+ *             required: [eventId, ticketId, opId]
  *             properties:
  *               eventId:
  *                 type: string
  *               ticketId:
  *                 type: string
  *                 description: Ticket id (from the QR) or uniqueCode
+ *               opId:
+ *                 type: string
+ *                 maxLength: 512
+ *                 description: Durable admission operation identity; reuse unchanged on retries
  *     responses:
  *       200:
  *         description: Check-in successful
@@ -691,7 +696,7 @@ router.post(
   '/confirm-check-in',
   protect,
   authorize(UserRole.ORGANIZER, UserRole.ADMIN),
-  validate(checkInLookupValidator),
+  validate(confirmCheckInValidator),
   confirmCheckInController
 );
 

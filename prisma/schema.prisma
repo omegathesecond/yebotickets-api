@@ -368,3 +368,14 @@ model TicketOrderDelivery {
   updatedAt DateTime @updatedAt
   @@index([status, nextAttemptAt])
 }
+
+// Immutable admission receipt. Deliberately retained independently of mutable
+// ticket/user rows so an operation key can never be reassigned after deletion.
+model TicketAdmissionReceipt {
+  opId       String   @id
+  operatorId String
+  eventId    String
+  ticketId   String
+  response   Json
+  createdAt  DateTime @default(now())
+}

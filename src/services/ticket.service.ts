@@ -1689,22 +1689,21 @@ const evaluateCheckIn = (
 };
 
 /** Serialize admission with cancelEvent's Event update, then claim once. */
-const claimTicketAdmission = async (ticketId: string, eventId: string) => {
-  return prisma.$transaction(async tx => {
-    // The lookup above is only a preview. Cancellation's UPDATE takes this same
-    // row lock, so re-read its committed flag while holding it until admission
-    // commits. Never include payment or notification calls in this transaction.
-    const events = await tx.$queryRaw<Array<{ isCancelled: boolean }>>`
-      SELECT "isCancelled" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
-    if (!events.length || events[0].isCancelled) return false;
-
-    const claim = await tx.ticket.updateMany({
-      where: { id: ticketId, eventId, isCheckedIn: false, status: 'sold' },
-      data: { isCheckedIn: true, checkedInAt: new Date() },
-    });
-    return claim.count === 1;
+const claimTicketAdmissionInTransaction = async (
+  tx: import('@prisma/client').Prisma.TransactionClient, ticketId: string, eventId: string
+) => {
+  const events = await tx.$queryRaw<Array<{ isCancelled: boolean }>>`
+    SELECT "isCancelled" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
+  if (!events.length || events[0].isCancelled) return false;
+  const claim = await tx.ticket.updateMany({
+    where: { id: ticketId, eventId, isCheckedIn: false, status: 'sold' },
+    data: { isCheckedIn: true, checkedInAt: new Date() },
   });
+  return claim.count === 1;
 };
+
+const claimTicketAdmission = async (ticketId: string, eventId: string) =>
+  prisma.$transaction(tx => claimTicketAdmissionInTransaction(tx, ticketId, eventId));
 
 /**
  * Flatten a ticket (with its relations) into the shape the gate scanner UI
@@ -1811,11 +1810,9 @@ export const getCheckInDetails = async (
 };
 
 /**
- * Confirm check-in (commit step). Atomically marks a previewed ticket as
- * checked in and REJECTS (throws) when the ticket is unknown, not 'sold', or
- * already checked in — reusing the same guard as verifyTicket. The mutation is
- * a conditional updateMany so two scanners racing on the same ticket cannot
- * both succeed.
+ * Confirm check-in and persist its immutable operation receipt in one commit.
+ * Replays return that receipt only for the same operator, event and ticket.
+ * Distinct operations still compete for the conditional admission claim.
  * @param ticketIdentifier Ticket database id or uniqueCode
  * @param eventId Event ID
  * @returns Check-in result for the now checked-in ticket
@@ -1823,33 +1820,47 @@ export const getCheckInDetails = async (
 export const confirmCheckIn = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester
-): Promise<{ ticket: any; valid: boolean; message: string }> => {
+  requester: CheckInRequester,
+  opId: string
+): Promise<{ ticket: any; valid: boolean; message: string; opId: string; eventId: string; ticketId: string }> => {
   try {
     await assertEventAccess(eventId, requester);
-
+    if (typeof opId !== 'string' || !opId.trim() || opId.length > 512) {
+      throw new ApiError('Admission operation ID is required (maximum 512 characters)', 400);
+    }
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
-    const evaluation = evaluateCheckIn(ticket);
-
-    if (!evaluation.valid) {
-      // Unknown code -> 404; not sold / already checked in -> 400.
-      throw new ApiError(evaluation.message, ticket ? 400 : 404);
-    }
-
-    if (!await claimTicketAdmission(ticket!.id, eventId)) {
-      throw new ApiError('Ticket has already been used for check-in', 400);
-    }
-
-    const updatedTicket = await prisma.ticket.findUnique({
-      where: { id: ticket!.id },
-      include: CHECK_IN_INCLUDE,
+    return await prisma.$transaction(async tx => {
+      // Serialize the key globally, including attempts to reuse it on a different
+      // event. The transaction lock is released only after the receipt commits.
+      await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended(${opId}, 0))`;
+      const receipt = await tx.ticketAdmissionReceipt.findUnique({ where: { opId } });
+      if (receipt) {
+        if (receipt.operatorId !== requester.id || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {
+          throw new ApiError('Admission operation ID belongs to another admission', 409);
+        }
+        return receipt.response as any;
+      }
+      const evaluation = evaluateCheckIn(ticket);
+      if (!evaluation.valid) throw new ApiError(evaluation.message, ticket ? 400 : 404);
+      if (!await claimTicketAdmissionInTransaction(tx, ticket!.id, eventId)) {
+        throw new ApiError('Ticket has already been used for check-in', 400);
+      }
+      const updatedTicket = await tx.ticket.findUniqueOrThrow({
+        where: { id: ticket!.id }, include: CHECK_IN_INCLUDE,
+      });
+      const response = {
+        ticket: toCheckInTicketDto(updatedTicket), valid: true,
+        message: 'Check-in successful', opId, eventId, ticketId: ticketIdentifier,
+      };
+      // JSON round-trip fixes timestamps to the exact wire representation used
+      // by both the initial response and every subsequent replay.
+      const persistedResponse = JSON.parse(JSON.stringify(response));
+      await tx.ticketAdmissionReceipt.create({ data: {
+        opId, operatorId: requester.id, eventId, ticketId: ticket!.id,
+        response: persistedResponse,
+      } });
+      return persistedResponse;
     });
-
-    return {
-      ticket: updatedTicket ? toCheckInTicketDto(updatedTicket) : {},
-      valid: true,
-      message: 'Check-in successful',
-    };
   } catch (error) {
     console.error('Error in confirmCheckIn service:', error);
     if (error instanceof ApiError) throw error;

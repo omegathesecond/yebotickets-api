@@ -209,6 +209,14 @@ export const checkInLookupValidator = [
     .withMessage('Event ID must be a string'),
 ];
 
+// Operation keys are opaque: validate without trimming or rewriting them.
+export const confirmCheckInValidator = [
+  ...checkInLookupValidator,
+  body('opId').isString().isLength({ min: 1, max: 512 })
+    .custom(value => typeof value === 'string' && value.trim().length > 0)
+    .withMessage('Admission operation ID is required (maximum 512 characters)'),
+];
+
 // Refund a single ticket: POST /api/tickets/refund/:ticketId. ticketId is the
 // ticket's UUID; an optional reason is recorded on the YeboPay refund.
 export const refundTicketValidator = [
