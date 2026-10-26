@@ -1,4 +1,5 @@
 import prisma from '../config/prisma';
+import type { Prisma } from '@prisma/client';
 import { ApiError } from '../middleware/error.middleware';
 import { CURRENCY, getPlatformFeePercent } from '../config/platform';
 import {
@@ -278,19 +279,33 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
   }
 };
 
-/** Load a request for an admin transition, asserting the transition is legal. */
-const loadForTransition = async (id: string, allowedFrom: string[]) => {
+/** Compare against the observed status in the write itself. PostgreSQL rechecks
+ * this predicate after any competing writer commits, so a stale decision loses
+ * without changing money, reference or audit fields. */
+const transitionPayout = async (
+  id: string,
+  allowedFrom: string[],
+  data: Prisma.PayoutRequestUncheckedUpdateInput
+) => {
   const existing = await prisma.payoutRequest.findUnique({ where: { id } });
-  if (!existing) {
-    throw new ApiError('Payout request not found', 404);
-  }
+  if (!existing) throw new ApiError('Payout request not found', 404);
   if (!allowedFrom.includes(existing.status)) {
     throw new ApiError(
       `A ${existing.status} payout request cannot be changed from here (expected: ${allowedFrom.join(' or ')})`,
-      400
+      409
     );
   }
-  return existing;
+  try {
+    return await prisma.payoutRequest.update({
+      where: { id, status: existing.status },
+      data,
+    });
+  } catch (error: any) {
+    if (error?.code === 'P2025') {
+      throw new ApiError('Payout request changed while you were deciding. Refresh and review its current status.', 409);
+    }
+    throw error;
+  }
 };
 
 /** Admin: approve a requested payout — cleared to pay, money has NOT moved yet.
@@ -298,18 +313,14 @@ const loadForTransition = async (id: string, allowedFrom: string[]) => {
  *  organizer can withdraw. `adminId` (the authenticated admin) is recorded as
  *  the reviewer for compliance traceability. */
 export const approvePayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
-  await loadForTransition(id, ['pending']);
   const now = new Date();
-  return prisma.payoutRequest.update({
-    where: { id },
-    data: {
-      status: 'approved',
-      approvedAt: now,
-      processedAt: now,
-      adminNote,
-      reviewedByAdminId: adminId,
-      reviewedAt: now,
-    },
+  return transitionPayout(id, ['pending'], {
+    status: 'approved',
+    approvedAt: now,
+    processedAt: now,
+    adminNote,
+    reviewedByAdminId: adminId,
+    reviewedAt: now,
   });
 };
 
@@ -318,11 +329,13 @@ export const approvePayoutRequest = async (id: string, adminId: string, adminNot
  *  moved until it is marked paid. `adminId` (the authenticated admin) is
  *  recorded as the reviewer for compliance traceability. */
 export const rejectPayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
-  await loadForTransition(id, ['pending', 'approved']);
   const now = new Date();
-  return prisma.payoutRequest.update({
-    where: { id },
-    data: { status: 'rejected', processedAt: now, adminNote, reviewedByAdminId: adminId, reviewedAt: now },
+  return transitionPayout(id, ['pending', 'approved'], {
+    status: 'rejected',
+    processedAt: now,
+    adminNote,
+    reviewedByAdminId: adminId,
+    reviewedAt: now,
   });
 };
 
@@ -345,19 +358,15 @@ export const markPayoutRequestPaid = async (
   if (!reference || !reference.trim()) {
     throw new ApiError('An external transfer reference is required to mark a payout paid', 400);
   }
-  await loadForTransition(id, ['approved']);
   const now = new Date();
-  return prisma.payoutRequest.update({
-    where: { id },
-    data: {
-      status: 'paid',
-      paidAt: now,
-      processedAt: now,
-      reference: reference.trim(),
-      adminNote,
-      reviewedByAdminId: adminId,
-      reviewedAt: now,
-    },
+  return transitionPayout(id, ['approved'], {
+    status: 'paid',
+    paidAt: now,
+    processedAt: now,
+    reference: reference.trim(),
+    adminNote,
+    reviewedByAdminId: adminId,
+    reviewedAt: now,
   });
 };
 
