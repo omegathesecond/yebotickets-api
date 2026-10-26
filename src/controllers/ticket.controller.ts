@@ -275,12 +275,12 @@ export const confirmCheckInController = async (req: Request, res: Response, next
       return next(new ApiError('User not authenticated', 401));
     }
 
-    const { ticketId, eventId } = req.body;
+    const { ticketId, eventId, opId } = req.body;
 
     const result = await confirmCheckIn(ticketId, eventId, {
       id: authReq.user.id,
       role: authReq.user.role,
-    });
+    }, opId);
 
     res.status(200).json({
       success: true,

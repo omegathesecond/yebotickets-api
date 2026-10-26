@@ -56,7 +56,7 @@ import { processWebhook } from '../payment-webhook.service';
 import {
   purchaseTicket,
   verifyTicket,
-  confirmCheckIn,
+  confirmCheckIn as confirmCheckInWithOperation,
   refundTicket,
   reconcileRefundAttempt,
   listRefundRecovery,
@@ -73,6 +73,9 @@ import {
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
+
+const confirmCheckIn = (ticket: string, event: string, requester: {id: string; role: string}) =>
+  confirmCheckInWithOperation(ticket, event, requester, crypto.randomUUID());
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 const sendTextMessageMock = sendTextMessage as jest.MockedFunction<typeof sendTextMessage>;
@@ -2311,6 +2314,7 @@ describe('admission serializes against event cancellation', () => {
       const tx = new Proxy(prismaMock, { get(target, key) {
         if (key !== '$queryRaw') return target[key as keyof typeof target];
         return async (sql: TemplateStringsArray, ...values: unknown[]) => {
+          if (sql.join('?').includes('pg_advisory_xact_lock')) return [];
           expect(sql.join('?')).toMatch(/SELECT "isCancelled" FROM "Event".*FOR UPDATE/);
           expect(values).toEqual([event.id]);
           release = await lock();
@@ -2396,5 +2400,105 @@ describe('admission serializes against event cancellation', () => {
     await cancelEvent(event.id, ORGANIZER);
     expect(event.isCancelled).toBe(true);
     expect(row.isCheckedIn).toBe(true);
+  });
+});
+
+
+describe('durable admission operation receipts', () => {
+  const requester = { id: 'org-1', role: 'organizer' };
+  let rows: Map<string, any>;
+  let receipts: Map<string, any>;
+  let failReceipt: boolean;
+  let tail: Promise<void>;
+  beforeEach(() => {
+    rows = new Map(['ticket-1', 'ticket-2'].map(id => [id, buildCheckInTicket({ id })]));
+    receipts = new Map();
+    failReceipt = false;
+    tail = Promise.resolve();
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+    prismaMock.ticket.findFirst.mockImplementation(async ({ where }: any) => {
+      const identifier = where.OR?.[0]?.id;
+      const row = rows.get(identifier) || (identifier === 'ABC123' ? rows.get('ticket-1') : null);
+      return row ? { ...row } : null;
+    });
+    // Model transaction commit/rollback and its held lock. All admission and
+    // receipt operations must use this transaction client, never the singleton.
+    prismaMock.$transaction.mockImplementation((async (callback: any) => {
+      const previous = tail;
+      let release!: () => void;
+      tail = new Promise<void>(done => { release = done; });
+      await previous;
+      const draft = new Map([...rows].map(([id, row]) => [id, { ...row }]));
+      const draftReceipts = new Map(receipts);
+      const tx = {
+        $queryRaw: jest.fn(async () => [{ isCancelled: false }]),
+        ticket: {
+          updateMany: jest.fn(async ({ where, data }: any) => {
+            const row = draft.get(where.id);
+            if (!row || row.isCheckedIn || row.status !== 'sold') return { count: 0 };
+            Object.assign(row, data); return { count: 1 };
+          }),
+          findUniqueOrThrow: jest.fn(async ({ where }: any) => draft.get(where.id)),
+        },
+        ticketAdmissionReceipt: {
+          findUnique: jest.fn(async ({ where }: any) => draftReceipts.get(where.opId) || null),
+          create: jest.fn(async ({ data }: any) => {
+            if (failReceipt) throw new Error('receipt storage unavailable');
+            draftReceipts.set(data.opId, data); return data;
+          }),
+        },
+      };
+      try {
+        const result = await callback(tx);
+        rows = draft; receipts = draftReceipts;
+        return result;
+      } finally { release(); }
+    }) as any);
+  });
+
+  const admit = (opId: string, ticket = 'ticket-1', operator = requester, event = 'event-1') =>
+    confirmCheckInWithOperation(ticket, event, operator, opId);
+
+  it('commits, loses the response, and returns the exact original success on repeated replay', async () => {
+    const original = await admit('lost-response');
+    // Caller never receives this success. A fresh request observes a used ticket.
+    expect(rows.get('ticket-1').isCheckedIn).toBe(true);
+    expect(receipts.size).toBe(1);
+    expect(await admit('lost-response')).toEqual(original);
+    expect(await admit('lost-response')).toEqual(original);
+    expect(original).toMatchObject({ valid: true, opId: 'lost-response', eventId: 'event-1', ticketId: 'ticket-1' });
+    expect(receipts.size).toBe(1);
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rolls back admission when writing the receipt fails, then safely retries', async () => {
+    failReceipt = true;
+    await expect(admit('rollback')).rejects.toMatchObject({ statusCode: 500 });
+    expect(rows.get('ticket-1').isCheckedIn).toBe(false);
+    expect(receipts.size).toBe(0);
+    failReceipt = false;
+    expect(await admit('rollback')).toMatchObject({ valid: true });
+  });
+
+  it('allows simultaneous identical requests to share exactly one receipt', async () => {
+    const [first, second] = await Promise.all([admit('same'), admit('same')]);
+    expect(first).toEqual(second);
+    expect(receipts.size).toBe(1);
+  });
+
+  it('admits once and reports a real conflict for distinct scanners', async () => {
+    const results = await Promise.allSettled([admit('scanner-a'), admit('scanner-b')]);
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.find(r => r.status === 'rejected')).toMatchObject({ reason: { statusCode: 400 } });
+    expect(receipts.size).toBe(1);
+  });
+
+  it('rejects key reuse for another ticket, operator or event without admitting again', async () => {
+    await admit('bound-key');
+    await expect(admit('bound-key', 'ticket-2')).rejects.toMatchObject({ statusCode: 409 });
+    await expect(admit('bound-key', 'ticket-1', { id: 'admin-2', role: 'admin' })).rejects.toMatchObject({ statusCode: 409 });
+    await expect(admit('bound-key', 'ticket-1', requester, 'event-2')).rejects.toMatchObject({ statusCode: 409 });
+    expect(rows.get('ticket-2').isCheckedIn).toBe(false);
+    expect(receipts.size).toBe(1);
   });
 });
