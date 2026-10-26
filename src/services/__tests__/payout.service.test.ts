@@ -92,11 +92,13 @@ const wirePayoutTable = ({ enforceIndexOnly = false } = {}) => {
   }) as any);
 
   prismaMock.payoutRequest.findUnique.mockImplementation((async (args: any) =>
-    store.find((r) => r.id === args.where.id) ?? null) as any);
+    (() => { const row = store.find((r) => r.id === args.where.id); return row ? { ...row } : null; })()) as any);
 
   prismaMock.payoutRequest.update.mockImplementation((async (args: any) => {
     const row = store.find((r) => r.id === args.where.id);
-    if (!row) throw new Error(`no payout row ${args.where.id}`);
+    if (!row || (args.where.status && row.status !== args.where.status)) {
+      throw Object.assign(new Error('Record not found'), { code: 'P2025' });
+    }
     Object.assign(row, args.data);
     return row;
   }) as any);
@@ -321,7 +323,7 @@ describe('admin fulfilment — approve, pay, reject', () => {
     wireSales(1000);
     const request = await createPayoutRequest(ORG, 400);
 
-    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT1')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT1')).rejects.toMatchObject({ statusCode: 409 });
     expect(store[0].status).toBe('pending');
   });
 
@@ -331,7 +333,7 @@ describe('admin fulfilment — approve, pay, reject', () => {
     await approvePayoutRequest(request.id, ADMIN);
     await markPayoutRequestPaid(request.id, ADMIN, 'FT1');
 
-    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT2')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(markPayoutRequestPaid(request.id, ADMIN, 'FT2')).rejects.toMatchObject({ statusCode: 409 });
     expect(await getOrganizerBalance(ORG)).toMatchObject({ paidOut: 400 });
   });
 
@@ -340,7 +342,7 @@ describe('admin fulfilment — approve, pay, reject', () => {
     const request = await createPayoutRequest(ORG, 400);
     await approvePayoutRequest(request.id, ADMIN);
 
-    await expect(approvePayoutRequest(request.id, ADMIN)).rejects.toMatchObject({ statusCode: 400 });
+    await expect(approvePayoutRequest(request.id, ADMIN)).rejects.toMatchObject({ statusCode: 409 });
   });
 
   it('RELEASES the amount back to the balance when a request is rejected', async () => {
@@ -536,5 +538,58 @@ describe('setPayoutApprovalStatus — admin review gate', () => {
     expect(prismaMock.user.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ payoutApprovalReviewedByAdminId: 'admin-bob' }) })
     );
+  });
+});
+
+describe('concurrent admin decisions', () => {
+  it.each([
+    ['approved', 'paid', 'rejected'],
+    ['approved', 'rejected', 'paid'],
+    ['pending', 'approved', 'rejected'],
+    ['pending', 'rejected', 'approved'],
+  ] as const)('%s: %s wins against delayed %s', async (initial, winner, loser) => {
+    wireSales(1000);
+    const request = await createPayoutRequest(ORG, 400);
+    if (initial === 'approved') await approvePayoutRequest(request.id, ADMIN);
+
+    // Both decisions must finish reading the same snapshot before either writes.
+    let reads = 0;
+    let release!: () => void;
+    const bothRead = new Promise<void>((resolve) => { release = resolve; });
+    prismaMock.payoutRequest.findUnique.mockImplementation((async () => {
+      const snapshot = { ...store[0] };
+      if (++reads === 2) release();
+      await bothRead;
+      return snapshot;
+    }) as any);
+    const results = await Promise.allSettled([
+      updatePayoutRequestStatus(request.id, winner, 'winner', { reference: 'FT-WINNER', adminNote: 'winner note' }),
+      updatePayoutRequestStatus(request.id, loser, 'loser', { reference: 'FT-LOSER', adminNote: 'loser note' }),
+    ]);
+    expect(results[0].status).toBe('fulfilled');
+    expect(results[1]).toMatchObject({ status: 'rejected', reason: { statusCode: 409 } });
+    expect(store[0]).toMatchObject({
+      status: winner, reviewedByAdminId: 'winner', adminNote: 'winner note',
+      reviewedAt: expect.any(Date),
+    });
+    expect(store[0].reference).toBe(winner === 'paid' ? 'FT-WINNER' : undefined);
+    expect(await getOrganizerBalance(ORG)).toMatchObject({
+      paidOut: winner === 'paid' ? 400 : 0,
+      reserved: winner === 'approved' ? 400 : 0,
+      availableBalance: winner === 'rejected' ? 1000 : 600,
+    });
+  });
+
+  it.each(['paid', 'rejected'] as const)('preserves terminal %s against every later decision', async (status) => {
+    wireSales(1000);
+    const request = await createPayoutRequest(ORG, 400);
+    await approvePayoutRequest(request.id, ADMIN);
+    await updatePayoutRequestStatus(request.id, status, ADMIN, { reference: 'FT1' });
+    const terminal = { ...store[0] };
+    for (const next of ['approved', 'paid', 'rejected'] as const) {
+      await expect(updatePayoutRequestStatus(request.id, next, 'other', { reference: 'FT2' }))
+        .rejects.toMatchObject({ statusCode: 409 });
+    }
+    expect(store[0]).toEqual(terminal);
   });
 });
