@@ -2502,3 +2502,79 @@ describe('durable admission operation receipts', () => {
     expect(receipts.size).toBe(1);
   });
 });
+
+// Use the real purchase and edit services with a transaction-scoped Event lock.
+// Both orderings must be safe even when the purchase's initial lookup is stale.
+describe('first purchase versus organiser backdating', () => {
+  it.each(['purchase', 'edit'])('%s acquires the Event lock first', async first => {
+    const { updateEvent } = await import('../event.service');
+    const event = { ...buildTicketType().event, id: 'event-1', organizerId: 'org-1',
+      startDate: new Date('2099-01-01'), endDate: new Date('2099-01-02') };
+    const row = buildAvailableTicket();
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      return { promise, resolve };
+    };
+    const acquired = deferred();
+    const resume = deferred();
+    const waiting = deferred();
+    let tail = Promise.resolve();
+    let locks = 0;
+    let firstTransactionReleased = false;
+    prismaMock.$transaction.mockImplementation((async (callback: any) => {
+      let release: (() => void) | undefined;
+      let lockPosition = 0;
+      const tx = new Proxy(prismaMock, { get(target, key) {
+        if (key !== '$queryRaw') return target[key as keyof typeof target];
+        return async (sql: TemplateStringsArray) => {
+          if (sql.join('?').includes('FROM "Event"')) {
+            expect(sql.join('?')).toMatch(/FOR (SHARE|UPDATE)/);
+            const previous = tail;
+            tail = new Promise<void>(done => { release = done; });
+            const position = ++locks;
+            lockPosition = position;
+            if (position === 2) waiting.resolve();
+            await previous;
+            if (position === 1) { acquired.resolve(); await resume.promise; }
+            return [{ ...event }];
+          }
+          return [{ saleStartDate: new Date(0), saleEndDate: new Date('2100-01-01') }];
+        };
+      } });
+      try { return await callback(tx); }
+      finally { if (release) { if (lockPosition === 1) firstTransactionReleased = true; release(); } }
+    }) as any);
+    prismaMock.ticketType.findUnique.mockImplementation((async () => buildTicketType({ event: { ...event } })) as any);
+    prismaMock.event.findFirst.mockImplementation((async () => ({ ...event })) as any);
+    prismaMock.event.update.mockImplementation((async ({ data }: any) => Object.assign(event, data)) as any);
+    prismaMock.ticket.count.mockImplementation((async () => row.status === 'available' ? 0 : 1) as any);
+    prismaMock.ticket.findFirst.mockImplementation((async () => row.status === 'available' ? { ...row } : null) as any);
+    prismaMock.ticket.updateMany.mockImplementation((async ({ data }: any) => { Object.assign(row, data); return { count: 1 }; }) as any);
+    prismaMock.ticket.findMany.mockImplementation((async ({ where }: any) => where.reservedAt ? [] : [
+      buildTicketWithRelations({ ...row, event: { ...event } }),
+    ]) as any);
+    createChargeMock.mockImplementation(async () => {
+      expect(firstTransactionReleased).toBe(true); // No database lock spans a gateway call.
+      return buildCharge({ status: 'PENDING' }) as any;
+    });
+    const buy = () => purchaseTicket('tt-1', 'user-1', PAYMENT);
+    const edit = () => updateEvent(event.id, {
+      startDate: new Date('2020-01-01'), endDate: new Date('2020-01-02'),
+    }, 'org-1');
+    const firstResult = Promise.allSettled([first === 'purchase' ? buy() : edit()]);
+    await acquired.promise;
+    const secondResult = Promise.allSettled([first === 'purchase' ? edit() : buy()]);
+    await waiting.promise;
+    resume.resolve();
+    expect((await firstResult)[0].status).toBe('fulfilled');
+    expect((await secondResult)[0].status).toBe('rejected');
+    if (first === 'purchase') {
+      expect(event.endDate).toEqual(new Date('2099-01-02'));
+      expect(row.status).toBe('reserved');
+    } else {
+      expect(row.status).toBe('available');
+      expect(createChargeMock).not.toHaveBeenCalled();
+    }
+  });
+});
