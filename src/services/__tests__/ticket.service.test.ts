@@ -1559,7 +1559,8 @@ describe('reclaimExpiredReservations', () => {
   });
 
   it('releases a hold whose charge YeboPay reports FAILED', async () => {
-    prismaMock.ticket.findMany.mockResolvedValueOnce([staleReserved()] as any);
+    prismaMock.ticket.findMany.mockResolvedValueOnce([staleReserved()] as any)
+      .mockResolvedValueOnce([staleReserved()] as any);
     getChargeMock.mockResolvedValueOnce(buildCharge({ status: 'FAILED' }) as any);
     prismaMock.ticket.updateMany.mockResolvedValueOnce({ count: 1 } as any); // release
 
@@ -2005,8 +2006,8 @@ describe('cancelled-event payment lifecycle', () => {
     expect(row).toMatchObject({ status: 'reserved', paymentRef: attempt, paymentStatus: 'PROCESSING' });
     // Reclaim cannot mistake an ambiguous accepted payment for an abandoned hold.
     row.reservedAt = new Date(0);
-    getChargeMock.mockRejectedValueOnce(new Error('attempt is not a charge id'));
-    expect(await reclaimExpiredReservations()).toMatchObject({ errors: 1, released: 0 });
+    expect(await reclaimExpiredReservations()).toMatchObject({ errors: 0, released: 0, stillPending: 1 });
+    expect(getChargeMock).not.toHaveBeenCalled();
     // Exercise the real signed-webhook entrypoint: dropping description in
     // verification/routing would orphan this accepted charge after response loss.
     const previousSecret = process.env.YEBOPAY_WEBHOOK_SECRET;

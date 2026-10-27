@@ -958,33 +958,19 @@ const releaseReservedTickets = async (ticketIds: string[], userId: string): Prom
   }
 };
 
-/**
- * Release EVERY reserved row sharing a YeboPay charge ref back to the pool —
- * used by the reclaim sweep, which only has the stale charge ref in hand (not
- * the full set of ticket ids the original purchase reserved). Same guard and
- * best-effort semantics as {@link releaseReservedTickets}.
- */
+/** Release a failed charge's holds inside its outcome transaction. */
 const releaseReservedTicketsByPaymentRef = async (
   paymentRef: string,
   userId: string,
-  tx?: Prisma.TransactionClient
+  tx: Prisma.TransactionClient
 ): Promise<void> => {
-  try {
-    await (tx || prisma).ticket.updateMany({
-      where: { paymentRef, status: 'reserved', userId, paymentStatus: { not: 'SUCCEEDED' } },
-      data: {
-        status: 'available',
-        userId: null,
-        reservedAt: null,
-        paymentRef: null,
-        paymentStatus: null,
-        amountPaid: null,
-      },
-    });
-  } catch (error) {
-    if (tx) throw error; // Transactional failure settlement must roll back as a unit.
-    console.error('Failed to release reserved ticket group after payment failure:', paymentRef, error);
-  }
+  await tx.ticket.updateMany({
+    where: { paymentRef, status: 'reserved', userId, paymentStatus: { not: 'SUCCEEDED' } },
+    data: {
+      status: 'available', userId: null, reservedAt: null,
+      paymentRef: null, paymentStatus: null, amountPaid: null,
+    },
+  });
 };
 
 /**
@@ -1239,10 +1225,11 @@ export const reclaimExpiredReservations = async (
       const pastHardExpiry =
         !ticket.reservedAt || now - ticket.reservedAt.getTime() > RESERVATION_HARD_EXPIRY_MS;
 
-      // No charge ref: the hold never reached a charge — nothing to reconcile
-      // against YeboPay. Reclaim only once it is genuinely abandoned (hard expiry).
-      if (!ticket.paymentRef) {
-        if (pastHardExpiry && ticket.paymentStatus !== 'PROCESSING') {
+      // An attempt reference is not a gateway charge ID. Its dispatch outcome
+      // stays unknown until a response or webhook binds the charge. Only legacy
+      // uncharged holds without an in-flight dispatch may expire.
+      if (!ticket.paymentRef || ticket.paymentRef.startsWith('attempt:')) {
+        if (pastHardExpiry && !ticket.paymentRef && ticket.paymentStatus !== 'PROCESSING') {
           await releaseReservedTickets([ticket.id], ticket.userId!);
           summary.released++;
         } else {
@@ -1261,8 +1248,9 @@ export const reclaimExpiredReservations = async (
         const outcome = await settleSucceededCharge(ticket.paymentRef);
         if (outcome.result === 'issued' || outcome.result === 'already_final') summary.finalized++;
       } else if (charge.status === 'FAILED') {
-        await releaseReservedTicketsByPaymentRef(ticket.paymentRef, ticket.userId!);
-        summary.released++;
+        const outcome = await settleFailedCharge(ticket.paymentRef);
+        if (outcome.result === 'released') summary.released++;
+        else if (outcome.result === 'already_final') summary.finalized++;
       } else {
         summary.stillPending++;
       }

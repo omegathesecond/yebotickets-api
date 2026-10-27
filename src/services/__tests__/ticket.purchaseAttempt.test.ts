@@ -5,7 +5,7 @@ jest.mock('../yebopay.service', () => ({ createCharge: jest.fn(), getCharge: jes
 jest.mock('../qr.service', () => ({ buildTicketQrPayload: jest.fn(() => ({})), generateTicketQrDataUrl: jest.fn(async () => 'QR') }));
 jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(async () => ({})), sendEmailMessage: jest.fn() }));
 import prisma from '../../config/prisma';
-import { purchaseTicket, recoverPurchaseAttempt, handleChargeWebhookEvent } from '../ticket.service';
+import { purchaseTicket, recoverPurchaseAttempt, handleChargeWebhookEvent, reclaimExpiredReservations } from '../ticket.service';
 import { createCharge, getCharge } from '../yebopay.service';
 import { sendTextMessage } from '../comms.service';
 const db = prisma as ReturnType<typeof mockDeep<PrismaClient>>;
@@ -23,6 +23,7 @@ function matches(row: any, where: any): boolean {
       if ('in' in v) return v.in.includes(row[k]);
       if ('not' in v) return row[k] !== v.not;
       if ('lte' in v) return row[k] <= v.lte;
+      if ('lt' in v) return row[k] < v.lt;
     }
     return row[k] === v;
   });
@@ -232,4 +233,40 @@ it('a stale FAILED create response after a success webhook cannot poison recover
   expect(attempts.get(key).failure).toBeNull();
   expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({pending: false});
   assertSingleOrder();
+});
+
+
+it('sweeper failure settlement leaves a recoverable terminal attempt after releasing inventory', async () => {
+  gateway.mockResolvedValueOnce({id: 'charge', status: 'PENDING'});
+  await buy();
+  tickets.filter(t => t.status === 'reserved').forEach(t => {t.reservedAt = new Date(0);});
+  (getCharge as jest.Mock).mockResolvedValue({id: 'charge', status: 'FAILED'});
+  await reclaimExpiredReservations();
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({failed: true, tickets: []});
+  expect(tickets.every(t => t.status === 'available')).toBe(true);
+  expect(gateway).toHaveBeenCalledTimes(1);
+});
+
+it('a stale sweeper FAILED response cannot poison a successful webhook outcome', async () => {
+  gateway.mockResolvedValueOnce({id: 'charge', status: 'PENDING'});
+  await buy();
+  tickets.filter(t => t.status === 'reserved').forEach(t => {t.reservedAt = new Date(0);});
+  (getCharge as jest.Mock).mockImplementation(async () => {
+    await handleChargeWebhookEvent('charge.succeeded', {id: 'charge'});
+    return {id: 'charge', status: 'FAILED'};
+  });
+  await reclaimExpiredReservations();
+  expect(attempts.get(key).failure).toBeNull();
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({pending: false, tickets: [{id: 'seat-0'}, {id: 'seat-1'}]});
+  assertSingleOrder();
+});
+
+it('sweeper never polls or expires an unknown gateway dispatch reference', async () => {
+  gateway.mockRejectedValueOnce(new Error('response lost'));
+  await expect(buy()).rejects.toThrow();
+  tickets.filter(t => t.status === 'reserved').forEach(t => {t.reservedAt = new Date(0);});
+  await reclaimExpiredReservations();
+  expect(getCharge).not.toHaveBeenCalled();
+  expect(tickets.filter(t => t.status === 'reserved')).toHaveLength(2);
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({pending: true, unknown: true});
 });
