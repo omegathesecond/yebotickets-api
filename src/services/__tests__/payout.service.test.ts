@@ -593,3 +593,30 @@ describe('concurrent admin decisions', () => {
     expect(store[0]).toEqual(terminal);
   });
 });
+
+
+describe('date edits cannot release future ticket proceeds', () => {
+  it.each(['sold', 'reserved'])('rejects backdating a future event with %s tickets, including concurrent payout', async status => {
+    const { updateEvent } = await import('../event.service');
+    const event = { id: 'e1', organizerId: ORG, title: 'Future Fest',
+      startDate: new Date('2099-01-01'), endDate: UPCOMING, isCancelled: false };
+    prismaMock.$transaction.mockImplementation((async (cb: any) => cb(prismaMock)) as any);
+    prismaMock.event.findFirst.mockImplementation((async () => ({ ...event })) as any);
+    prismaMock.event.update.mockImplementation((async ({ data }: any) => Object.assign(event, data)) as any);
+    prismaMock.ticket.count.mockResolvedValue(1);
+    prismaMock.event.findMany.mockImplementation((async () => [{ ...event }]) as any);
+    prismaMock.ticket.findMany.mockResolvedValue(status === 'sold' ? [
+      { eventId: 'e1', status, amountPaid: 100, ticketType: { price: 100 } },
+    ] as any : []);
+    const outcomes = await Promise.allSettled([
+      updateEvent('e1', { startDate: new Date('2020-01-01'), endDate: FINISHED }, ORG),
+      createPayoutRequest(ORG, 1),
+    ]);
+    expect(outcomes.map(result => result.status)).toEqual(['rejected', 'rejected']);
+    expect((outcomes[0] as PromiseRejectedResult).reason.statusCode).toBe(409);
+    expect((outcomes[1] as PromiseRejectedResult).reason.statusCode).toBe(400);
+    expect(event.endDate).toEqual(UPCOMING);
+    expect((await getOrganizerBalance(ORG)).availableBalance).toBe(0);
+    expect(store).toHaveLength(0);
+  });
+});

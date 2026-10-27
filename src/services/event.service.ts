@@ -281,6 +281,23 @@ export const updateEvent = async (
         'End date must be after start date'
       );
 
+      // Event.endDate is the settlement release boundary. Purchases hold a
+      // conflicting Event FOR SHARE lock until their sale/reservation commits,
+      // so this check cannot race the first inventory claim. Gateway calls run
+      // after that transaction and never extend this lock's lifetime.
+      if (updateData.endDate !== undefined &&
+          new Date(updateData.endDate).getTime() < existingEvent.endDate.getTime()) {
+        const committedTickets = await tx.ticket.count({
+          where: { eventId, status: { not: 'available' } },
+        });
+        if (committedTickets > 0) {
+          throw new ApiError(
+            'The event end date cannot be moved earlier after ticket sales or payment holds. Keep the current end date or postpone the event; contact support if the schedule needs correction.',
+            409
+          );
+        }
+      }
+
       // Build update object
       const updateObj: any = {};
       if (updateData.title) updateObj.title = updateData.title;
