@@ -32,11 +32,22 @@ import {
 import { validate } from '../middleware/validate.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
 import { deliveryRetryLimiter, purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
+import { ApiError } from '../middleware/error.middleware';
+import type { AuthenticatedRequest } from '../types/auth';
 import { UserRole } from '../interfaces/user.interface';
 
-import { listRefundRecovery, reconcileRefundAttempt } from '../services/ticket.service';
+import { recoverPurchaseAttempt, listRefundRecovery, reconcileRefundAttempt } from '../services/ticket.service';
 
 const router = express.Router();
+
+router.post('/purchase-attempts/:key/recover', protect, purchaseTicketLimiter, async (req, res, next) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.id;
+    if (!userId) throw new ApiError('User not authenticated', 401);
+    const order = await recoverPurchaseAttempt(req.params.key, userId);
+    res.status(order.pending ? 202 : 200).json({ success: true, data: order });
+  } catch (error) { next(error); }
+});
 
 router.post('/:ticketId/delivery/retry', protect, deliveryRetryLimiter, retryTicketDeliveryController);
 

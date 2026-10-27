@@ -54,7 +54,7 @@ jest.mock('../yebopay.service', () => ({
 import prisma from '../../config/prisma';
 import { processWebhook } from '../payment-webhook.service';
 import {
-  purchaseTicket,
+  purchaseTicket as purchaseWithKey,
   verifyTicket,
   confirmCheckIn as confirmCheckInWithOperation,
   refundTicket,
@@ -74,6 +74,10 @@ import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
+// Existing purchase scenarios now supply the mandatory durable identity.
+const purchaseTicket: typeof purchaseWithKey = (tier, user, payment, quantity) =>
+  purchaseWithKey(tier, user, { idempotencyKey: crypto.randomUUID(), ...payment }, quantity);
+
 const confirmCheckIn = (ticket: string, event: string, requester: {id: string; role: string}) =>
   confirmCheckInWithOperation(ticket, event, requester, crypto.randomUUID());
 
@@ -90,6 +94,10 @@ beforeEach(() => {
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
   recoveryLock = null;
+  prismaMock.ticketPurchaseAttempt.findUnique.mockResolvedValue(null);
+  prismaMock.ticketPurchaseAttempt.create.mockImplementation(async ({data}: any) => ({...data}));
+  prismaMock.ticketPurchaseAttempt.update.mockImplementation(async ({data}: any) => ({...data}));
+  prismaMock.ticketPurchaseAttempt.updateMany.mockResolvedValue({count: 1});
   // Model the durable delivery table independently of ticket.findMany's
   // sequential reservation/settlement fixtures. Dispatch re-reads its members.
   const orders = new Map<string, any>();
@@ -130,6 +138,7 @@ beforeEach(() => {
   prismaMock.$transaction.mockImplementation(((callback: any) => {
     if (typeof callback !== 'function') return Promise.all(callback);
     const tx = new Proxy(prismaMock, { get(target, key) {
+      if (key === '$queryRaw') return (sql: TemplateStringsArray, ...args: any[]) => sql.join('').includes('pg_advisory_xact_lock') ? Promise.resolve([]) : (target.$queryRaw as any)(sql, ...args);
       if (key !== 'ticket') return target[key as keyof typeof target];
       return new Proxy(target.ticket, { get(ticket, operation) {
         if (operation !== 'findMany') return ticket[operation as keyof typeof ticket];
@@ -146,9 +155,7 @@ beforeEach(() => {
   prismaMock.$queryRaw.mockResolvedValue([{
     saleStartDate: new Date(0), saleEndDate: new Date('2099-01-01'), isCancelled: false, isPublished: true, endDate: new Date(Date.now() + 86400000),
   }]);
-  // Default: no stale reservations to reclaim. purchaseTicket's paid path runs a
-  // reclaim sweep up front (prisma.ticket.findMany); without this the call would
-  // see `undefined` and throw. Tests that exercise reclaim (or a batch claim's
+  // Default empty query result. Tests that exercise reclaim (or a batch claim's
   // post-claim fetch) override it.
   prismaMock.ticket.findMany.mockResolvedValue([] as any);
   // Default: claimAvailableTickets' shortfall path counts what's really left
@@ -260,7 +267,7 @@ const PAYMENT = {
   providerCode: 'mtn-momo-sz',
   phone: '+26878000000',
   country: 'SZ',
-  idempotencyKey: 'idem-1',
+  idempotencyKey: 'idem-000000000001',
 };
 
 describe('purchaseTicket — payment + atomic claim', () => {
@@ -270,7 +277,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
     prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([] as any) // reclaim sweep: no stale reservations
       .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved' })] as any) // reserve re-fetch
       .mockResolvedValueOnce([
         buildTicketWithRelations({
@@ -294,18 +300,18 @@ describe('purchaseTicket — payment + atomic claim', () => {
       providerCode: 'mtn-momo-sz',
       phone: '+26878000000',
       country: 'SZ',
-      idempotencyKey: 'idem-1',
+      idempotencyKey: 'idem-000000000001',
     });
 
-    // Reserve and settle use conditional writes; the third write attaches
-    // the delivery order inside the settlement transaction.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(3); // reserve, settle, attach durable order
+    // Reserve, charge binding and settlement are guarded; issuance also
+    // attaches the durable delivery order inside the settlement transaction.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(4); // reserve, bind charge, settle, attach durable order
     expect(prismaMock.ticketOrderDelivery.upsert).toHaveBeenCalledWith({ where: { id: 'paid:chg_1' }, create: { id: 'paid:chg_1' }, update: {} });
     expect(prismaMock.ticket.update).not.toHaveBeenCalled();
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.where).toEqual({ id: 'ticket-1', status: 'available', userId: null });
     expect(reserveArg.data).toMatchObject({ userId: 'user-1', status: 'reserved' });
-    const finalizeArg = prismaMock.ticket.updateMany.mock.calls[1][0];
+    const finalizeArg = prismaMock.ticket.updateMany.mock.calls[2][0];
     expect(finalizeArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1' });
     expect(finalizeArg.data).toMatchObject({
       status: 'sold',
@@ -347,7 +353,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
       })
     );
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([] as any) // reclaim sweep: no stale reservations
       .mockResolvedValueOnce(reservedRows as any) // reserve re-fetch
       .mockResolvedValueOnce(soldRows as any); // finalize re-fetch
     createChargeMock.mockResolvedValue(buildCharge({ amount: '300' }) as any);
@@ -420,7 +425,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
       .mockResolvedValueOnce({ id: 'ticket-3' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([] as any) // reclaim sweep: no stale reservations
       .mockResolvedValueOnce(
         ['ticket-1', 'ticket-2', 'ticket-3'].map((id) =>
           buildTicketWithRelations({ id, status: 'reserved' })
@@ -480,7 +484,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
     prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any); // reserve + release
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([] as any) // reclaim sweep: no stale reservations
       .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved' })] as any);
     createChargeMock.mockResolvedValue(
       buildCharge({ status: 'FAILED', failure_reason: 'insufficient funds' }) as any
@@ -490,12 +493,12 @@ describe('purchaseTicket — payment + atomic claim', () => {
       statusCode: 402,
     });
 
-    // It reserved (updateMany #1) then RELEASED the hold (updateMany #2 back to
-    // available) — it never finalized a sale and never delivered a ticket.
-    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(2);
+    // It reserved, bound the charge reference, then released the hold.
+    // It never finalized a sale and never delivered a ticket.
+    expect(prismaMock.ticket.updateMany).toHaveBeenCalledTimes(3);
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.data).toMatchObject({ status: 'reserved' });
-    const releaseArg = prismaMock.ticket.updateMany.mock.calls[1][0];
+    const releaseArg = prismaMock.ticket.updateMany.mock.calls[2][0];
     expect(releaseArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1' });
     // Release returns the row to the pool AND clears the (failed) payment trail
     // so the freed seat is pristine for the next buyer.
@@ -520,7 +523,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
     prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([] as any) // reclaim sweep: no stale reservations
       .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved' })] as any) // reserve re-fetch
       .mockResolvedValueOnce([
         buildTicketWithRelations({ status: 'reserved', paymentStatus: 'PENDING', amountPaid: 100 }),
@@ -541,7 +543,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
     // NEVER a release (the seat stays held) and NEVER a flip to 'sold'.
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.data).toMatchObject({ status: 'reserved' });
-    const pendingArg = prismaMock.ticket.updateMany.mock.calls[1][0];
+    const pendingArg = prismaMock.ticket.updateMany.mock.calls[2][0];
     expect(pendingArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1', paymentStatus: { not: 'SUCCEEDED' } });
     expect(pendingArg.data).toMatchObject({ paymentRef: 'chg_1', paymentStatus: 'PENDING', amountPaid: 100 });
     // The mark-pending write must NOT flip status (no `status` key) — the seat
@@ -670,8 +672,8 @@ describe('purchaseTicket — payment + atomic claim', () => {
     createChargeMock.mockResolvedValue(buildCharge() as any);
 
     const outcomes = await Promise.allSettled([
-      purchaseTicket('tt-1', 'user-1', { ...PAYMENT, idempotencyKey: 'k1' }),
-      purchaseTicket('tt-1', 'user-2', { ...PAYMENT, idempotencyKey: 'k2' }),
+      purchaseTicket('tt-1', 'user-1', { ...PAYMENT, idempotencyKey: 'purchase-key-0001' }),
+      purchaseTicket('tt-1', 'user-2', { ...PAYMENT, idempotencyKey: 'purchase-key-0002' }),
     ]);
 
     const fulfilled = outcomes.filter(o => o.status === 'fulfilled');
@@ -742,7 +744,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
       prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
       prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
       prismaMock.ticket.findMany.mockResolvedValue([buildTicketWithRelations()] as any);
-      if (price > 0) prismaMock.ticket.findMany.mockResolvedValueOnce([]);
+
       createChargeMock.mockResolvedValue(buildCharge() as any);
       await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).resolves.toBeDefined();
       expect(createChargeMock).toHaveBeenCalledTimes(price > 0 ? 1 : 0);
@@ -767,8 +769,6 @@ describe('purchaseTicket — payment + atomic claim', () => {
       prismaMock.ticket.findFirst.mockResolvedValue(buildAvailableTicket() as any);
       prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
       prismaMock.ticket.findMany.mockResolvedValue([buildTicketWithRelations()] as any);
-      // Paid purchases first query stale reservations, then fetch their claim.
-      if (price > 0) prismaMock.ticket.findMany.mockResolvedValueOnce([]);
       createChargeMock.mockResolvedValue(buildCharge() as any);
 
       await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).resolves.toBeDefined();

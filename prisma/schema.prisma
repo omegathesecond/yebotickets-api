@@ -379,3 +379,16 @@ model TicketAdmissionReceipt {
   response   Json
   createdAt  DateTime @default(now())
 }
+
+// Immutable purchase identity; retain even after ticket release/deletion.
+// Only the creator may dispatch. PROCESSING is never automatically retried.
+model TicketPurchaseAttempt {
+  key String @id
+  userId String
+  fingerprint String
+  ticketIds String[]
+  attemptRef String @unique
+  chargeId String? @unique
+  failure String?
+  createdAt DateTime @default(now())
+}

@@ -52,8 +52,8 @@ export const RECLAIM_BATCH = 20;
  * How the buyer is paying, forwarded to YeboPay. Either a saved
  * `paymentMethodId`, OR a one-off `providerCode` (+ the family's field: `phone`
  * for mobile money, `cardToken` for card). `country` defaults to SZ.
- * `idempotencyKey` lets the client make a retry safe against double-charging —
- * the buyer app sends a fresh key per ticket so each ticket is charged once.
+ * `idempotencyKey` is mandatory, globally owned by this buyer and bound to
+ * one immutable purchase intent; replay recovers its original allocation.
  */
 export interface PurchasePaymentInput {
   paymentMethodId?: string;
@@ -693,85 +693,84 @@ const assertTierOnSale = (tier: SaleTier | undefined): void => {
 };
 
 const claimAvailableTickets = async (
+  tx: Prisma.TransactionClient,
   ticketTypeId: string,
   eventId: string,
   userId: string,
   quantity: number,
   data: Record<string, unknown>
 ): Promise<{ tickets: any[]; availableRemaining: number }> => {
-  return prisma.$transaction(async (tx) => {
-    // Hold a shared row lock through the inventory claim. Unpublish/cancel
-    // updates take a conflicting lock: whichever commits first determines
-    // whether this purchase may claim inventory. Never hold it over YeboPay.
-    const events = await tx.$queryRaw<SaleEvent[]>`
-      SELECT "isCancelled", "isPublished", "endDate"
-      FROM "Event" WHERE "id" = ${eventId} FOR SHARE
-    `;
-    assertEventOnSale(events[0]);
-    // Tier edits use a conflicting row lock. Re-read after acquiring it so an
-    // edit committed since the initial lookup cannot bypass the sale window.
-    const tiers = await tx.$queryRaw<SaleTier[]>`
-      SELECT "saleStartDate", "saleEndDate"
-      FROM "TicketType" WHERE "id" = ${ticketTypeId} AND "eventId" = ${eventId} FOR SHARE
-    `;
-    assertTierOnSale(tiers[0]);
-    const claimedIds: string[] = [];
+  // Hold a shared row lock through the inventory claim. Unpublish/cancel
+  // updates take a conflicting lock: whichever commits first determines
+  // whether this purchase may claim inventory. Never hold it over YeboPay.
+  const events = await tx.$queryRaw<SaleEvent[]>`
+    SELECT "isCancelled", "isPublished", "endDate"
+    FROM "Event" WHERE "id" = ${eventId} FOR SHARE
+  `;
+  assertEventOnSale(events[0]);
+  // Tier edits use a conflicting row lock. Re-read after acquiring it so an
+  // edit committed since the initial lookup cannot bypass the sale window.
+  const tiers = await tx.$queryRaw<SaleTier[]>`
+    SELECT "saleStartDate", "saleEndDate"
+    FROM "TicketType" WHERE "id" = ${ticketTypeId} AND "eventId" = ${eventId} FOR SHARE
+  `;
+  assertTierOnSale(tiers[0]);
+  const claimedIds: string[] = [];
 
-    while (claimedIds.length < quantity) {
-      const candidate = await tx.ticket.findFirst({
-        where: { ticketTypeId, status: 'available', userId: null },
-        select: { id: true },
-      });
-
-      if (!candidate) {
-        break; // pool exhausted
-      }
-
-      // Conditional claim: only flips the row while it is STILL available and
-      // unowned. count === 1 -> we won; count === 0 -> another buyer beat us to
-      // this exact row between our find and our write.
-      const claim = await tx.ticket.updateMany({
-        where: { id: candidate.id, status: 'available', userId: null },
-        data: { userId, ...data },
-      });
-
-      if (claim.count === 1) {
-        claimedIds.push(candidate.id);
-      }
-      // else lost this row; the next findFirst can never return it again.
-    }
-
-    if (claimedIds.length < quantity) {
-      // Never partially reserve: give back everything this attempt claimed.
-      if (claimedIds.length > 0) {
-        await tx.ticket.updateMany({
-          where: { id: { in: claimedIds }, userId },
-          data: {
-            userId: null,
-            status: 'available',
-            reservedAt: null,
-            paymentRef: null,
-            paymentStatus: null,
-            amountPaid: null,
-            purchaseDate: null,
-          },
-        });
-      }
-      const availableRemaining = await tx.ticket.count({
-        where: { ticketTypeId, status: 'available', userId: null },
-      });
-      return { tickets: [], availableRemaining };
-    }
-
-    // We own every row; no other writer can match the guard now, so this read
-    // returns our committed claim with the relations needed for delivery.
-    const tickets = await tx.ticket.findMany({
-      where: { id: { in: claimedIds } },
-      include: PURCHASE_INCLUDE,
+  while (claimedIds.length < quantity) {
+    const candidate = await tx.ticket.findFirst({
+      where: { ticketTypeId, status: 'available', userId: null },
+      select: { id: true },
     });
-    if (data.status === 'sold') await enqueueOrderDelivery(tx, tickets);
-    return { tickets, availableRemaining: tickets.length };
+
+    if (!candidate) {
+      break; // pool exhausted
+    }
+
+    // Conditional claim: only flips the row while it is STILL available and
+    // unowned. count === 1 -> we won; count === 0 -> another buyer beat us to
+    // this exact row between our find and our write.
+    const claim = await tx.ticket.updateMany({
+      where: { id: candidate.id, status: 'available', userId: null },
+      data: { userId, ...data },
+    });
+
+    if (claim.count === 1) {
+      claimedIds.push(candidate.id);
+    }
+    // else lost this row; the next findFirst can never return it again.
+  }
+
+  if (claimedIds.length < quantity) {
+    // Never partially reserve: give back everything this attempt claimed.
+    if (claimedIds.length > 0) {
+      await tx.ticket.updateMany({
+        where: { id: { in: claimedIds }, userId },
+        data: {
+          userId: null,
+          status: 'available',
+          reservedAt: null,
+          paymentRef: null,
+          paymentStatus: null,
+          amountPaid: null,
+          purchaseDate: null,
+        },
+      });
+    }
+    const availableRemaining = await tx.ticket.count({
+      where: { ticketTypeId, status: 'available', userId: null },
+    });
+    return { tickets: [], availableRemaining };
+  }
+
+  // We own every row; no other writer can match the guard now, so this read
+  // returns our committed claim with the relations needed for delivery.
+  const tickets = await tx.ticket.findMany({
+    where: { id: { in: claimedIds } },
+    include: PURCHASE_INCLUDE,
   });
+  if (data.status === 'sold') await enqueueOrderDelivery(tx, tickets);
+  return { tickets, availableRemaining: tickets.length };
 };
 
 /**
@@ -1134,6 +1133,7 @@ export const settleFailedCharge = async (chargeId: string): Promise<WebhookCharg
   if (tickets.some((t) => t.status !== 'reserved')) {
     return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
   }
+  await prisma.ticketPurchaseAttempt.updateMany({ where: { chargeId }, data: { failure: 'Payment failed. No ticket was issued.' } });
   await releaseReservedTicketsByPaymentRef(chargeId, tickets[0].userId!);
   return { result: 'released', ticketId: tickets[0].id };
 };
@@ -1156,6 +1156,10 @@ export const handleChargeWebhookEvent = async (
       ? charge.description.match(/\[yebotickets:(attempt:[0-9a-f-]{36})\]$/)?.[1]
       : undefined;
     if (key) {
+      await prisma.ticketPurchaseAttempt.updateMany({
+        where: { attemptRef: key, OR: [{ chargeId: null }, { chargeId: charge.id }] },
+        data: { chargeId: charge.id, ...(eventType === 'charge.failed' ? { failure: 'Payment failed. No ticket was issued.' } : {}) },
+      });
       await prisma.ticket.updateMany({
         where: { paymentRef: key, status: 'reserved', paymentStatus: 'PROCESSING' },
         data: { paymentRef: charge.id },
@@ -1341,73 +1345,51 @@ export const purchaseTicket = async (
     }
     const qty = quantity;
 
-    // Reject off-sale events before any reclaim, inventory write or charge.
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
-      include: { event: { select: { isCancelled: true, isPublished: true, endDate: true } } },
-    });
-
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
+    const key = payment?.idempotencyKey;
+    if (typeof key !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) {
+      throw new ApiError('A purchase idempotencyKey (16–128 letters, digits, _ or -) is required', 400);
     }
-
-    assertEventOnSale(ticketType.event);
-    assertTierOnSale(ticketType);
-
-    const price = ticketType.price;
-
-    // --- Free tickets: no payment, claim straight to sold, all-or-nothing. ---
-    if (!price || price <= 0) {
-      const { tickets: freeTickets, availableRemaining } = await claimAvailableTickets(
-        ticketTypeId,
-        ticketType.eventId,
-        userId,
-        qty,
-        {
-          status: 'sold',
-          purchaseDate: new Date(),
-          paymentStatus: 'FREE',
-          amountPaid: 0,
+    // Hash intent only: never persist card tokens or phone numbers here.
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify([
+      ticketTypeId, qty, payment?.paymentMethodId || null, payment?.providerCode || null,
+      payment?.country || DEFAULT_COUNTRY, payment?.phone || null, payment?.cardToken || null,
+    ])).digest('hex');
+    const allocation = await prisma.$transaction(async tx => {
+      // Global key ownership also rejects reuse by a different principal.
+      // This lock ends before any gateway or delivery call.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+      const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
+      if (prior) {
+        if (prior.userId !== userId || prior.fingerprint !== fingerprint) {
+          throw new ApiError('Purchase key is already bound to a different buyer or purchase intent', 409);
         }
-      );
-      if (freeTickets.length === 0) {
-        throw new ApiError(
-          `Only ${availableRemaining} ticket(s) left for this ticket type — requested ${qty}.`,
-          409
-        );
+        return { replay: true as const, attempt: prior };
       }
-      return finishIssuedOrder(freeTickets);
-    }
-
-    // --- Paid tickets: reserve N -> charge ONCE -> finalize / hold / release. -
-    const validPayment = assertPaymentProvided(payment);
-
-    // 0. Reclaim any stale holds for this type FIRST so an abandoned async
-    //    PENDING charge can't make this type look sold-out. Best-effort: a
-    //    YeboPay outage here is logged, never thrown (it must not block a sale).
-    await reclaimExpiredReservations(ticketTypeId).catch((error) =>
-      console.error('Reservation reclaim sweep failed (continuing):', ticketTypeId, error)
-    );
-
-    // 1. Reserve `qty` available rows atomically, all-or-nothing (held, not yet
-    //    sold). reservedAt stamps each hold so the reclaim sweep can later
-    //    resolve them if the async charge never confirms.
-    const attemptRef = `attempt:${crypto.randomUUID()}`;
-    const { tickets: reserved, availableRemaining } = await claimAvailableTickets(
-      ticketTypeId,
-      ticketType.eventId,
-      userId,
-      qty,
-      { status: 'reserved', reservedAt: new Date(), paymentStatus: 'PROCESSING',
-        paymentRef: attemptRef, amountPaid: price }
-    );
-    if (reserved.length === 0) {
-      throw new ApiError(
-        `Only ${availableRemaining} ticket(s) left for this ticket type — requested ${qty}.`,
-        409
+      const ticketType = await tx.ticketType.findUnique({ where: { id: ticketTypeId }, include: { event: true } });
+      if (!ticketType) throw new ApiError('Ticket type not found', 404);
+      assertEventOnSale(ticketType.event);
+      assertTierOnSale(ticketType);
+      const price = ticketType.price;
+      if (price > 0) assertPaymentProvided(payment);
+      const attemptRef = `attempt:${crypto.randomUUID()}`;
+      const { tickets, availableRemaining } = await claimAvailableTickets(
+        tx, ticketTypeId, ticketType.eventId, userId, qty,
+        price > 0
+          ? { status: 'reserved', reservedAt: new Date(), paymentStatus: 'PROCESSING', paymentRef: attemptRef, amountPaid: price }
+          : { status: 'sold', purchaseDate: new Date(), paymentStatus: 'FREE', amountPaid: 0 }
       );
-    }
-    const reservedIds = reserved.map((t) => t.id);
+      if (!tickets.length) throw new ApiError(`Only ${availableRemaining} ticket(s) left for this ticket type — requested ${qty}.`, 409);
+      const attempt = await tx.ticketPurchaseAttempt.create({ data: {
+        key, userId, fingerprint, attemptRef, ticketIds: tickets.map(t => t.id),
+      } });
+      return { replay: false as const, attempt, tickets, price, ticketType };
+    });
+    if (allocation.replay) return recoverPurchaseAttempt(key, userId);
+    const { tickets: reserved, price, ticketType, attempt } = allocation;
+    if (price <= 0) return finishIssuedOrder(reserved);
+    const validPayment = assertPaymentProvided(payment);
+    const attemptRef = attempt.attemptRef;
+    const reservedIds = attempt.ticketIds;
 
     // 2. Persist an attempt reference BEFORE charging. An HTTP/transport error
     //    cannot prove no charge was accepted; retain the hold for its webhook.
@@ -1430,7 +1412,7 @@ export const purchaseTicket = async (
           userId,
           quantity: qty,
         },
-        idempotencyKey: validPayment.idempotencyKey || crypto.randomUUID(),
+        idempotencyKey: key,
       });
     } catch (error) {
       console.error('Charge creation outcome unknown; retained reconciliation hold:', attemptRef, error);
@@ -1439,6 +1421,13 @@ export const purchaseTicket = async (
       }
       throw error;
     }
+
+    // Bind the gateway identity before settlement. A webhook may have won.
+    await prisma.ticketPurchaseAttempt.update({ where: { key }, data: { chargeId: charge.id } });
+    await prisma.ticket.updateMany({
+      where: { id: { in: reservedIds }, userId, paymentRef: attemptRef, status: 'reserved' },
+      data: { paymentRef: charge.id },
+    });
 
     // 3a. PENDING (asynchronous rail — mobile money). The buyer has NOT paid yet
     //     but WILL be debited once they approve the USSD prompt; the money then
@@ -1454,12 +1443,15 @@ export const purchaseTicket = async (
         paymentRef: charge.id,
         amountPaidPerTicket: price,
       });
-      return buildPendingOrderResult(held.length ? held : reserved, charge.id);
+      if (!held.length || held.every(t => t.status === 'cancelled')) return recoverPurchaseAttempt(key, userId);
+      if (held.every(t => t.status === 'sold')) return finishIssuedOrder(held);
+      return buildPendingOrderResult(held, charge.id);
     }
 
     // 3b. Any non-SUCCEEDED, non-PENDING status (FAILED/REFUNDED/…) is a hard
     //     failure: release every hold and surface it loudly — no ticket issued.
     if (charge.status !== 'SUCCEEDED') {
+      await prisma.ticketPurchaseAttempt.update({ where: { key }, data: { failure: `Payment ${charge.status}. No ticket was issued.` } });
       await releaseReservedTickets(reservedIds, userId);
       const reason = charge.failure_reason ? `: ${charge.failure_reason}` : '';
       throw new ApiError(`Payment ${charge.status.toLowerCase()}${reason}. No ticket was issued.`, 402);
@@ -1474,7 +1466,7 @@ export const purchaseTicket = async (
       amountPaidPerTicket: price,
     });
     if (sold.length === 0) {
-      throw new ApiError('Failed to finalize the purchased ticket(s)', 500);
+      return recoverPurchaseAttempt(key, userId);
     }
 
     return finishIssuedOrder(sold);
@@ -1483,6 +1475,62 @@ export const purchaseTicket = async (
     if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to purchase ticket', 500);
   }
+};
+
+/** Recover only; never dispatch a second charge, including after a process crash. */
+export const recoverPurchaseAttempt = async (key: string, userId: string) => {
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new ApiError('Invalid purchase key', 400);
+  const attempt = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
+    if (prior) {
+      if (prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
+      return prior;
+    }
+    // Fence a request that never arrived (or was rejected before allocation).
+    // A delayed POST with this key can no longer start a charge after recovery.
+    return tx.ticketPurchaseAttempt.create({ data: {
+      key, userId, fingerprint: 'closed-before-allocation', ticketIds: [],
+      attemptRef: `attempt:${crypto.randomUUID()}`,
+      failure: 'No purchase was dispatched. This attempt is closed.',
+    } });
+  });
+  if (attempt.failure) {
+    // A crash may occur after recording FAILED but before returning inventory.
+    // Match the immutable reference too: the same buyer may now hold these
+    // physical seats under a deliberate later attempt.
+    if (attempt.ticketIds.length) await prisma.ticket.updateMany({
+      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved',
+        paymentRef: { in: [attempt.attemptRef, ...(attempt.chargeId ? [attempt.chargeId] : [])] },
+        paymentStatus: { not: 'SUCCEEDED' } },
+      data: { status: 'available', userId: null, reservedAt: null, paymentRef: null, paymentStatus: null, amountPaid: null },
+    });
+    return { pending: false as const, failed: true as const, message: attempt.failure, tickets: [] };
+  }
+  let tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
+  if (tickets.length !== attempt.ticketIds.length) throw new ApiError('Purchase requires reconciliation. Do not pay again.', 409);
+  if (tickets.every(t => t.status === 'cancelled')) return { pending: false as const, failed: true as const, message: 'Order cancelled or refunded. No admission tickets remain.', tickets: [] };
+  if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+  const chargeId = attempt.chargeId || tickets.find(t => t.paymentRef && !t.paymentRef.startsWith('attempt:'))?.paymentRef;
+  if (chargeId) {
+    // Recover a crash between persisting the charge identity and attaching it
+    // to the reservations. Never allocate or dispatch in this path.
+    await prisma.ticket.updateMany({
+      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved', paymentRef: attempt.attemptRef },
+      data: { paymentRef: chargeId },
+    });
+    const charge = await getCharge(chargeId);
+    if (charge.status === 'SUCCEEDED') await settleSucceededCharge(chargeId);
+    else if (charge.status === 'FAILED') {
+      await prisma.ticketPurchaseAttempt.update({ where: { key }, data: { failure: 'Payment failed. No ticket was issued.' } });
+      await settleFailedCharge(chargeId);
+      return { pending: false as const, failed: true as const, message: 'Payment failed. No ticket was issued.', tickets: [] };
+    }
+    tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
+    if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+  }
+  return { ...buildPendingOrderResult(tickets, chargeId || attempt.attemptRef),
+    unknown: !chargeId, message: chargeId ? 'Payment pending. Do not pay again.' : 'Payment outcome unconfirmed. Your seats remain held. Do not pay again.' };
 };
 
 /**
