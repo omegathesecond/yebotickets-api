@@ -425,7 +425,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
       .mockResolvedValueOnce({ id: 'ticket-3' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any);
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce(
+      .mockResolvedValue(
         ['ticket-1', 'ticket-2', 'ticket-3'].map((id) =>
           buildTicketWithRelations({ id, status: 'reserved' })
         ) as any
@@ -443,7 +443,8 @@ describe('purchaseTicket — payment + atomic claim', () => {
     );
     expect(releaseWrites).toHaveLength(1);
     expect(releaseWrites[0][0].where).toEqual({
-      id: { in: ['ticket-1', 'ticket-2', 'ticket-3'] },
+      paymentRef: 'chg_1',
+      paymentStatus: { not: 'SUCCEEDED' },
       status: 'reserved',
       userId: 'user-1',
     });
@@ -484,7 +485,8 @@ describe('purchaseTicket — payment + atomic claim', () => {
     prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
     prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 } as any); // reserve + release
     prismaMock.ticket.findMany
-      .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved' })] as any);
+      .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved' })] as any)
+      .mockResolvedValueOnce([buildTicketWithRelations({ status: 'reserved', paymentRef: 'chg_1' })] as any);
     createChargeMock.mockResolvedValue(
       buildCharge({ status: 'FAILED', failure_reason: 'insufficient funds' }) as any
     );
@@ -499,7 +501,7 @@ describe('purchaseTicket — payment + atomic claim', () => {
     const reserveArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(reserveArg.data).toMatchObject({ status: 'reserved' });
     const releaseArg = prismaMock.ticket.updateMany.mock.calls[2][0];
-    expect(releaseArg.where).toEqual({ id: { in: ['ticket-1'] }, status: 'reserved', userId: 'user-1' });
+    expect(releaseArg.where).toEqual({ paymentRef: 'chg_1', status: 'reserved', userId: 'user-1', paymentStatus: { not: 'SUCCEEDED' } });
     // Release returns the row to the pool AND clears the (failed) payment trail
     // so the freed seat is pristine for the next buyer.
     expect(releaseArg.data).toEqual({

@@ -966,10 +966,11 @@ const releaseReservedTickets = async (ticketIds: string[], userId: string): Prom
  */
 const releaseReservedTicketsByPaymentRef = async (
   paymentRef: string,
-  userId: string
+  userId: string,
+  tx?: Prisma.TransactionClient
 ): Promise<void> => {
   try {
-    await prisma.ticket.updateMany({
+    await (tx || prisma).ticket.updateMany({
       where: { paymentRef, status: 'reserved', userId, paymentStatus: { not: 'SUCCEEDED' } },
       data: {
         status: 'available',
@@ -981,6 +982,7 @@ const releaseReservedTicketsByPaymentRef = async (
       },
     });
   } catch (error) {
+    if (tx) throw error; // Transactional failure settlement must roll back as a unit.
     console.error('Failed to release reserved ticket group after payment failure:', paymentRef, error);
   }
 };
@@ -1121,21 +1123,25 @@ export const settleSucceededCharge = async (chargeId: string): Promise<WebhookCh
  * human.
  */
 export const settleFailedCharge = async (chargeId: string): Promise<WebhookChargeOutcome> => {
-  const tickets = await findTicketsByPaymentRef(chargeId);
-  if (tickets.length === 0) return { result: 'unmatched' };
-  if (tickets.some((t) => t.status === 'sold' || t.paymentStatus === 'SUCCEEDED')) {
-    console.error(
-      `YeboPay charge.failed for an already-SOLD ticket in charge ${chargeId} — conflict, needs reconciliation:`,
-      tickets.map((t) => t.id)
-    );
-    return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
-  }
-  if (tickets.some((t) => t.status !== 'reserved')) {
-    return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
-  }
-  await prisma.ticketPurchaseAttempt.updateMany({ where: { chargeId }, data: { failure: 'Payment failed. No ticket was issued.' } });
-  await releaseReservedTicketsByPaymentRef(chargeId, tickets[0].userId!);
-  return { result: 'released', ticketId: tickets[0].id };
+  return prisma.$transaction(async tx => {
+    // Use the same ticket rows that issuance updates as the serialization point.
+    // Re-read after locking: a pre-lock snapshot can miss successful settlement.
+    await tx.$queryRaw`SELECT "id" FROM "Ticket" WHERE "paymentRef" = ${chargeId} ORDER BY "id" FOR UPDATE`;
+    const tickets = await tx.ticket.findMany({ where: { paymentRef: chargeId }, include: PURCHASE_INCLUDE });
+    if (!tickets.length) return { result: 'unmatched' };
+    if (tickets.some(t => t.status === 'sold' || t.paymentStatus === 'SUCCEEDED')) {
+      console.error('YeboPay charge.failed contradicts successful settlement:', chargeId);
+      return { result: 'already_final', ticketId: tickets[0].id, status: 'sold' };
+    }
+    if (tickets.some(t => t.status !== 'reserved')) {
+      return { result: 'already_final', ticketId: tickets[0].id, status: tickets[0].status };
+    }
+    // Failure and release commit together. Neither recovery nor a concurrent
+    // success can observe a failed attempt with an issued ticket set.
+    await tx.ticketPurchaseAttempt.updateMany({ where: { chargeId }, data: { failure: 'Payment failed. No ticket was issued.' } });
+    await releaseReservedTicketsByPaymentRef(chargeId, tickets[0].userId!, tx);
+    return { result: 'released', ticketId: tickets[0].id };
+  });
 };
 
 /**
@@ -1453,8 +1459,8 @@ export const purchaseTicket = async (
     // 3b. Any non-SUCCEEDED, non-PENDING status (FAILED/REFUNDED/…) is a hard
     //     failure: release every hold and surface it loudly — no ticket issued.
     if (charge.status !== 'SUCCEEDED') {
-      await prisma.ticketPurchaseAttempt.update({ where: { key }, data: { failure: `Payment ${charge.status}. No ticket was issued.` } });
-      await releaseReservedTickets(reservedIds, userId);
+      const outcome = await settleFailedCharge(charge.id);
+      if (outcome.result !== 'released') return recoverPurchaseAttempt(key, userId);
       const reason = charge.failure_reason ? `: ${charge.failure_reason}` : '';
       throw new ApiError(`Payment ${charge.status.toLowerCase()}${reason}. No ticket was issued.`, 402);
     }
@@ -1524,9 +1530,8 @@ export const recoverPurchaseAttempt = async (key: string, userId: string) => {
     const charge = await getCharge(chargeId);
     if (charge.status === 'SUCCEEDED') await settleSucceededCharge(chargeId);
     else if (charge.status === 'FAILED') {
-      await prisma.ticketPurchaseAttempt.update({ where: { key }, data: { failure: 'Payment failed. No ticket was issued.' } });
-      await settleFailedCharge(chargeId);
-      return { pending: false as const, failed: true as const, message: 'Payment failed. No ticket was issued.', tickets: [] };
+      const outcome = await settleFailedCharge(chargeId);
+      if (outcome.result === 'released') return recoverPurchaseAttempt(key, userId);
     }
     tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
     if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);

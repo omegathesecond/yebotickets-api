@@ -209,3 +209,27 @@ it('a failed webhook after successful issuance preserves the order on retry and 
   expect(tickets.filter(t => t.status === 'sold')).toHaveLength(2);
   assertSingleOrder();
 });
+
+it('recovery preserves issuance when a stale FAILED poll returns after a success webhook', async () => {
+  gateway.mockResolvedValueOnce({id: 'charge', status: 'PENDING'});
+  await buy();
+  (getCharge as jest.Mock).mockImplementationOnce(async () => {
+    await handleChargeWebhookEvent('charge.succeeded', {id: 'charge'});
+    return {id: 'charge', status: 'FAILED'};
+  });
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({pending: false, tickets: [{id: 'seat-0'}, {id: 'seat-1'}]});
+  expect(attempts.get(key).failure).toBeNull();
+  expect(await buy()).toMatchObject({pending: false});
+  assertSingleOrder();
+});
+
+it('a stale FAILED create response after a success webhook cannot poison recovery', async () => {
+  gateway.mockImplementationOnce(async (input: any) => {
+    await handleChargeWebhookEvent('charge.succeeded', {id: 'charge', description: input.description});
+    return {id: 'charge', status: 'FAILED'};
+  });
+  expect(await buy()).toMatchObject({pending: false});
+  expect(attempts.get(key).failure).toBeNull();
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject({pending: false});
+  assertSingleOrder();
+});
