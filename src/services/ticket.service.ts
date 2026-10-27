@@ -1158,7 +1158,9 @@ export const handleChargeWebhookEvent = async (
     if (key) {
       await prisma.ticketPurchaseAttempt.updateMany({
         where: { attemptRef: key, OR: [{ chargeId: null }, { chargeId: charge.id }] },
-        data: { chargeId: charge.id, ...(eventType === 'charge.failed' ? { failure: 'Payment failed. No ticket was issued.' } : {}) },
+        // Binding identifies the charge; settlement alone decides its outcome.
+        // A late failed event must not overwrite an already issued order.
+        data: { chargeId: charge.id },
       });
       await prisma.ticket.updateMany({
         where: { paymentRef: key, status: 'reserved', paymentStatus: 'PROCESSING' },

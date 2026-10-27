@@ -195,3 +195,17 @@ it('missing identity is rejected without allocating or charging', async () => {
   await expect(purchaseTicket('tier', 'buyer', {providerCode: 'momo'}, 2)).rejects.toMatchObject({statusCode: 400});
   expect(attempts.size).toBe(0); expect(gateway).not.toHaveBeenCalled();
 });
+
+it('a failed webhook after successful issuance preserves the order on retry and reload', async () => {
+  const issued = await buy();
+  const description = `Tickets [yebotickets:${attempts.get(key).attemptRef}]`;
+  expect(await handleChargeWebhookEvent('charge.failed', {id: 'charge', description}))
+    .toMatchObject({result: 'already_final', status: 'sold'});
+  // Redelivery of the contradictory event must also leave recovery unchanged.
+  await handleChargeWebhookEvent('charge.failed', {id: 'charge', description});
+  expect(attempts.get(key).failure).toBeNull();
+  expect(await buy()).toMatchObject(issued);
+  expect(await recoverPurchaseAttempt(key, 'buyer')).toMatchObject(issued);
+  expect(tickets.filter(t => t.status === 'sold')).toHaveLength(2);
+  assertSingleOrder();
+});
