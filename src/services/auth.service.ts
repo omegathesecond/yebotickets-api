@@ -1,3 +1,4 @@
+import { Prisma, User } from '@prisma/client';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
@@ -5,6 +6,33 @@ import { sendOTP, sendTextMessage } from './comms.service';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 import { randomInt } from 'crypto';
+
+/** Serialize challenge decisions with each other and with issuance's User UPDATE.
+ * Read only AFTER acquiring the lock: an earlier snapshot may be superseded.
+ * Auth failures are returned through the transaction so attempt/expiry writes
+ * commit before the normal error channel rejects the request.
+ */
+const withLockedUser = async <T>(
+  where: { id: string } | { phoneNumber: string },
+  decide: (tx: Prisma.TransactionClient, user: User | null) => Promise<T>
+): Promise<T> => {
+  const result = await prisma.$transaction(async (tx) => {
+    if ('id' in where) {
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${where.id} FOR UPDATE`;
+    } else {
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "phoneNumber" = ${where.phoneNumber} FOR UPDATE`;
+    }
+    const user = await tx.user.findUnique({ where });
+    try {
+      return { value: await decide(tx, user) };
+    } catch (error) {
+      if (error instanceof ApiError) return { error };
+      throw error;
+    }
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+  if ('error' in result) throw result.error;
+  return result.value;
+};
 
 /**
  * Maximum number of consecutive wrong guesses allowed against a single OTP
@@ -118,65 +146,62 @@ export const verifyOTP = async (
   otp: string
 ): Promise<{ user: any; token: string; refreshToken: string }> => {
   try {
-    // Find user with the phone number
-    const user = await prisma.user.findUnique({
-      where: { phoneNumber },
-    });
-
-    if (!user) {
-      throw new ApiError('User not found', 404);
-    }
-
-    // Check if OTP exists and is valid
-    if (!user.otpCode || !user.otpExpiresAt) {
-      throw new ApiError('No OTP requested', 400);
-    }
-
-    // Check if OTP is expired
-    if (new Date() > user.otpExpiresAt) {
-      throw new ApiError('OTP expired', 400);
-    }
-
-    // Check if OTP matches
-    if (user.otpCode !== otp) {
-      // Wrong guess: bump the attempt counter. Once the threshold is reached,
-      // invalidate the code entirely (clear it + reset the counter) so the
-      // attacker can't keep guessing and the user is forced to request a new
-      // one. Returns 429 so the client surfaces the lockout distinctly.
-      const attempts = (user.otpAttempts ?? 0) + 1;
-
-      if (attempts >= MAX_OTP_ATTEMPTS) {
-        await prisma.user.update({
-          where: { id: user.id },
-          data: {
-            otpCode: null,
-            otpExpiresAt: null,
-            otpAttempts: 0,
-          },
-        });
-        throw new ApiError(
-          'Too many incorrect attempts. This code has been disabled — please request a new OTP.',
-          429
-        );
+    const updatedUser = await withLockedUser({ phoneNumber }, async (tx, user) => {
+      if (!user) {
+        throw new ApiError('User not found', 404);
       }
 
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { otpAttempts: attempts },
-      });
-      const remaining = MAX_OTP_ATTEMPTS - attempts;
-      throw new ApiError(`Invalid OTP. ${remaining} attempt(s) remaining.`, 400);
-    }
+      // Check if OTP exists and is valid
+      if (!user.otpCode || !user.otpExpiresAt) {
+        throw new ApiError('No OTP requested', 400);
+      }
 
-    // OTP verified, clear it, reset the attempt counter, and mark user verified
-    const updatedUser = await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        otpCode: null,
-        otpExpiresAt: null,
-        otpAttempts: 0,
-        isVerified: true,
-      },
+      // Check if OTP is expired
+      if (new Date() >= user.otpExpiresAt) {
+        throw new ApiError('OTP expired', 400);
+      }
+
+      // Check if OTP matches
+      if (user.otpCode !== otp) {
+        // Wrong guess: bump the attempt counter. Once the threshold is reached,
+        // invalidate the code entirely (clear it + reset the counter) so the
+        // attacker can't keep guessing and the user is forced to request a new
+        // one. Returns 429 so the client surfaces the lockout distinctly.
+        const attempts = (user.otpAttempts ?? 0) + 1;
+
+        if (attempts >= MAX_OTP_ATTEMPTS) {
+          await tx.user.update({
+            where: { id: user.id },
+            data: {
+              otpCode: null,
+              otpExpiresAt: null,
+              otpAttempts: 0,
+            },
+          });
+          throw new ApiError(
+            'Too many incorrect attempts. This code has been disabled — please request a new OTP.',
+            429
+          );
+        }
+
+        await tx.user.update({
+          where: { id: user.id },
+          data: { otpAttempts: attempts },
+        });
+        const remaining = MAX_OTP_ATTEMPTS - attempts;
+        throw new ApiError(`Invalid OTP. ${remaining} attempt(s) remaining.`, 400);
+      }
+
+      // OTP verified, clear it, reset the attempt counter, and mark user verified
+      return tx.user.update({
+        where: { id: user.id },
+        data: {
+          otpCode: null,
+          otpExpiresAt: null,
+          otpAttempts: 0,
+          isVerified: true,
+        },
+      });
     });
 
     // Generate access + refresh tokens
@@ -383,42 +408,48 @@ export const resetPassword = async (
   resetCode: string,
   newPassword: string
 ): Promise<{ success: true }> => {
-  const user = await findResetAccount(identifier);
+  const account = await findResetAccount(identifier);
+  if (!account) throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+  return withLockedUser({ id: account.id }, async (tx, user) => {
+    if (!user || !['organizer', 'admin'].includes(user.role) || !user.resetCodeHash || !user.resetCodeExpiresAt) {
+      throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+    }
+    if (new Date() >= user.resetCodeExpiresAt) {
+      // Expired — burn it so it can't linger.
+      await tx.user.update({
+        where: { id: user.id },
+        data: { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
+      });
+      throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+    }
 
-  if (!user || !user.resetCodeHash || !user.resetCodeExpiresAt) {
-    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
-  }
-  if (new Date() > user.resetCodeExpiresAt) {
-    // Expired — burn it so it can't linger.
-    await prisma.user.update({
+    const codeMatches = await bcrypt.compare(resetCode, user.resetCodeHash);
+    if (!codeMatches) {
+      // Brute-force cap: count the miss and burn the code once the cap is hit.
+      const attempts = user.resetCodeAttempts + 1;
+      await tx.user.update({
+        where: { id: user.id },
+        data:
+          attempts >= MAX_RESET_CODE_ATTEMPTS
+            ? { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 }
+            : { resetCodeAttempts: attempts },
+      });
+      throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+    }
+
+    const hashed = await hashPassword(newPassword);
+    // bcrypt work can cross the expiry boundary while the row is locked.
+    if (new Date() >= user.resetCodeExpiresAt) {
+      throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
+    }
+    await tx.user.update({
       where: { id: user.id },
-      data: { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
+      // Clearing the code is what enforces single-use; reset the attempt counter.
+      data: { password: hashed, resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
     });
-    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
-  }
 
-  const codeMatches = await bcrypt.compare(resetCode, user.resetCodeHash);
-  if (!codeMatches) {
-    // Brute-force cap: count the miss and burn the code once the cap is hit.
-    const attempts = user.resetCodeAttempts + 1;
-    await prisma.user.update({
-      where: { id: user.id },
-      data:
-        attempts >= MAX_RESET_CODE_ATTEMPTS
-          ? { resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 }
-          : { resetCodeAttempts: attempts },
-    });
-    throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
-  }
-
-  const hashed = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: user.id },
-    // Clearing the code is what enforces single-use; reset the attempt counter.
-    data: { password: hashed, resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
+    return { success: true as const };
   });
-
-  return { success: true };
 };
 
 /**

@@ -46,6 +46,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
 
 beforeEach(() => {
   mockReset(prismaMock);
+  prismaMock.$transaction.mockImplementation(async (fn: any) => fn(prismaMock));
   sendTextMessageMock.mockClear();
 });
 
@@ -53,6 +54,7 @@ describe('requestPasswordReset', () => {
   it('mints a 6-digit code, persists a HASH of it with an expiry, and delivers the plaintext code via YeboLink', async () => {
     const user = await buildUser();
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     const before = Date.now();
@@ -92,6 +94,7 @@ describe('requestPasswordReset', () => {
   it('does not claim success if YeboLink delivery fails (no silent fallback)', async () => {
     const user = await buildUser();
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
     sendTextMessageMock.mockRejectedValueOnce(new Error('YeboLink /messages/send 500'));
 
@@ -108,6 +111,7 @@ describe('resetPassword', () => {
     const codeHash = await bcrypt.hash('123456', 10);
     const user = await buildUser({ resetCodeHash: codeHash, resetCodeExpiresAt: future() });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     const result = await resetPassword(identifier, '123456', 'NewPass1');
@@ -125,6 +129,7 @@ describe('resetPassword', () => {
     const codeHash = await bcrypt.hash('123456', 10);
     const user = await buildUser({ resetCodeHash: codeHash, resetCodeExpiresAt: future(), resetCodeAttempts: 0 });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     await expect(resetPassword(identifier, '000000', 'NewPass1')).rejects.toMatchObject({
@@ -140,6 +145,7 @@ describe('resetPassword', () => {
     const codeHash = await bcrypt.hash('123456', 10);
     const user = await buildUser({ resetCodeHash: codeHash, resetCodeExpiresAt: future(), resetCodeAttempts: 4 });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     await expect(resetPassword(identifier, '000000', 'NewPass1')).rejects.toMatchObject({
@@ -155,6 +161,7 @@ describe('resetPassword', () => {
     const codeHash = await bcrypt.hash('123456', 10);
     const user = await buildUser({ resetCodeHash: codeHash, resetCodeExpiresAt: past() });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
     prismaMock.user.update.mockResolvedValue({ ...user } as any);
 
     await expect(resetPassword(identifier, '123456', 'NewPass1')).rejects.toMatchObject({
@@ -169,6 +176,7 @@ describe('resetPassword', () => {
     // After a successful reset the columns are null — a replay finds no code.
     const user = await buildUser({ resetCodeHash: null, resetCodeExpiresAt: null });
     prismaMock.user.findFirst.mockResolvedValue(user as any);
+    prismaMock.user.findUnique.mockResolvedValue(user as any);
 
     await expect(resetPassword(identifier, '123456', 'NewPass1')).rejects.toMatchObject({
       statusCode: 400,
