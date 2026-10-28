@@ -403,7 +403,14 @@ export const deleteEvent = async (
         JOIN "Ticket" t ON t."id" = r."ticketId"
         WHERE t."eventId" = ${eventId} LIMIT 1
       `;
-      if (history || receipt || refunds.length) {
+      // Failed/released purchases clear ticket fields but retain their durable
+      // identity. Preserve those inventory rows too, including failed charges.
+      const attempts = await tx.$queryRaw<{ key: string }[]>`
+        SELECT a."key" FROM "TicketPurchaseAttempt" a
+        JOIN "Ticket" t ON t."id" = ANY(a."ticketIds")
+        WHERE t."eventId" = ${eventId} LIMIT 1
+      `;
+      if (history || receipt || refunds.length || attempts.length) {
         throw new ApiError('Cannot delete an event with purchase or admission history. Cancel or unpublish the event instead.', 409);
       }
       await tx.ticket.deleteMany({ where: { eventId, status: 'available' } });

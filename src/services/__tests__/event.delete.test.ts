@@ -5,7 +5,7 @@ jest.mock('../yebopay.service', () => ({ createCharge: jest.fn(async () => ({ id
 import prisma from '../../config/prisma';
 import { createCharge } from '../yebopay.service';
 import { deleteEvent } from '../event.service';
-import { generateTickets, purchaseTicket } from '../ticket.service';
+import { generateTickets, purchaseTicket, updateTicketType } from '../ticket.service';
 const db = prisma as ReturnType<typeof mockDeep<PrismaClient>>;
 
 describe('atomic event deletion', () => {
@@ -16,22 +16,26 @@ describe('atomic event deletion', () => {
   let onLock: () => void;
   let receipt: any;
   let refund: any;
+  let attempt: any;
   beforeEach(() => {
     mockReset(db);
     event = { id: 'event', organizerId: 'owner', isPublished: true, isCancelled: false, endDate: new Date('2099-01-01') };
     onLock = () => {};
-    receipt = refund = null;
+    receipt = refund = attempt = null;
     tickets = [];
     writes = [];
     tail = Promise.resolve();
     const tier = () => ({ id: 'tier', eventId: 'event', quantity: 5, price: 100, type: 'standard', event, saleStartDate: new Date('2000-01-01'), saleEndDate: new Date('2099-01-01') });
     db.ticketType.findUnique.mockImplementation(async () => tier() as any);
     db.ticket.findMany.mockImplementation(async ({ where }: any) => where.reservedAt ? [] : tickets);
+    db.ticketPurchaseAttempt.update.mockResolvedValue({} as any);
     db.ticket.updateMany.mockImplementation(async ({ data }: any) => { tickets.forEach(t => Object.assign(t, data)); return { count: tickets.length }; });
     db.$transaction.mockImplementation(async (callback: any) => {
       let release: (() => void) | undefined;
       const tx: any = {
         $queryRaw: async (sql: TemplateStringsArray) => {
+          if (sql.join('').includes('TicketPurchaseAttempt')) return attempt ? [attempt] : [];
+          if (sql.join('').includes('pg_advisory')) return [];
           if (sql.join('').includes('TicketRefundLock')) return refund ? [refund] : [];
           if (sql.join('').includes('FROM "Event"')) {
             const previous = tail;
@@ -49,6 +53,7 @@ describe('atomic event deletion', () => {
         ticketType: {
           findUnique: async () => tier(),
           deleteMany: async () => { writes.push('tiers'); },
+          update: async ({ data }: any) => ({ ...tier(), ...data }),
         },
         ticket: {
           findFirst: async ({ where }: any) => tickets.find(t => where.OR ? where.OR.some((clause: any) => {
@@ -60,6 +65,10 @@ describe('atomic event deletion', () => {
           deleteMany: async () => { writes.push('inventory'); tickets = []; },
           count: async () => tickets.length,
           createMany: async ({ data }: any) => { expect(event).toBeTruthy(); tickets.push(...data); return { count: data.length }; },
+        },
+        ticketPurchaseAttempt: {
+          findUnique: async () => null,
+          create: async ({ data }: any) => { attempt = data; return data; },
         },
         ticketAdmissionReceipt: { findFirst: async () => receipt },
         ticketRefundLock: { findFirst: async () => refund },
@@ -105,16 +114,30 @@ describe('atomic event deletion', () => {
     expect(event).toBeNull();
     expect(tickets).toEqual([]);
   });
-  it.each(['receipt', 'refund'])('retains independent %s history', async kind => {
+  it.each([true, false])('serializes tier edits versus deletion (delete first %s)', async deleteFirst => {
+    const locked = new Promise<void>(resolve => { onLock = resolve; });
+    const edit = () => updateTicketType('tier', { quantity: 10 }, 'owner');
+    const first = deleteFirst ? deleteEvent('event', 'owner') : edit();
+    await locked;
+    const second = deleteFirst ? edit() : deleteEvent('event', 'owner');
+    const results = await Promise.allSettled([first, second]);
+    expect(results[0].status).toBe('fulfilled');
+    if (deleteFirst) expect(results[1]).toMatchObject({ status: 'rejected', reason: { statusCode: 404 } });
+    else expect(results[1].status).toBe('fulfilled');
+    expect(event).toBeNull();
+    expect(tickets).toEqual([]);
+  });
+  it.each(['receipt', 'refund', 'attempt'])('retains independent %s history', async kind => {
     if (kind === 'receipt') receipt = { opId: 'admission' };
-    else refund = { chargeId: 'charge' };
+    else if (kind === 'refund') refund = { chargeId: 'charge' };
+    else attempt = { key: 'released-purchase', ticketIds: ['ticket'] };
     await expect(deleteEvent('event', 'owner')).rejects.toMatchObject({ statusCode: 409 });
     expect(writes).toEqual([]);
   });
   it.each([true, false])('serializes checkout versus deletion (delete first %s)', async deleteFirst => {
     tickets = [{ id: 'ticket', eventId: 'event', status: 'available' }];
     const locked = new Promise<void>(resolve => { onLock = resolve; });
-    const buy = () => purchaseTicket('tier', 'buyer', { providerCode: 'momo' });
+    const buy = () => purchaseTicket('tier', 'buyer', { providerCode: 'momo', idempotencyKey: 'delete-race-purchase-01' });
     const first = deleteFirst ? deleteEvent('event', 'owner') : buy();
     await locked;
     const second = deleteFirst ? buy() : deleteEvent('event', 'owner');
