@@ -1,3 +1,4 @@
+import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
@@ -164,8 +165,13 @@ export const getAvailableQuantities = async (ticketTypeIds: string[]): Promise<M
  * @param eventId Event ID
  * @returns List of ticket types
  */
-export const getTicketTypes = async (eventId: string) => {
+export const getTicketTypes = async (eventId: string, viewer?: EventViewer) => {
   try {
+    const event = await prisma.event.findUnique({
+      where: { id: eventId },
+      select: { organizerId: true, isPublished: true, isCancelled: true },
+    });
+    assertEventVisible(event, viewer);
     const ticketTypes = await prisma.ticketType.findMany({
       where: { eventId },
     });
@@ -177,6 +183,7 @@ export const getTicketTypes = async (eventId: string) => {
     }));
   } catch (error) {
     console.error('Error in getTicketTypes service:', error);
+    if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to fetch ticket types', 500);
   }
 };

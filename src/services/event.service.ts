@@ -1,3 +1,4 @@
+import { assertEventVisible } from '../utils/eventVisibility';
 import prisma from '../config/prisma';
 import { assertDateInterval } from '../utils/dateInterval';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
@@ -224,20 +225,7 @@ export const getEventById = async (
       },
     });
 
-    if (!event) {
-      throw new ApiError('Event not found', 404);
-    }
-
-    const isOwningOrganizer = !!viewer && viewer.id === event.organizerId;
-    const isAdmin = viewer?.role === UserRole.ADMIN;
-    const isPrivilegedViewer = isOwningOrganizer || isAdmin;
-
-    if ((!event.isPublished || event.isCancelled) && !isPrivilegedViewer) {
-      // Same 404 shape as "doesn't exist" so an unauthenticated (or
-      // non-owning) caller can't distinguish a draft/cancelled event from
-      // one that was never created.
-      throw new ApiError('Event not found', 404);
-    }
+    const isPrivilegedViewer = assertEventVisible(event, viewer);
 
     return transformEvent(event, { includeOrganizerEmail: isPrivilegedViewer });
   } catch (error) {

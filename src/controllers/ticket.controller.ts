@@ -47,7 +47,7 @@ export const getTicketTypesController = async (req: Request, res: Response, next
   try {
     const { eventId } = req.params;
     
-    const ticketTypes = await getTicketTypes(eventId);
+    const ticketTypes = await getTicketTypes(eventId, (req as AuthenticatedRequest).user);
     
     res.status(200).json({
       success: true,

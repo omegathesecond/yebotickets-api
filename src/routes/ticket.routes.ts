@@ -30,7 +30,7 @@ import {
   cancelEventValidator
 } from '../validators/ticket.validator';
 import { validate } from '../middleware/validate.middleware';
-import { protect, authorize } from '../middleware/auth.middleware';
+import { protect, authorize, optionalProtect } from '../middleware/auth.middleware';
 import { deliveryRetryLimiter, purchaseTicketLimiter, refundLimiter, refundRequestLimiter } from '../middleware/rateLimit.middleware';
 import { UserRole } from '../interfaces/user.interface';
 
@@ -59,7 +59,7 @@ router.post('/refund-recovery/:chargeId/reconcile', protect, authorize(UserRole.
  *   get:
  *     summary: Get ticket types for an event
  *     tags: [Tickets]
- *     description: Retrieve all ticket types available for a specific event
+ *     description: Public for published, non-cancelled events. Verified owning organisers and admins may also read draft or cancelled event tiers.
  *     parameters:
  *       - in: path
  *         name: eventId
@@ -87,7 +87,7 @@ router.post('/refund-recovery/:chargeId/reconcile', protect, authorize(UserRole.
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/types/event/:eventId', getTicketTypesController);
+router.get('/types/event/:eventId', optionalProtect, getTicketTypesController);
 
 /**
  * @swagger
