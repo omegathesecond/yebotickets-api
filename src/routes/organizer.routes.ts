@@ -71,7 +71,7 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import { getEventsController, createEventController } from '../controllers/event.controller';
-import { protect, authorize } from '../middleware/auth.middleware';
+import { optionalProtect, protect, authorize } from '../middleware/auth.middleware';
 import { UserRole } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
 import { 
@@ -147,7 +147,8 @@ const router = express.Router();
  *       400:
  *         description: Invalid input data
  */
-router.post('/signup', validate(organizerSignupValidator), becomeOrganizerController);
+// Existing accounts require their own verified session; new accounts may register publicly.
+router.post('/signup', optionalProtect, validate(organizerSignupValidator), becomeOrganizerController);
 
 /**
  * @swagger

@@ -12,7 +12,7 @@ import { randomInt } from 'crypto';
  * Auth failures are returned through the transaction so attempt/expiry writes
  * commit before the normal error channel rejects the request.
  */
-const withLockedUser = async <T>(
+export const withLockedUser = async <T>(
   where: { id: string } | { phoneNumber: string },
   decide: (tx: Prisma.TransactionClient, user: User | null) => Promise<T>
 ): Promise<T> => {

@@ -3,7 +3,7 @@ import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
-import { updateProfile, changePassword } from '../services/auth.service';
+import { updateProfile, changePassword, withLockedUser } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
 import { generateAuthTokens } from '../services/token.service';
@@ -22,83 +22,48 @@ export const becomeOrganizerController = async (req: Request, res: Response, nex
       return;
     }
 
-    // Check if user already exists
-    let user = await prisma.user.findUnique({
-      where: { phoneNumber },
-    });
-
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    if (user) {
-      // If user exists, check if already an organizer
-      if (user.role === 'organizer' || user.role === 'admin') {
-        res.status(400).json({
-          success: false,
-          message: 'User is already an organizer or admin',
-        });
-        return;
+    const user = await withLockedUser({ phoneNumber }, async (tx, existing) => {
+      if (existing) {
+        const actor = (req as AuthenticatedRequest).user;
+        if (!actor || actor.id !== existing.id || !existing.isVerified) {
+          throw new ApiError('Verify ownership of this phone number before registering as an organizer', 403);
+        }
+        if (existing.role !== 'user') {
+          throw new ApiError('User is already an organizer or admin', 409);
+        }
       }
-
-      // Update existing user to organizer role
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          role: 'organizer',
-          name,
-          password: hashedPassword,
-          email: email || user.email,
-          companyName: organizerProfile?.companyName,
-          companyDescription: organizerProfile?.description,
-          website: organizerProfile?.website,
-          socialFacebook: organizerProfile?.socialMedia?.facebook,
-          socialTwitter: organizerProfile?.socialMedia?.twitter,
-          socialInstagram: organizerProfile?.socialMedia?.instagram,
-          socialLinkedin: organizerProfile?.socialMedia?.linkedin,
-          addressStreet: organizerProfile?.address?.street,
-          addressCity: organizerProfile?.address?.city,
-          addressState: organizerProfile?.address?.state,
-          addressZipCode: organizerProfile?.address?.zipCode,
-          addressCountry: organizerProfile?.address?.country,
-        },
-      });
-    } else {
-      // Create new user with organizer role
-      user = await prisma.user.create({
-        data: {
-          name,
-          phoneNumber,
-          email,
-          password: hashedPassword,
-          role: 'organizer',
-          companyName: organizerProfile?.companyName,
-          companyDescription: organizerProfile?.description,
-          website: organizerProfile?.website,
-          socialFacebook: organizerProfile?.socialMedia?.facebook,
-          socialTwitter: organizerProfile?.socialMedia?.twitter,
-          socialInstagram: organizerProfile?.socialMedia?.instagram,
-          socialLinkedin: organizerProfile?.socialMedia?.linkedin,
-          addressStreet: organizerProfile?.address?.street,
-          addressCity: organizerProfile?.address?.city,
-          addressState: organizerProfile?.address?.state,
-          addressZipCode: organizerProfile?.address?.zipCode,
-          addressCountry: organizerProfile?.address?.country,
-        },
-      });
-    }
-
-    // Generate OTP for verification
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        otpCode: otp,
-        otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
+      const data = {
+        name,
+        password: hashedPassword,
+        email: email || existing?.email,
+        role: 'organizer' as const,
+        companyName: organizerProfile?.companyName,
+        companyDescription: organizerProfile?.description,
+        website: organizerProfile?.website,
+        socialFacebook: organizerProfile?.socialMedia?.facebook,
+        socialTwitter: organizerProfile?.socialMedia?.twitter,
+        socialInstagram: organizerProfile?.socialMedia?.instagram,
+        socialLinkedin: organizerProfile?.socialMedia?.linkedin,
+        addressStreet: organizerProfile?.address?.street,
+        addressCity: organizerProfile?.address?.city,
+        addressState: organizerProfile?.address?.state,
+        addressZipCode: organizerProfile?.address?.zipCode,
+        addressCountry: organizerProfile?.address?.country,
+      };
+      // The row lock serializes upgrades with OTP verification and other upgrades.
+      // A concurrent create for an absent phone hits the unique constraint; never
+      // retry that conflict as an update without checking ownership again.
+      return existing
+        ? tx.user.update({ where: { id: existing.id }, data })
+        : tx.user.create({ data: { ...data, phoneNumber } });
     });
 
     res.status(200).json({
       success: true,
-      message: 'User created/upgraded to organizer successfully. Please verify your phone number.',
+      message: user.isVerified
+        ? 'Organizer registration completed successfully.'
+        : 'Organizer created. Request an OTP to verify your phone number.',
       data: {
         id: user.id,
         name: user.name,
@@ -109,6 +74,10 @@ export const becomeOrganizerController = async (req: Request, res: Response, nex
       },
     });
   } catch (error) {
+    if ((error as { code?: string }).code === 'P2002') {
+      next(new ApiError('Account already exists. Verify phone ownership before registering.', 409));
+      return;
+    }
     next(error);
   }
 };
