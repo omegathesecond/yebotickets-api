@@ -1,3 +1,4 @@
+import { assertUnusedInventory } from './ticketDeletion.service';
 import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
@@ -102,39 +103,42 @@ export const createTicketType = async (
 ) => {
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
-    // First verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
+    return await prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR SHARE`;
+      // First verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: eventId,
+          organizerId,
+        },
+      });
+
+      if (!event) {
+        throw new ApiError('Event not found or you do not have permission to create tickets for it', 404);
+      }
+
+      // Map the type enum
+      const typeValue = ticketTypeData.type?.toLowerCase() || 'standard';
+
+      // Create the ticket type
+      const ticketType = await tx.ticketType.create({
+        data: {
+          name: ticketTypeData.name!,
+          description: ticketTypeData.description || null,
+          price: ticketTypeData.price!,
+          quantity: ticketTypeData.quantity!,
+          eventId,
+          type: typeValue as any,
+          saleStartDate: new Date(ticketTypeData.saleStartDate!),
+          saleEndDate: new Date(ticketTypeData.saleEndDate!),
+        },
+      });
+
+      return {
+        ...ticketType,
+        type: mapTicketType(ticketType.type),
+      };
     });
-
-    if (!event) {
-      throw new ApiError('Event not found or you do not have permission to create tickets for it', 404);
-    }
-
-    // Map the type enum
-    const typeValue = ticketTypeData.type?.toLowerCase() || 'standard';
-
-    // Create the ticket type
-    const ticketType = await prisma.ticketType.create({
-      data: {
-        name: ticketTypeData.name!,
-        description: ticketTypeData.description || null,
-        price: ticketTypeData.price!,
-        quantity: ticketTypeData.quantity!,
-        eventId,
-        type: typeValue as any,
-        saleStartDate: new Date(ticketTypeData.saleStartDate!),
-        saleEndDate: new Date(ticketTypeData.saleEndDate!),
-      },
-    });
-
-    return {
-      ...ticketType,
-      type: mapTicketType(ticketType.type),
-    };
   } catch (error) {
     console.error('Error in createTicketType service:', error);
     if (error instanceof ApiError) throw error;
@@ -188,7 +192,7 @@ export const getTicketTypes = async (eventId: string, viewer?: EventViewer) => {
   }
 };
 
-/** Serialize inventory creation and capacity edits on the tier row. Count every
+/** Serialize inventory creation and capacity edits on the event then tier row. Count every
  * record: selling, reserving or cancelling a ticket never frees a seat here. */
 const assertInventoryCapacity = async (
   tx: Prisma.TransactionClient,
@@ -210,6 +214,11 @@ const assertInventoryCapacity = async (
 };
 
 const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string) => {
+  // Match checkout's Event -> TicketType order. The lookup is only a lock
+  // target; the caller re-reads the tier after locking to detect deletion.
+  const tier = await tx.ticketType.findUnique({ where: { id: ticketTypeId }, select: { eventId: true } });
+  if (!tier) throw new ApiError('Ticket type not found', 404);
+  await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${tier.eventId} FOR SHARE`;
   await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
 };
 
@@ -295,50 +304,15 @@ export const deleteTicketType = async (
   organizerId: string
 ): Promise<{ message: string }> => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
-    });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to delete this ticket type', 403);
-    }
-
-    // Check if there are any tickets of this type that are already sold
-    const soldTicketsCount = await prisma.ticket.count({
-      where: {
-        ticketTypeId,
-        status: { in: ['sold', 'reserved'] },
-      },
-    });
-
-    if (soldTicketsCount > 0) {
-      throw new ApiError('Cannot delete ticket type that has sold tickets', 400);
-    }
-
-    // Delete all available tickets of this type first
-    await prisma.ticket.deleteMany({
-      where: {
-        ticketTypeId,
-        status: 'available',
-      },
-    });
-
-    // Delete the ticket type
-    await prisma.ticketType.delete({
-      where: { id: ticketTypeId },
+    await prisma.$transaction(async tx => {
+      await lockTicketTier(tx, ticketTypeId);
+      const ticketType = await tx.ticketType.findUnique({ where: { id: ticketTypeId } });
+      if (!ticketType) throw new ApiError('Ticket type not found', 404);
+      const event = await tx.event.findFirst({ where: { id: ticketType.eventId, organizerId } });
+      if (!event) throw new ApiError('You do not have permission to delete this ticket type', 403);
+      await assertUnusedInventory(tx, ticketType.eventId, ticketTypeId);
+      await tx.ticket.deleteMany({ where: { ticketTypeId, status: 'available' } });
+      await tx.ticketType.delete({ where: { id: ticketTypeId } });
     });
 
     return { message: 'Ticket type deleted successfully' };
@@ -1360,7 +1334,7 @@ export const purchaseTicket = async (
     const allocation = await prisma.$transaction(async tx => {
       // Global key ownership also rejects reuse by a different principal.
       // This lock ends before any gateway or delivery call.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))::text`;
       const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
       if (prior) {
         if (prior.userId !== userId || prior.fingerprint !== fingerprint) {
@@ -1484,7 +1458,7 @@ export const purchaseTicket = async (
 export const recoverPurchaseAttempt = async (key: string, userId: string) => {
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new ApiError('Invalid purchase key', 400);
   const attempt = await prisma.$transaction(async tx => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))::text`;
     const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
     if (prior) {
       if (prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
