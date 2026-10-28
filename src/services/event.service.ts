@@ -1,4 +1,4 @@
-import { assertUnusedInventory } from './ticketDeletion.service';
+import { assertNoTicketHistory } from './ticketDeletion.service';
 import { assertEventVisible } from '../utils/eventVisibility';
 import prisma from '../config/prisma';
 import { assertDateInterval } from '../utils/dateInterval';
@@ -364,14 +364,16 @@ export const deleteEvent = async (
   organizerId: string
 ): Promise<{ message: string }> => {
   try {
-    await prisma.$transaction(async tx => {
-      // Conflicts with checkout's Event FOR SHARE and inventory mutations.
+    await prisma.$transaction(async (tx) => {
+      // Checkout locks Event before TicketType. Use the same order, and keep
+      // the exclusive event lock until inventory and its parent are removed.
       await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
       const event = await tx.event.findFirst({ where: { id: eventId, organizerId } });
       if (!event) {
         throw new ApiError('Event not found or you do not have permission to delete it', 404);
       }
-      await assertUnusedInventory(tx, eventId);
+
+      await assertNoTicketHistory(tx, eventId);
       await tx.ticket.deleteMany({ where: { eventId, status: 'available' } });
       await tx.ticketType.deleteMany({ where: { eventId } });
       await tx.event.delete({ where: { id: eventId } });

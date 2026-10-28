@@ -21,7 +21,7 @@ describe('ticket tier capacity', () => {
       let release: (() => void) | undefined;
       const tx: any = {
         $queryRaw: jest.fn(async (sql: TemplateStringsArray, id: string) => {
-          if (sql.join('?').includes('FROM "Event"')) return [{ id: 'event' }];
+          if (sql.join('').includes('FROM "Event"')) return [{ id: 'event' }];
           expect(sql.join('?')).toContain('FROM "TicketType" WHERE "id" = ? FOR UPDATE');
           expect(id).toBe('tier');
           const previous = tail;

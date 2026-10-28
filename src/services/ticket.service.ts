@@ -1,4 +1,4 @@
-import { assertUnusedInventory } from './ticketDeletion.service';
+import { assertNoTicketHistory } from './ticketDeletion.service';
 import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
@@ -103,8 +103,9 @@ export const createTicketType = async (
 ) => {
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
-    return await prisma.$transaction(async tx => {
-      await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR SHARE`;
+    return await prisma.$transaction(async (tx) => {
+      const events = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR SHARE`;
+      if (!events.length) throw new ApiError('Event not found', 404);
       // First verify the event belongs to this organizer
       const event = await tx.event.findFirst({
         where: {
@@ -192,7 +193,7 @@ export const getTicketTypes = async (eventId: string, viewer?: EventViewer) => {
   }
 };
 
-/** Serialize inventory creation and capacity edits on the event then tier row. Count every
+/** Serialize inventory creation and capacity edits on the tier row. Count every
  * record: selling, reserving or cancelling a ticket never frees a seat here. */
 const assertInventoryCapacity = async (
   tx: Prisma.TransactionClient,
@@ -214,11 +215,12 @@ const assertInventoryCapacity = async (
 };
 
 const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string) => {
-  // Match checkout's Event -> TicketType order. The lookup is only a lock
-  // target; the caller re-reads the tier after locking to detect deletion.
   const tier = await tx.ticketType.findUnique({ where: { id: ticketTypeId }, select: { eventId: true } });
   if (!tier) throw new ApiError('Ticket type not found', 404);
-  await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${tier.eventId} FOR SHARE`;
+  // Match checkout's Event -> TicketType lock order. Re-read both after waiting
+  // so a completed deletion becomes a normal 404 rather than an FK failure.
+  const events = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Event" WHERE "id" = ${tier.eventId} FOR SHARE`;
+  if (!events.length) throw new ApiError('Event not found', 404);
   await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
 };
 
@@ -304,13 +306,13 @@ export const deleteTicketType = async (
   organizerId: string
 ): Promise<{ message: string }> => {
   try {
-    await prisma.$transaction(async tx => {
+    await prisma.$transaction(async (tx) => {
       await lockTicketTier(tx, ticketTypeId);
       const ticketType = await tx.ticketType.findUnique({ where: { id: ticketTypeId } });
       if (!ticketType) throw new ApiError('Ticket type not found', 404);
       const event = await tx.event.findFirst({ where: { id: ticketType.eventId, organizerId } });
       if (!event) throw new ApiError('You do not have permission to delete this ticket type', 403);
-      await assertUnusedInventory(tx, ticketType.eventId, ticketTypeId);
+      await assertNoTicketHistory(tx, ticketType.eventId, ticketTypeId);
       await tx.ticket.deleteMany({ where: { ticketTypeId, status: 'available' } });
       await tx.ticketType.delete({ where: { id: ticketTypeId } });
     });
