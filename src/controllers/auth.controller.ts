@@ -10,7 +10,7 @@ import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
-import { verifyRefreshToken, generateAuthTokens } from '../services/token.service';
+import { assertCurrentSession, verifyRefreshToken, generateAuthTokens } from '../services/token.service';
 
 export const requestOTPController = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -60,13 +60,15 @@ export const refreshTokenController = async (req: Request, res: Response, next: 
     // Confirm the user still exists (token could outlive a deleted account).
     const user = await prisma.user.findUnique({
       where: { id: payload.id },
-      select: { id: true, role: true },
+      select: { id: true, role: true, sessionVersion: true },
     });
     if (!user) {
       return next(new ApiError('User no longer exists', 401));
     }
 
-    const tokens = generateAuthTokens(user.id, user.role);
+    assertCurrentSession(payload, user);
+
+    const tokens = generateAuthTokens(user.id, user.role, user.sessionVersion);
 
     res.status(200).json({
       accessToken: tokens.token,

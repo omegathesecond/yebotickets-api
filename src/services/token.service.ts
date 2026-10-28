@@ -29,6 +29,7 @@ const REFRESH_EXPIRES = (): string => process.env.JWT_REFRESH_EXPIRES_IN || '30d
 export interface RefreshTokenPayload {
   id: string;
   role: string;
+  sessionVersion: number;
   type: 'refresh';
 }
 
@@ -40,21 +41,21 @@ export interface AuthTokens {
 }
 
 /** Mint a short-lived access (bearer) token. */
-export const generateAccessToken = (userId: string, role: string): string => {
+export const generateAccessToken = (userId: string, role: string, sessionVersion: number): string => {
   const options = { expiresIn: ACCESS_EXPIRES() };
-  return jwt.sign({ id: userId, role }, accessSecret(), options as jwt.SignOptions);
+  return jwt.sign({ id: userId, role, sessionVersion }, accessSecret(), options as jwt.SignOptions);
 };
 
 /** Mint a long-lived refresh token (carries type:'refresh'). */
-export const generateRefreshToken = (userId: string, role: string): string => {
+export const generateRefreshToken = (userId: string, role: string, sessionVersion: number): string => {
   const options = { expiresIn: REFRESH_EXPIRES() };
-  return jwt.sign({ id: userId, role, type: 'refresh' }, refreshSecret(), options as jwt.SignOptions);
+  return jwt.sign({ id: userId, role, sessionVersion, type: 'refresh' }, refreshSecret(), options as jwt.SignOptions);
 };
 
 /** Mint both tokens for a freshly authenticated user. */
-export const generateAuthTokens = (userId: string, role: string): AuthTokens => ({
-  token: generateAccessToken(userId, role),
-  refreshToken: generateRefreshToken(userId, role),
+export const generateAuthTokens = (userId: string, role: string, sessionVersion: number): AuthTokens => ({
+  token: generateAccessToken(userId, role, sessionVersion),
+  refreshToken: generateRefreshToken(userId, role, sessionVersion),
 });
 
 /**
@@ -74,5 +75,23 @@ export const verifyRefreshToken = (token: string): RefreshTokenPayload => {
     throw new ApiError('Invalid refresh token', 401);
   }
 
-  return { id: decoded.id as string, role: (decoded.role as string) || 'user', type: 'refresh' };
+  assertSessionVersion(decoded.sessionVersion);
+  return { sessionVersion: decoded.sessionVersion as number, id: decoded.id as string, role: (decoded.role as string) || 'user', type: 'refresh' };
+};
+
+/** Missing versions are invalid too: pre-revocation tokens cannot be upgraded. */
+function assertSessionVersion(version: unknown): asserts version is number {
+  if (!Number.isSafeInteger(version) || (version as number) < 0) {
+    throw new ApiError('Sign in required', 401);
+  }
+}
+
+export const assertCurrentSession = (
+  payload: { sessionVersion?: unknown },
+  user: { sessionVersion: number } | null
+): void => {
+  assertSessionVersion(payload.sessionVersion);
+  if (!user || payload.sessionVersion !== user.sessionVersion) {
+    throw new ApiError('Sign in required', 401);
+  }
 };

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { assertCurrentSession } from '../services/token.service';
 import { ApiError } from './error.middleware';
 import prisma from '../config/prisma';
 import { IUser, UserRole } from '../interfaces/user.interface';
@@ -27,13 +28,14 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
     try {
       // Verify token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
+      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string; sessionVersion?: number; type?: string };
 
       // Get user from database
       const user = await prisma.user.findUnique({
         where: { id: decoded.id },
         select: {
           id: true,
+          sessionVersion: true,
           name: true,
           phoneNumber: true,
           email: true,
@@ -45,8 +47,11 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
       });
       
       if (!user) {
-        return next(new ApiError('User not found', 404));
+        return next(new ApiError('Sign in required', 401));
       }
+
+      if (decoded.type) throw new ApiError('Invalid access token', 401);
+      assertCurrentSession(decoded, user);
 
       // Attach user to request object
       authReq.user = user as unknown as IUser;

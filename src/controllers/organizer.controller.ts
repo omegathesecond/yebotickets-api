@@ -351,7 +351,7 @@ export const loginOrganizerController = async (req: Request, res: Response, next
     }
 
     // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(user.id, user.role);
+    const { token, refreshToken } = generateAuthTokens(user.id, user.role, user.sessionVersion);
 
     res.status(200).json({
       success: true,

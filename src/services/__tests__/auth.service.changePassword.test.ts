@@ -37,6 +37,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
 
 beforeEach(() => {
   mockReset(prismaMock);
+  prismaMock.$transaction.mockImplementation(async (fn: any) => fn(prismaMock));
 });
 
 describe('changePassword', () => {

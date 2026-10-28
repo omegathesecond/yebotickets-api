@@ -60,6 +60,7 @@ model User {
   name        String
   phoneNumber String   @unique
   email       String?  @unique
+  sessionVersion Int @default(0)
   password    String?
   role        UserRole @default(user)
   isVerified  Boolean  @default(false)

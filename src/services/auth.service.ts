@@ -205,7 +205,7 @@ export const verifyOTP = async (
     });
 
     // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role);
+    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role, updatedUser.sessionVersion);
 
     // Return user info (without sensitive data) and tokens
     const userToReturn = {
@@ -312,27 +312,28 @@ export const changePassword = async (
   currentPassword: string,
   newPassword: string
 ): Promise<{ success: true }> => {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  return withLockedUser({ id: userId }, async (tx, user) => {
 
-  if (!user) {
-    throw new ApiError('User not found', 404);
-  }
-  if (!user.password) {
-    throw new ApiError('No password is set for this account', 400);
-  }
+    if (!user) {
+      throw new ApiError('User not found', 404);
+    }
+    if (!user.password) {
+      throw new ApiError('No password is set for this account', 400);
+    }
 
-  const isCurrentValid = await comparePassword(currentPassword, user.password);
-  if (!isCurrentValid) {
-    throw new ApiError('Current password is incorrect', 401);
-  }
+    const isCurrentValid = await comparePassword(currentPassword, user.password);
+    if (!isCurrentValid) {
+      throw new ApiError('Current password is incorrect', 401);
+    }
 
-  const hashed = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: userId },
-    data: { password: hashed },
+    const hashed = await hashPassword(newPassword);
+    await tx.user.update({
+      where: { id: userId },
+      data: { password: hashed, sessionVersion: { increment: 1 } },
   });
 
-  return { success: true };
+  return { success: true as const };
+  });
 };
 
 /**
@@ -445,7 +446,7 @@ export const resetPassword = async (
     await tx.user.update({
       where: { id: user.id },
       // Clearing the code is what enforces single-use; reset the attempt counter.
-      data: { password: hashed, resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
+      data: { password: hashed, sessionVersion: { increment: 1 }, resetCodeHash: null, resetCodeExpiresAt: null, resetCodeAttempts: 0 },
     });
 
     return { success: true as const };
