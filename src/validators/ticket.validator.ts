@@ -155,9 +155,9 @@ export const purchaseTicketValidator = [
     .withMessage('cardToken must be a string'),
 
   body('idempotencyKey')
-    .optional()
-    .isString()
-    .withMessage('idempotencyKey must be a string'),
+    .isString().bail()
+    .matches(/^[A-Za-z0-9_-]{16,128}$/)
+    .withMessage('idempotencyKey must be 16–128 letters, digits, _ or -'),
 
   // How many tickets to buy in this order (one order, one payment). Defaults
   // to 1 in the service; capped at 10 so a single mobile-money charge stays a
