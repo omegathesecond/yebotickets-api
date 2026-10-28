@@ -33,8 +33,14 @@ describe('atomic event deletion', () => {
     db.$transaction.mockImplementation(async (callback: any) => {
       let release: (() => void) | undefined;
       const tx: any = {
-        $queryRaw: async (sql: TemplateStringsArray) => {
-          if (sql.join('').includes('TicketPurchaseAttempt')) return attempt ? [attempt] : [];
+        $queryRaw: async (sql: TemplateStringsArray, ...values: any[]) => {
+          if (sql.join('').includes('TicketPurchaseAttempt')) {
+            // Mirror the SQL join: removing referenced inventory would make
+            // the later event check blind to a released purchase attempt.
+            const [eventId, ticketTypeId] = values;
+            return attempt && tickets.some(t => attempt.ticketIds.includes(t.id) &&
+              t.eventId === eventId && (!ticketTypeId || t.ticketTypeId === ticketTypeId)) ? [attempt] : [];
+          }
           if (sql.join('').includes('pg_advisory')) return [];
           if (sql.join('').includes('TicketRefundLock')) return refund ? [refund] : [];
           if (sql.join('').includes('FROM "Event"')) {
@@ -132,7 +138,10 @@ describe('atomic event deletion', () => {
   it.each(['receipt', 'refund', 'attempt'])('retains independent %s history', async kind => {
     if (kind === 'receipt') receipt = { opId: 'admission' };
     else if (kind === 'refund') refund = { chargeId: 'charge' };
-    else attempt = { key: 'released-purchase', ticketIds: ['ticket'] };
+    else {
+      tickets = [{ id: 'ticket', eventId: 'event', ticketTypeId: 'tier', status: 'available' }];
+      attempt = { key: 'released-purchase', ticketIds: ['ticket'] };
+    }
     await expect(deleteEvent('event', 'owner')).rejects.toMatchObject({ statusCode: 409 });
     expect(writes).toEqual([]);
   });
