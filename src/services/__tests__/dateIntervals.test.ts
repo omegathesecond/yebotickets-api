@@ -32,6 +32,7 @@ beforeEach(() => {
     const tx = mockDeep<PrismaClient>();
     tx.ticket.count.mockImplementation((async () => committedTickets) as any);
     tx.$queryRaw.mockImplementation((async (strings: TemplateStringsArray) => {
+      if (strings.join('').includes('FOR SHARE')) return [{ id: 'event' }];
       expect(strings.join('?')).toMatch(/FOR UPDATE/);
       const previous = queue;
       queue = new Promise<void>(resolve => { release = resolve; });

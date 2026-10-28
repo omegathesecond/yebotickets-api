@@ -363,21 +363,52 @@ export const deleteEvent = async (
   organizerId: string
 ): Promise<{ message: string }> => {
   try {
-    // Check if the event exists and belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
-    });
+    await prisma.$transaction(async (tx) => {
+      // Checkout locks Event before TicketType. Use the same order, and keep
+      // the exclusive event lock until inventory and its parent are removed.
+      await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
+      const event = await tx.event.findFirst({ where: { id: eventId, organizerId } });
+      if (!event) {
+        throw new ApiError('Event not found or you do not have permission to delete it', 404);
+      }
 
-    if (!event) {
-      throw new ApiError('Event not found or you do not have permission to delete it', 404);
-    }
-
-    // Delete the event (cascade will delete related ticketTypes and tickets)
-    await prisma.event.delete({
-      where: { id: eventId },
+      const history = await tx.ticket.findFirst({
+        where: {
+          eventId,
+          OR: [
+            { status: { not: 'available' } },
+            { userId: { not: null } },
+            { purchaseDate: { not: null } },
+            { reservedAt: { not: null } },
+            { paymentRef: { not: null } },
+            { paymentStatus: { not: null } },
+            { amountPaid: { not: null } },
+            { deliveryOrderId: { not: null } },
+            { refundRef: { not: null } },
+            { refundedAt: { not: null } },
+            { cancelledAt: { not: null } },
+            { refundRequestedAt: { not: null } },
+            { refundRequestReason: { not: null } },
+            { isCheckedIn: true },
+            { checkedInAt: { not: null } },
+          ],
+        },
+        select: { id: true },
+      });
+      const receipt = await tx.ticketAdmissionReceipt.findFirst({ where: { eventId }, select: { opId: true } });
+      // Refund locks deliberately have no FK; inspect them without loading
+      // every generated ticket id into application memory or SQL parameters.
+      const refunds = await tx.$queryRaw<{ chargeId: string }[]>`
+        SELECT r."chargeId" FROM "TicketRefundLock" r
+        JOIN "Ticket" t ON t."id" = r."ticketId"
+        WHERE t."eventId" = ${eventId} LIMIT 1
+      `;
+      if (history || receipt || refunds.length) {
+        throw new ApiError('Cannot delete an event with purchase or admission history. Cancel or unpublish the event instead.', 409);
+      }
+      await tx.ticket.deleteMany({ where: { eventId, status: 'available' } });
+      await tx.ticketType.deleteMany({ where: { eventId } });
+      await tx.event.delete({ where: { id: eventId } });
     });
 
     return { message: 'Event deleted successfully' };

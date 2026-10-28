@@ -102,39 +102,43 @@ export const createTicketType = async (
 ) => {
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
-    // First verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
+    return await prisma.$transaction(async (tx) => {
+      const events = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR SHARE`;
+      if (!events.length) throw new ApiError('Event not found', 404);
+      // First verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: eventId,
+          organizerId,
+        },
+      });
+
+      if (!event) {
+        throw new ApiError('Event not found or you do not have permission to create tickets for it', 404);
+      }
+
+      // Map the type enum
+      const typeValue = ticketTypeData.type?.toLowerCase() || 'standard';
+
+      // Create the ticket type
+      const ticketType = await tx.ticketType.create({
+        data: {
+          name: ticketTypeData.name!,
+          description: ticketTypeData.description || null,
+          price: ticketTypeData.price!,
+          quantity: ticketTypeData.quantity!,
+          eventId,
+          type: typeValue as any,
+          saleStartDate: new Date(ticketTypeData.saleStartDate!),
+          saleEndDate: new Date(ticketTypeData.saleEndDate!),
+        },
+      });
+
+      return {
+        ...ticketType,
+        type: mapTicketType(ticketType.type),
+      };
     });
-
-    if (!event) {
-      throw new ApiError('Event not found or you do not have permission to create tickets for it', 404);
-    }
-
-    // Map the type enum
-    const typeValue = ticketTypeData.type?.toLowerCase() || 'standard';
-
-    // Create the ticket type
-    const ticketType = await prisma.ticketType.create({
-      data: {
-        name: ticketTypeData.name!,
-        description: ticketTypeData.description || null,
-        price: ticketTypeData.price!,
-        quantity: ticketTypeData.quantity!,
-        eventId,
-        type: typeValue as any,
-        saleStartDate: new Date(ticketTypeData.saleStartDate!),
-        saleEndDate: new Date(ticketTypeData.saleEndDate!),
-      },
-    });
-
-    return {
-      ...ticketType,
-      type: mapTicketType(ticketType.type),
-    };
   } catch (error) {
     console.error('Error in createTicketType service:', error);
     if (error instanceof ApiError) throw error;
@@ -210,6 +214,12 @@ const assertInventoryCapacity = async (
 };
 
 const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string) => {
+  const tier = await tx.ticketType.findUnique({ where: { id: ticketTypeId }, select: { eventId: true } });
+  if (!tier) throw new ApiError('Ticket type not found', 404);
+  // Match checkout's Event -> TicketType lock order. Re-read both after waiting
+  // so a completed deletion becomes a normal 404 rather than an FK failure.
+  const events = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Event" WHERE "id" = ${tier.eventId} FOR SHARE`;
+  if (!events.length) throw new ApiError('Event not found', 404);
   await tx.$queryRaw`SELECT "id" FROM "TicketType" WHERE "id" = ${ticketTypeId} FOR UPDATE`;
 };
 
