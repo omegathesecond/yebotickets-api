@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import ticketRoutes from '../ticket.routes';
 import { errorHandler } from '../../middleware/error.middleware';
 import prisma from '../../config/prisma';
+import { generateAccessToken } from '../../services/token.service';
 const db = prisma as unknown as DeepMockProxy<PrismaClient>;
 let server: http.Server;
 let baseUrl: string;
@@ -39,9 +40,10 @@ const read = (authorization?: string, query = '') => fetch(baseUrl + '/tickets/t
   headers: authorization === undefined ? {} : { authorization },
 });
 const authenticate = (id: string, role: string) => {
-  db.user.findUnique.mockResolvedValue({ id, role } as any);
+  const sessionVersion = 2;
+  db.user.findUnique.mockResolvedValue({ id, role, sessionVersion } as any);
   // Even a signed role claim cannot override the database role.
-  return `Bearer ${jwt.sign({ id, role: 'admin' }, secret)}`;
+  return `Bearer ${generateAccessToken(id, 'admin', sessionVersion)}`;
 };
 it('returns published inventory anonymously', async () => {
   db.event.findUnique.mockResolvedValue({ organizerId: 'owner', isPublished: true, isCancelled: false } as any);
@@ -79,5 +81,11 @@ it('rejects expired and incorrectly signed tokens', async () => {
   for (const token of [jwt.sign({ id: 'owner' }, secret, { expiresIn: -1 }), jwt.sign({ id: 'owner' }, 'wrong')]) {
     expect((await read(`Bearer ${token}`)).status).toBe(401);
   }
+  expect(db.ticketType.findMany).not.toHaveBeenCalled();
+});
+it('rejects unversioned tokens even for an existing organiser', async () => {
+  authenticate('owner', 'organizer');
+  expect((await read(`Bearer ${jwt.sign({ id: 'owner', role: 'organizer' }, secret)}`)).status).toBe(401);
+  expect(db.event.findUnique).not.toHaveBeenCalled();
   expect(db.ticketType.findMany).not.toHaveBeenCalled();
 });
