@@ -5,7 +5,7 @@ jest.mock('../yebopay.service', () => ({ createCharge: jest.fn(async () => ({ id
 import prisma from '../../config/prisma';
 import { createCharge } from '../yebopay.service';
 import { deleteEvent } from '../event.service';
-import { generateTickets, purchaseTicket, updateTicketType } from '../ticket.service';
+import { deleteTicketType, generateTickets, purchaseTicket, updateTicketType } from '../ticket.service';
 const db = prisma as ReturnType<typeof mockDeep<PrismaClient>>;
 
 describe('atomic event deletion', () => {
@@ -53,6 +53,7 @@ describe('atomic event deletion', () => {
         ticketType: {
           findUnique: async () => tier(),
           deleteMany: async () => { writes.push('tiers'); },
+          delete: async () => { writes.push('tier'); },
           update: async ({ data }: any) => ({ ...tier(), ...data }),
         },
         ticket: {
@@ -68,6 +69,7 @@ describe('atomic event deletion', () => {
         },
         ticketPurchaseAttempt: {
           findUnique: async () => null,
+          updateMany: async ({ data }: any) => { Object.assign(attempt, data); return { count: 1 }; },
           create: async ({ data }: any) => { attempt = data; return data; },
         },
         ticketAdmissionReceipt: { findFirst: async () => receipt },
@@ -132,6 +134,35 @@ describe('atomic event deletion', () => {
     else if (kind === 'refund') refund = { chargeId: 'charge' };
     else attempt = { key: 'released-purchase', ticketIds: ['ticket'] };
     await expect(deleteEvent('event', 'owner')).rejects.toMatchObject({ statusCode: 409 });
+    expect(writes).toEqual([]);
+  });
+  it('deletes an unused tier atomically', async () => {
+    tickets = [{ id: 'ticket', status: 'available' }];
+    await expect(deleteTicketType('tier', 'owner')).resolves.toHaveProperty('message');
+    expect(writes).toEqual(['inventory', 'tier']);
+  });
+  it('rejects tier deletion by a nonowner', async () => {
+    await expect(deleteTicketType('tier', 'other')).rejects.toMatchObject({ statusCode: 403 });
+    expect(writes).toEqual([]);
+  });
+  it.each(['sold', 'reserved', 'cancelled'])('preserves %s tier inventory', async status => {
+    tickets = [{ id: 'ticket', status }];
+    await expect(deleteTicketType('tier', 'owner')).rejects.toMatchObject({ statusCode: 409 });
+    expect(tickets).toHaveLength(1);
+    expect(writes).toEqual([]);
+  });
+  it('preserves failed purchase history through release, tier deletion and event deletion', async () => {
+    tickets = [{ id: 'ticket', eventId: 'event', ticketTypeId: 'tier', status: 'available' }];
+    (createCharge as jest.Mock).mockResolvedValueOnce({ id: 'charge', status: 'FAILED' });
+    await expect(purchaseTicket('tier', 'buyer', {
+      providerCode: 'momo', idempotencyKey: 'delete-failed-purchase-01',
+    })).rejects.toMatchObject({ statusCode: 402 });
+    expect(tickets[0]).toMatchObject({ status: 'available', userId: null, paymentRef: null });
+    expect(attempt).toMatchObject({ ticketIds: ['ticket'], failure: expect.any(String) });
+    await expect(deleteTicketType('tier', 'owner')).rejects.toMatchObject({ statusCode: 409 });
+    await expect(deleteEvent('event', 'owner')).rejects.toMatchObject({ statusCode: 409 });
+    expect(tickets).toHaveLength(1);
+    expect(event).toBeTruthy();
     expect(writes).toEqual([]);
   });
   it.each([true, false])('serializes checkout versus deletion (delete first %s)', async deleteFirst => {

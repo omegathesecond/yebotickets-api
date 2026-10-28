@@ -1,3 +1,4 @@
+import { assertNoTicketHistory } from './ticketDeletion.service';
 import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
@@ -305,50 +306,15 @@ export const deleteTicketType = async (
   organizerId: string
 ): Promise<{ message: string }> => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
-    });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to delete this ticket type', 403);
-    }
-
-    // Check if there are any tickets of this type that are already sold
-    const soldTicketsCount = await prisma.ticket.count({
-      where: {
-        ticketTypeId,
-        status: { in: ['sold', 'reserved'] },
-      },
-    });
-
-    if (soldTicketsCount > 0) {
-      throw new ApiError('Cannot delete ticket type that has sold tickets', 400);
-    }
-
-    // Delete all available tickets of this type first
-    await prisma.ticket.deleteMany({
-      where: {
-        ticketTypeId,
-        status: 'available',
-      },
-    });
-
-    // Delete the ticket type
-    await prisma.ticketType.delete({
-      where: { id: ticketTypeId },
+    await prisma.$transaction(async (tx) => {
+      await lockTicketTier(tx, ticketTypeId);
+      const ticketType = await tx.ticketType.findUnique({ where: { id: ticketTypeId } });
+      if (!ticketType) throw new ApiError('Ticket type not found', 404);
+      const event = await tx.event.findFirst({ where: { id: ticketType.eventId, organizerId } });
+      if (!event) throw new ApiError('You do not have permission to delete this ticket type', 403);
+      await assertNoTicketHistory(tx, ticketType.eventId, ticketTypeId);
+      await tx.ticket.deleteMany({ where: { ticketTypeId, status: 'available' } });
+      await tx.ticketType.delete({ where: { id: ticketTypeId } });
     });
 
     return { message: 'Ticket type deleted successfully' };
