@@ -210,7 +210,7 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
 
     let totalTypes = 0;
     for (const eventId of eventIds) {
-      const ticketTypes = await getTicketTypes(eventId);
+      const ticketTypes = await getTicketTypes(eventId, authReq.user);
       totalTypes += ticketTypes.length;
     }
 

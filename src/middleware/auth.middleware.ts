@@ -112,3 +112,12 @@ export const verifyInternalApiKey = (req: Request, res: Response, next: NextFunc
 
   next();
 };
+
+/** Anonymous when absent; supplied credentials must pass the normal verifier. */
+export const optionalProtect = (req: Request, res: Response, next: NextFunction) => {
+  if (req.headers.authorization === undefined) return next();
+  if (!/^Bearer [^\s]+$/.test(req.headers.authorization)) {
+    return next(new ApiError('Not authorized, invalid token', 401));
+  }
+  return protect(req, res, next);
+};

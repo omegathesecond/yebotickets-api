@@ -1646,6 +1646,9 @@ describe('getEventTicketsForCheckIn (offline scanner pre-sync)', () => {
 });
 
 describe('getTicketTypes (buyer-facing availability)', () => {
+  beforeEach(() => {
+    prismaMock.event.findUnique.mockResolvedValue({ organizerId: 'owner', isPublished: true, isCancelled: false } as any);
+  });
   it('attaches availableQuantity computed from status:available, unowned tickets — not the original capacity', async () => {
     prismaMock.ticketType.findMany.mockResolvedValue([
       buildTicketType({ id: 'tt-1', quantity: 50 }),
