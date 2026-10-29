@@ -16,9 +16,14 @@ export const errorHandler = (
   res: Response,
   _next: NextFunction
 ) => {
-  console.error(err);
-
   const statusCode = (err as ApiError).statusCode || 500;
+  // Expected HTTP client failures remain visible without being reported as
+  // runtime crashes by Cloud Run's stderr error grouping.
+  if (statusCode >= 400 && statusCode < 500) {
+    console.log(JSON.stringify({ severity: 'WARNING', statusCode, message: err.message }));
+  } else {
+    console.error(err);
+  }
   const message = err.message || 'Internal Server Error';
 
   res.status(statusCode).json({

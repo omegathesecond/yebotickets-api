@@ -84,6 +84,8 @@ steps:
       - '--platform'
       - 'managed'
       - '--allow-unauthenticated'
+      - '--min-instances=0'
+      - '--min=0'
       - '--service-account'
       - 'yebotickets-runtime@hiyebo.iam.gserviceaccount.com'
       # ADDITIVE secret binding (per CLAUDE.md: --update-secrets, never
