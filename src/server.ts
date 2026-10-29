@@ -1,3 +1,5 @@
+import './instrument';
+import { captureFailure } from './monitoring/sentry';
 import { startOrderDeliveryRecovery, stopOrderDeliveryRecovery } from './services/orderDeliveryRecovery.service';
 import express from 'express';
 import cors from 'cors';
@@ -65,6 +67,7 @@ app.get('/health', async (_, res) => {
     await prisma.$queryRaw`SELECT 1`;
     res.status(200).json({ status: 'ok', database: 'connected' });
   } catch (error) {
+    captureFailure(error, 'health');
     res.status(500).json({ status: 'error', database: 'disconnected' });
   }
 });
@@ -102,6 +105,8 @@ const startServer = async () => {
     startReservationReclaimScheduler();
     startOrderDeliveryRecovery();
   } catch (error) {
+    captureFailure(error, 'startup');
+    await import('@sentry/node').then(sentry => sentry.flush(10000));
     console.error('Failed to start server:', error);
     process.exit(1);
   }

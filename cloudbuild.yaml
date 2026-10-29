@@ -83,6 +83,7 @@ steps:
       - 'europe-west1'
       - '--platform'
       - 'managed'
+      - '--min-instances=0'
       - '--allow-unauthenticated'
       - '--service-account'
       - 'yebotickets-runtime@hiyebo.iam.gserviceaccount.com'
@@ -93,7 +94,7 @@ steps:
       # via substitutions so the dev trigger can point at the _DEV secrets
       # instead of prod's without touching this file.
       - '--update-secrets'
-      - 'DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest,YEBOPAY_API_KEY=${_YEBOPAY_API_KEY_SECRET}:latest,YEBOPAY_WEBHOOK_SECRET=${_YEBOPAY_WEBHOOK_SECRET_SECRET}:latest'
+      - 'SENTRY_DSN=${_SENTRY_DSN_SECRET}:latest,DATABASE_URL=${_DATABASE_URL_SECRET}:latest,R2_ACCESS_KEY_ID=${_R2_ACCESS_KEY_ID_SECRET}:latest,R2_SECRET_ACCESS_KEY=${_R2_SECRET_ACCESS_KEY_SECRET}:latest,R2_ENDPOINT=${_R2_ENDPOINT_SECRET}:latest,R2_BUCKET_NAME=${_R2_BUCKET_NAME_SECRET}:latest,R2_PUBLIC_URL=${_R2_PUBLIC_URL_SECRET}:latest,YEBOPAY_API_KEY=${_YEBOPAY_API_KEY_SECRET}:latest,YEBOPAY_WEBHOOK_SECRET=${_YEBOPAY_WEBHOOK_SECRET_SECRET}:latest'
       # Which YeboPay gateway to talk to. The host is yebopay.APP —
       # api.yebopay.com is an unrelated third-party site, so this must never be
       # left to drift. Dev overrides it to https://dev-api.yebopay.app.
@@ -103,7 +104,7 @@ steps:
       # owed 100% of gross) until the business sets a rate; change it via the
       # trigger substitution, never by hand, so a redeploy cannot reset it.
       - '--update-env-vars'
-      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT}'
+      - 'SENTRY_ENVIRONMENT=${_SENTRY_ENVIRONMENT},YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
@@ -116,6 +117,8 @@ substitutions:
   # yebotickets-api-dev and the secrets at their _DEV counterparts so a
   # dev build never binds the prod database or R2 bucket.
   _SERVICE: 'yebotickets-api-prod'
+  _SENTRY_DSN_SECRET: 'YEBOTICKETS__SENTRY_DSN'
+  _SENTRY_ENVIRONMENT: 'production'
   _DATABASE_URL_SECRET: 'YEBOTICKETS__DATABASE_URL'
   _R2_ACCESS_KEY_ID_SECRET: 'YEBOTICKETS__R2_ACCESS_KEY_ID'
   _R2_SECRET_ACCESS_KEY_SECRET: 'YEBOTICKETS__R2_SECRET_ACCESS_KEY'

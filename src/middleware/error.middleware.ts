@@ -1,3 +1,4 @@
+import { captureFailure } from '../monitoring/sentry';
 import { Request, Response, NextFunction } from 'express';
 
 export class ApiError extends Error {
@@ -19,6 +20,7 @@ export const errorHandler = (
   console.error(err);
 
   const statusCode = (err as ApiError).statusCode || 500;
+  if (statusCode >= 500) captureFailure(err, 'http');
   const message = err.message || 'Internal Server Error';
 
   res.status(statusCode).json({
