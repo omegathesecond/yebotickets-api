@@ -75,3 +75,24 @@ Final validation: compiled isolated worker suite (`npm run build`, then
 its two runner fixtures look for adjacent `src/codex-runner.js`, which only exists
 under `dist` after compilation; this is an existing fixture-path issue, not a
 watcher failure. Compiled results: `/tmp/yebotickets-watcher-compiled-tests.log`.
+
+## Managed release integration (rework, 2026-10-29)
+
+Integrated the existing patch into `omegathesecond/claude-config`, the managed
+worker repository, on the same incident branch name. Pushed commit `eaef6bf`:
+`bootstrap/omevision-worker/src/handlers.ts`, `session-watcher.regression.mjs`,
+`package.json` (regression in normal test command), and release notes in README.
+No API runtime changes are required. The regression fails against freshly cloned
+main and passes against this candidate; TypeScript build and compiled suite pass
+47/47 with fixture permissions. Test log:
+`/tmp/yebotickets-managed-worker-tests-unrestricted.log`.
+
+Live dashboard reads still show original scan `task-1793250848434-tugqxu` queued
+with no verification result. Fleet-1 has six active sessions, fleet-2 zero at
+06:56–06:57 UTC. Managed sync rebuilds/restarts workers on worker source changes;
+startup reaping kills untracked agent panes. Consequently this implementation
+has not merged the release branch or restarted a worker. The instruction to
+leave merging to review remains in force. The next stage must review the managed
+worker branch and arrange a drained cloud rollout, then prove the exact worker
+release and accepted original scan result. No completion/deployment success
+signal or fabricated verifyCmd was emitted. Live recovery remains incomplete.
