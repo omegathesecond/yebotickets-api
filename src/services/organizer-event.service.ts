@@ -173,18 +173,17 @@ export const getOrganizerEarnings = async (requester: Requester) => {
  * Full stats for a single event the organizer owns (GET /api/events/:id/details).
  * All counts/revenue are computed from real ticket rows:
  *  - sold/available counts per ticket type (from the inventory rows),
- *  - revenue per type = sold count × that type's price,
+ *  - revenue per type = recorded amounts on sold tickets,
  *  - pendingPayments = value of tickets still RESERVED (held, awaiting an async
  *    mobile-money confirmation) — i.e. outstanding unpaid money.
  */
 export const getEventDetailsForOrganizer = async (eventId: string, requester: Requester) => {
   const event = await assertEventAccess(eventId, requester);
 
-  const [soldByType, availableByType, reservedTickets] = await Promise.all([
-    prisma.ticket.groupBy({
-      by: ['ticketTypeId'],
+  const [soldTickets, availableByType, reservedTickets] = await Promise.all([
+    prisma.ticket.findMany({
       where: { eventId, status: 'sold' },
-      _count: { _all: true },
+      select: { ticketTypeId: true, amountPaid: true, ticketType: { select: { price: true } } },
     }),
     prisma.ticket.groupBy({
       by: ['ticketTypeId'],
@@ -193,27 +192,33 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
     }),
     prisma.ticket.findMany({
       where: { eventId, status: 'reserved' },
-      select: { ticketType: { select: { price: true } } },
+      select: { amountPaid: true, ticketType: { select: { price: true } } },
     }),
   ]);
 
-  const soldMap = new Map(soldByType.map((g) => [g.ticketTypeId, g._count._all]));
+  const soldMap = new Map<string, { count: number; revenue: number }>();
+  for (const ticket of soldTickets) {
+    const totals = soldMap.get(ticket.ticketTypeId) || { count: 0, revenue: 0 };
+    totals.count += 1;
+    totals.revenue += ticketRevenue(ticket);
+    soldMap.set(ticket.ticketTypeId, totals);
+  }
   const availableMap = new Map(availableByType.map((g) => [g.ticketTypeId, g._count._all]));
 
   const ticketTypes = event.ticketTypes.map((tt) => {
-    const sold = soldMap.get(tt.id) || 0;
+    const sold = soldMap.get(tt.id)?.count || 0;
     const available = availableMap.get(tt.id) || 0;
     return {
       name: tt.name,
       sold,
       available,
-      revenue: sold * tt.price,
+      revenue: soldMap.get(tt.id)?.revenue || 0,
     };
   });
 
   const totalTicketsSold = ticketTypes.reduce((sum, t) => sum + t.sold, 0);
   const totalRevenue = ticketTypes.reduce((sum, t) => sum + t.revenue, 0);
-  const pendingPayments = reservedTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const pendingPayments = reservedTickets.reduce((sum, t) => sum + ticketRevenue(t), 0);
 
   return {
     event: toDashboardEvent(event, totalTicketsSold),
