@@ -1,0 +1,45 @@
+--- a/src/handlers.ts
++++ b/src/handlers.ts
+@@ -558,20 +558,19 @@
+ // --- Session watcher (polls tmux for ended sessions) ---
+ 
+ export function startSessionWatcher(config: Config): ReturnType<typeof setInterval> {
++  let checking = false;
+   return setInterval(async () => {
+-    if (runningSessions.size === 0) return;
+-
+-    let activeSessions: tmux.TmuxSession[];
++    if (checking || runningSessions.size === 0) return;
++    checking = true;
++    // Capture identities before querying tmux or awaiting any finalization.
++    // Map iterators otherwise visit sessions launched during those awaits.
++    const candidates = [...runningSessions];
+     try {
+-      activeSessions = await tmux.listSessions();
+-    } catch {
+-      return;
+-    }
+-
+-    const activeNames = new Set(activeSessions.map((s) => s.name));
+-
+-    for (const [codexSessionId, session] of runningSessions) {
+-      if (!activeNames.has(session.tmuxTarget)) {
++      const activeSessions = await tmux.listSessions();
++      const activeNames = new Set(activeSessions.map((s) => s.name));
++      for (const [codexSessionId, session] of candidates) {
++        if (runningSessions.get(codexSessionId) !== session) continue;
++        if (activeNames.has(session.tmuxTarget)) continue;
+         logger.info(
+           { claude_session_id: codexSessionId, tmux_target: session.tmuxTarget },
+           'tmux session disappeared — triggering SessionEnd',
+@@ -583,6 +582,10 @@
+           logger.error({ claude_session_id: codexSessionId, err }, 'SessionEnd handler failed');
+         });
+       }
++    } catch (err) {
++      logger.error({ err }, 'Session watcher failed');
++    } finally {
++      checking = false;
+     }
+   }, 10_000);
+ }
