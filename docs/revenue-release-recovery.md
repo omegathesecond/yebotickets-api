@@ -73,3 +73,23 @@ public dev health probe still returns HTTP 503 `Service is disabled`.
 The existing implementation builds and both relevant suites pass (34 tests).
 No secret rebinding, migration, runtime replacement, deployment-branch push,
 verifyCmd completion assertion or completion signal was performed.
+
+## Access audit: final implementation rework
+
+At 2026-10-29 22:41 UTC, authenticated task and agent-session GETs succeeded
+through the escalated worker-host context; JSON responses were retained under
+`/tmp/revenue-recovery-{task,sessions}.json`. No stage result was submitted.
+The worker environment and `/root/.omevision/env` contain no named Neon
+management credential, standard Neon CLI credential locations are absent, and
+the accessible hiyebo Secret Manager inventory contains no named Neon management
+secret. No connected Neon management tool is available. Other products' database
+and infrastructure credentials were not used to bypass this missing access.
+
+A fresh TLS read-only `SELECT 1` using approved dev DIRECT_URL version 1 again
+returned Neon's explicit endpoint-disabled error. The worker-host health probe
+returned HTTP 503, and Cloud Run still routes 100% to the diagnostic revision
+listed above. Build and both relevant suites pass (34 tests). The missing
+prerequisite is authorized Neon management access for this existing dev endpoint,
+or its re-enablement by an existing authorized operator. Database credentials
+alone cannot perform this management operation. Runtime restoration, historical
+revenue verification, verifyCmd and stage completion remain pending.
