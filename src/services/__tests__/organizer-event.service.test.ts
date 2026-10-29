@@ -99,25 +99,69 @@ describe('getOrganizerEarnings — derived from real sold tickets', () => {
 });
 
 describe('getEventDetailsForOrganizer — stats from real ticket rows', () => {
-  it('computes revenue = sold count x price and pending = reserved value', async () => {
-    prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
-    // 3 sold of tt-1 @100, 47 available, 0 reserved value here.
-    prismaMock.ticket.groupBy
-      .mockResolvedValueOnce([{ ticketTypeId: 'tt-1', _count: { _all: 3 } }] as any) // sold
-      .mockResolvedValueOnce([{ ticketTypeId: 'tt-1', _count: { _all: 47 } }] as any); // available
-    prismaMock.ticket.findMany.mockResolvedValue([
-      { ticketType: { price: 100 } }, // one reserved ticket -> pending 100
+  it('preserves historical sold and reserved amounts through repricing and agrees with earnings', async () => {
+    const event = eventRow({ ticketTypes: [
+      { id: 'tt-1', name: 'VIP', price: 100, quantity: 50 },
+      { id: 'tt-2', name: 'General', price: 50, quantity: 20 },
+      { id: 'tt-3', name: 'Unused', price: 20, quantity: 10 },
+    ] });
+    const rows = [
+      ...[100, 100, 100, 150, 0].map(amountPaid => ({
+        eventId: 'event-1', ticketTypeId: 'tt-1', status: 'sold', amountPaid,
+      })),
+      { eventId: 'event-1', ticketTypeId: 'tt-2', status: 'sold', amountPaid: 40 },
+      { eventId: 'event-1', ticketTypeId: 'tt-1', status: 'reserved', amountPaid: 80 },
+      { eventId: 'event-1', ticketTypeId: 'tt-1', status: 'reserved', amountPaid: 0 },
+      { eventId: 'event-1', ticketTypeId: 'tt-1', status: 'cancelled', amountPaid: 900 },
+      { eventId: 'event-1', ticketTypeId: 'tt-1', status: 'refunded', amountPaid: 700 },
+    ];
+    prismaMock.event.findUnique.mockResolvedValue(event as any);
+    prismaMock.event.findMany.mockResolvedValue([event] as any);
+    prismaMock.ticket.findMany.mockImplementation(async (args: any) => {
+      expect(['sold', 'reserved']).toContain(args.where.status);
+      expect(args.include?.ticketType || args.select?.ticketType).toBeTruthy();
+      if (args.select) expect(args.select.amountPaid).toBe(true);
+      return rows.filter(row => row.status === args.where.status).map(row => ({
+        ...row, ticketType: event.ticketTypes.find(tt => tt.id === row.ticketTypeId),
+      })) as any;
+    });
+    prismaMock.ticket.groupBy.mockResolvedValue([
+      { ticketTypeId: 'tt-1', _count: { _all: 43 } },
+      { ticketTypeId: 'tt-2', _count: { _all: 19 } },
+      { ticketTypeId: 'tt-3', _count: { _all: 10 } },
     ] as any);
 
-    const { event, stats } = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
+    const before = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
+    event.ticketTypes[0].price = 200;
+    event.ticketTypes[1].price = 300;
+    const after = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
+    expect(after.stats).toEqual(before.stats);
+    expect(after.event.title).toBe('Test Fest');
+    expect(after.stats).toEqual({
+      totalTicketsSold: 6, totalRevenue: 490, pendingPayments: 80,
+      ticketTypes: [
+        { name: 'VIP', sold: 5, available: 43, revenue: 450 },
+        { name: 'General', sold: 1, available: 19, revenue: 40 },
+        { name: 'Unused', sold: 0, available: 10, revenue: 0 },
+      ],
+    });
+    expect(after.stats.ticketTypes.reduce((sum, tt) => sum + tt.revenue, 0)).toBe(after.stats.totalRevenue);
+    const earnings = await getOrganizerEarnings({ id: 'org-1', role: 'organizer' });
+    expect(after.stats.totalRevenue).toBe(earnings.totalEarnings);
+    for (const [args] of prismaMock.ticket.groupBy.mock.calls) {
+      expect(args?.where).toEqual({ eventId: 'event-1', status: 'available' });
+    }
+  });
 
-    expect(event.title).toBe('Test Fest');
-    expect(stats.totalTicketsSold).toBe(3);
-    expect(stats.totalRevenue).toBe(300);
-    expect(stats.pendingPayments).toBe(100);
-    expect(stats.ticketTypes).toEqual([
-      { name: 'VIP', sold: 3, available: 47, revenue: 300 },
-    ]);
+  it('returns zero totals for unsold inventory', async () => {
+    prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
+    prismaMock.ticket.findMany.mockResolvedValue([]);
+    prismaMock.ticket.groupBy.mockResolvedValue([
+      { ticketTypeId: 'tt-1', _count: { _all: 50 } },
+    ] as any);
+    const { stats } = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
+    expect(stats).toEqual({ totalRevenue: 0, totalTicketsSold: 0, pendingPayments: 0,
+      ticketTypes: [{ name: 'VIP', sold: 0, available: 50, revenue: 0 }] });
   });
 });
 
