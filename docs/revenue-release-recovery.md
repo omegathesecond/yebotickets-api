@@ -50,3 +50,26 @@ recorded rows and earnings. A health check alone cannot prove this repair.
 Before deployment completion, PATCH the dashboard task verifyCmd with a
 read-only assertion of that exact revision and operation. Do not signal
 deployment completion or invent live verification while this blocker remains.
+
+## Rework: historical credential recovery
+
+The cloud-worker recheck found enabled version 1 of both approved dev secrets.
+They identify the separate Neon endpoint `ep-rapid-brook-agyszm2a` (database
+`neondb`); version 1 of the production secrets identifies a different endpoint,
+`ep-autumn-pond-ag5w94k8`. No credential values were printed or changed.
+
+A direct `psql` connection using dev DIRECT_URL version 1, TLS, a 15-second
+connection timeout and read-only transaction defaults failed with the provider
+error: `The endpoint has been disabled. Enable it using the API and retry.`
+Thus historical approved credentials exist, but the endpoint cannot currently
+serve application or migration queries. The accessible hiyebo secret inventory
+has no named Neon management credential. Authorized Neon management access is
+needed to enable this existing dev endpoint before checking schema and migration
+access; do not create a replacement database or substitute production access.
+
+Authenticated dashboard task/session reads succeeded and were retained locally.
+Cloud Run still routes 100% to `yebotickets-api-dev-hn1029-5bbfde`; the worker-host
+public dev health probe still returns HTTP 503 `Service is disabled`.
+The existing implementation builds and both relevant suites pass (34 tests).
+No secret rebinding, migration, runtime replacement, deployment-branch push,
+verifyCmd completion assertion or completion signal was performed.
