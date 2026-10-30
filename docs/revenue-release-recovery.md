@@ -93,3 +93,29 @@ prerequisite is authorized Neon management access for this existing dev endpoint
 or its re-enablement by an existing authorized operator. Database credentials
 alone cannot perform this management operation. Runtime restoration, historical
 revenue verification, verifyCmd and stage completion remain pending.
+
+## Cloud-fleet continuation: 2026-10-30
+
+Recovered the existing remote incident branch at `0fd3700` by fast-forward;
+this newly provisioned worktree initially tracked only main. No implementation
+was rewritten. Build and both revenue/settlement suites pass (34 tests).
+
+Authenticated host-context task and agent-session reads succeeded and were
+retained in `/tmp/yebotickets-{task,sessions}.json`. The task is running with
+this implementation session; do not redispatch a duplicate. Worker inventory
+and worker-session reads also succeeded, but these routes do not expose the
+specific job `wjob_c865dd720c030812` status. There is insufficient evidence to
+cancel that job; no cancellation or redispatch was attempted.
+
+A fresh explicit TLS, read-only `SELECT 1` against approved dev DIRECT_URL
+version 1 reproduced Neon's endpoint-disabled error for
+`ep-rapid-brook-agyszm2a`. The hiyebo named Neon management-secret inventory
+remains empty. Host-context dev health returns HTTP 503 Service is disabled.
+Cloud Run still sends 100% traffic to `yebotickets-api-dev-hn1029-5bbfde` with
+runtime identity `yebotickets-runtime@hiyebo.iam.gserviceaccount.com`.
+
+The prerequisite remains authorized management access to enable the existing
+Neon dev endpoint, or re-enablement by its authorized operator. No bindings,
+production/dev branches, migrations or runtime configuration were changed.
+Live historical revenue proof, verifyCmd and completion signalling remain
+pending; no stage-result POST was sent.
