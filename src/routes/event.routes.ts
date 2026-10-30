@@ -232,6 +232,12 @@ router.get(
  *         schema:
  *           type: integer
  *           default: 10
+ *       - in: query
+ *         name: pendingRefunds
+ *         description: Only outstanding requests on sold, unrefunded, uncancelled tickets
+ *         schema:
+ *           type: boolean
+ *           default: false
  *     responses:
  *       200:
  *         description: Paginated tickets

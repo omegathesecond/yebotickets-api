@@ -116,7 +116,7 @@ export const getEventPurchasesController = async (req: Request, res: Response, n
 export const getEventTicketsController = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const requester = requesterOf(req);
-    const result = await getEventTickets(req.params.id, requester, req.query.page, req.query.limit);
+    const result = await getEventTickets(req.params.id, requester, req.query.page, req.query.limit, req.query.pendingRefunds);
     res.status(200).json(result);
   } catch (error) {
     next(error);

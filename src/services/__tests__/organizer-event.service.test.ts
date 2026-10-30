@@ -357,3 +357,61 @@ describe('getEventTickets — pagination + ownership', () => {
     });
   });
 });
+
+describe('pending refund ticket pages', () => {
+  const owner = { id: 'org-1', role: 'organizer' };
+  beforeEach(() => prismaMock.event.findUnique.mockResolvedValue(eventRow() as any));
+
+  it('filters before slicing, counts the same matches, and excludes completed or ineligible requests', async () => {
+    const rows = Array.from({ length: 25 }, (_, i) => ({
+      id: `ticket-${i}`, eventId: 'event-1', status: 'sold',
+      refundRequestedAt: i >= 12 ? new Date() : null,
+      refundedAt: null, cancelledAt: null, paymentStatus: 'SUCCEEDED',
+    }));
+    (rows[12] as any).paymentStatus = null;
+    rows[13].status = 'cancelled';
+    rows[14].status = 'reserved';
+    rows[15].paymentStatus = 'REFUNDED';
+    const matches = (where: any) => rows.filter(t => t.eventId === where.eventId &&
+      t.status === where.status && t.refundRequestedAt !== null &&
+      t.refundedAt === where.refundedAt && t.cancelledAt === where.cancelledAt &&
+      (t.paymentStatus === null || t.paymentStatus !== where.OR[1].paymentStatus.not));
+    prismaMock.ticket.count.mockImplementation(async (args: any) => matches(args.where).length);
+    prismaMock.ticket.findMany.mockImplementation(async (args: any) =>
+      matches(args.where).slice(args.skip, args.skip + args.take) as any);
+    const first = await getEventTickets('event-1', owner, '1', '3', 'true');
+    expect(first.tickets.map(t => t.id)).toEqual(['ticket-12', 'ticket-16', 'ticket-17']);
+    expect(first).toMatchObject({ totalTickets: 10, totalPages: 4, currentPage: 1 });
+    expect(prismaMock.ticket.count.mock.calls[0][0]?.where).toEqual(
+      prismaMock.ticket.findMany.mock.calls[0][0]?.where);
+    const where = prismaMock.ticket.count.mock.calls[0][0]?.where;
+    expect(where).toEqual({ eventId: 'event-1', status: 'sold', refundRequestedAt: { not: null },
+      refundedAt: null, cancelledAt: null, OR: [{ paymentStatus: null }, { paymentStatus: { not: 'REFUNDED' } }] });
+    const second = await getEventTickets('event-1', owner, '2', '3', 'true');
+    expect(second.tickets.map(t => t.id)).toEqual(['ticket-18', 'ticket-19', 'ticket-20']);
+    rows.forEach((t, i) => { if (i !== 12) t.refundRequestedAt = null; });
+    expect(await getEventTickets('event-1', owner, '1', '3', 'true'))
+      .toMatchObject({ tickets: [{ id: 'ticket-12' }], totalTickets: 1, totalPages: 1 });
+    rows.forEach(t => { t.refundRequestedAt = null; });
+    expect(await getEventTickets('event-1', owner, '1', '3', 'true'))
+      .toMatchObject({ tickets: [], totalTickets: 0, totalPages: 1 });
+  });
+
+  it('rejects another organiser before querying pending requests', async () => {
+    await expect(getEventTickets('event-1', { ...owner, id: 'other' }, 1, 10, 'true'))
+      .rejects.toMatchObject({ statusCode: 403 });
+    expect(prismaMock.ticket.count).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.findMany).not.toHaveBeenCalled();
+  });
+
+  it.each(['yes', ['true'], {}])('rejects an invalid filter %p', async filter => {
+    await expect(getEventTickets('event-1', owner, 1, 10, filter)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it.each([undefined, 'false'])('keeps the issued ticket predicate when disabled (%p)', async filter => {
+    prismaMock.ticket.count.mockResolvedValue(0);
+    prismaMock.ticket.findMany.mockResolvedValue([]);
+    await getEventTickets('event-1', owner, 1, 10, filter);
+    expect(prismaMock.ticket.count).toHaveBeenCalledWith({ where: { eventId: 'event-1', status: { not: 'available' } } });
+  });
+});

@@ -439,12 +439,23 @@ export const getEventTickets = async (
   eventId: string,
   requester: Requester,
   pageParam?: any,
-  limitParam?: any
+  limitParam?: any,
+  pendingRefundsParam?: unknown
 ) => {
   const event = await assertEventAccess(eventId, requester);
   const { page, limit, skip } = parsePagination(pageParam, limitParam);
 
-  const where = { eventId, ...ISSUED_TICKET_FILTER };
+  if (pendingRefundsParam !== undefined && pendingRefundsParam !== 'true' && pendingRefundsParam !== 'false') {
+    throw new ApiError('pendingRefunds must be true or false', 400);
+  }
+  const where = {
+    eventId,
+    ...(pendingRefundsParam === 'true'
+      ? { status: 'sold' as const, refundRequestedAt: { not: null },
+          refundedAt: null, cancelledAt: null,
+          OR: [{ paymentStatus: null }, { paymentStatus: { not: 'REFUNDED' } }]  }
+      : ISSUED_TICKET_FILTER),
+  };
 
   const [total, tickets] = await Promise.all([
     prisma.ticket.count({ where }),
@@ -474,6 +485,7 @@ export const getEventTickets = async (
 
   return {
     tickets: ticketRows,
+    totalTickets: total,
     currentPage: page,
     totalPages: Math.max(1, Math.ceil(total / limit)),
   };
