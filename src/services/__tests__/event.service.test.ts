@@ -59,7 +59,7 @@ describe('getEvents — cancelled events excluded from listings', () => {
   it('includes cancelled events only when showCancelled=true is passed', async () => {
     prismaMock.event.findMany.mockResolvedValue([] as any);
 
-    await getEvents({ showCancelled: 'true' });
+    await getEvents({ showCancelled: 'true' }, { id: 'org-1', role: 'organizer' });
 
     const arg = prismaMock.event.findMany.mock.calls[0][0] as any;
     expect(arg.where.isCancelled).toBeUndefined();

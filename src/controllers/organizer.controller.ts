@@ -195,7 +195,7 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
       organizer: organizerId,
       showUnpublished: 'true',
       includePast: 'true',
-    });
+    }, authReq.user);
     
     // Get event statistics
     const eventStats = {

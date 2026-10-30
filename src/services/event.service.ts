@@ -1,4 +1,4 @@
-import { assertEventVisible } from '../utils/eventVisibility';
+import { EventViewer, assertEventVisible } from '../utils/eventVisibility';
 import prisma from '../config/prisma';
 import { assertDateInterval } from '../utils/dateInterval';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
@@ -101,7 +101,7 @@ const toPositiveInt = (value: any, fallback: number): number => {
  * @returns `{ data, total, page, limit, hasMore }` — `data` is the page of
  *   events, `total` the full match count across all pages.
  */
-export const getEvents = async (query: Record<string, any> = {}) => {
+export const getEvents = async (query: Record<string, any> = {}, viewer?: EventViewer) => {
   try {
     const where: any = {};
 
@@ -134,8 +134,17 @@ export const getEvents = async (query: Record<string, any> = {}) => {
       where.endDate = { gte: new Date() };
     }
 
+    const privateListing = !!viewer?.id &&
+      (viewer.role === UserRole.ORGANIZER || viewer.role === UserRole.ADMIN) &&
+      (query.showUnpublished === 'true' || query.showCancelled === 'true');
+
+    // Private listing is restricted to the verified owner, except for admins.
+    if (privateListing && viewer.role !== UserRole.ADMIN) {
+      where.organizerId = viewer.id;
+    }
+
     // By default, only return published events unless specified
-    if (query.showUnpublished !== 'true') {
+    if (!privateListing || query.showUnpublished !== 'true') {
       where.isPublished = true;
     }
 
@@ -143,12 +152,12 @@ export const getEvents = async (query: Record<string, any> = {}) => {
     // isCancelled; without this filter a cancelled event keeps appearing in the
     // public buyer listing and selling tickets. An organizer dashboard can opt
     // in to see its own cancelled events via showCancelled=true.
-    if (query.showCancelled !== 'true') {
+    if (!privateListing || query.showCancelled !== 'true') {
       where.isCancelled = false;
     }
 
     // Organizer filter
-    if (query.organizer) {
+    if (query.organizer && !where.organizerId) {
       where.organizerId = query.organizer;
     }
 

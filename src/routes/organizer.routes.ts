@@ -594,17 +594,11 @@ router.get('/dashboard', getOrganizerDashboardController);
 router.get('/events', (req: Request, res: Response, next: NextFunction) => {
   const authReq = req as AuthenticatedRequest;
   if (authReq.user && authReq.user.id) {
-    // If admin, allow viewing all events unless organizer ID is specified
-    if (authReq.user.role === UserRole.ADMIN && !req.query.organizer) {
-      next();
-      return;
-    }
-    // For organizers or when organizer ID is specified. includePast=true so
-    // an organizer managing their own events still sees past ones, unlike the
-    // public listing's upcoming-only default.
     req.query = {
       ...req.query,
-      organizer: (req.query.organizer as string) || authReq.user.id,
+      ...(authReq.user.role === UserRole.ADMIN
+        ? {}
+        : { organizer: authReq.user.id }),
       showUnpublished: 'true',
       includePast: 'true'
     };

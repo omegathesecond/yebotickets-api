@@ -39,8 +39,9 @@ export const createEventController = async (req: Request, res: Response, next: N
  *  - GET /api/organizers/events — behind protect+authorize(ORGANIZER, ADMIN);
  *    its wrapper middleware sets showUnpublished/organizer server-side so
  *    organizers/staff (including the scanner app) can see their own drafts.
- * Only honour showUnpublished/showCancelled when the caller is an
- * authenticated organizer/admin. Checking role (not merely req.user
+ * The service honours private flags only for verified organizers/admins and
+ * forces non-admin private listings to the viewer's own organizer ID.
+ * Checking role (not merely req.user
  * presence) means this stays safe even if this controller is ever mounted
  * behind `protect` alone without `authorize(ORGANIZER, ADMIN)` — a plain
  * logged-in customer must not be able to enumerate draft/unpublished events
@@ -58,7 +59,7 @@ export const getEventsController = async (req: Request, res: Response, next: Nex
           const { showUnpublished, showCancelled, ...publicQuery } = req.query;
           return publicQuery;
         })();
-    const { data, total, page, limit, hasMore } = await getEvents(query);
+    const { data, total, page, limit, hasMore } = await getEvents(query, authReq.user);
 
     res.status(200).json({
       success: true,
