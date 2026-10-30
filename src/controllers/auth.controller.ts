@@ -60,10 +60,14 @@ export const refreshTokenController = async (req: Request, res: Response, next: 
     // Confirm the user still exists (token could outlive a deleted account).
     const user = await prisma.user.findUnique({
       where: { id: payload.id },
-      select: { id: true, role: true },
+      select: { id: true, role: true, isSuspended: true },
     });
     if (!user) {
       return next(new ApiError('User no longer exists', 401));
+    }
+
+    if (user.role === 'organizer' && user.isSuspended) {
+      return next(new ApiError('Organizer account is suspended', 403));
     }
 
     const tokens = generateAuthTokens(user.id, user.role);

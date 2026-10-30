@@ -38,6 +38,7 @@ export interface IUser {
   password?: string | null;
   role: UserRole;
   isVerified: boolean;
+  isSuspended: boolean;
   otpCode?: string | null;
   otpExpiresAt?: Date | null;
   // Organizer-specific fields (flattened in DB)

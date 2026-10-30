@@ -220,9 +220,7 @@ router.get('/all', authorize(UserRole.ADMIN), getOrganizersController);
  *           schema:
  *             type: object
  *             properties:
- *               isVerified:
- *                 type: boolean
- *               isActive:
+ *               isSuspended:
  *                 type: boolean
  *     responses:
  *       200:
@@ -332,8 +330,7 @@ router.patch(
  *   patch:
  *     summary: Set an organizer's payout-approval review status (Admin only)
  *     description: >
- *       Separate from PUT /organizers/{id}/status (which only toggles the
- *       auto-set phone-OTP isVerified flag) — this is the gate
+ *       Separate from PUT /organizers/{id}/status (administrative suspension) — this is the gate
  *       createPayoutRequest actually checks before an organizer may withdraw.
  *     tags: [Organizers]
  *     security:

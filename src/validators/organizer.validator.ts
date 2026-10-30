@@ -174,13 +174,7 @@ export const organizerLoginValidator: ValidationChain[] = [
 ];
 
 export const organizerStatusValidator: ValidationChain[] = [
-  body('isVerified')
-    .optional()
-    .isBoolean()
-    .withMessage('isVerified must be a boolean'),
-  
-  body('isActive')
-    .optional()
-    .isBoolean()
-    .withMessage('isActive must be a boolean'),
-]; 
+  body('isSuspended')
+    .custom((value) => typeof value === 'boolean')
+    .withMessage('isSuspended must be a boolean'),
+];

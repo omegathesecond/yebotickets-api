@@ -63,6 +63,7 @@ model User {
   password    String?
   role        UserRole @default(user)
   isVerified  Boolean  @default(false)
+  isSuspended Boolean  @default(false)
   
   // OTP fields
   otpCode     String?

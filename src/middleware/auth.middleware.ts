@@ -39,6 +39,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
           email: true,
           role: true,
           isVerified: true,
+          isSuspended: true,
           createdAt: true,
           updatedAt: true,
         },
@@ -46,6 +47,10 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
       
       if (!user) {
         return next(new ApiError('User not found', 404));
+      }
+
+      if (user.role === 'organizer' && user.isSuspended) {
+        return next(new ApiError('Organizer account is suspended', 403));
       }
 
       // Attach user to request object

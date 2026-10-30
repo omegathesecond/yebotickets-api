@@ -277,6 +277,7 @@ export const getOrganizersController = async (req: Request, res: Response, next:
         email: true,
         role: true,
         isVerified: true,
+        isSuspended: true,
         payoutApprovalStatus: true,
         payoutApprovalReviewedByAdminId: true,
         payoutApprovalReviewedAt: true,
@@ -327,6 +328,10 @@ export const loginOrganizerController = async (req: Request, res: Response, next
     if (!isPasswordValid) {
       next(new ApiError('Invalid credentials', 401));
       return;
+    }
+
+    if (user.role === 'organizer' && user.isSuspended) {
+      return next(new ApiError('Organizer account is suspended', 403));
     }
 
     // Check if user is verified
@@ -392,6 +397,7 @@ export const getOrganizerProfileController = async (req: Request, res: Response,
         email: true,
         role: true,
         isVerified: true,
+        isSuspended: true,
         companyName: true,
         companyDescription: true,
         website: true,
@@ -432,14 +438,14 @@ export const getOrganizerProfileController = async (req: Request, res: Response,
 export const updateOrganizerStatusController = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params;
-    const { isVerified } = req.body;
-
-    const updates: any = {};
-    if (typeof isVerified === 'boolean') updates.isVerified = isVerified;
+    const { isSuspended } = req.body;
+    if (typeof isSuspended !== 'boolean') {
+      return next(new ApiError('isSuspended must be a boolean', 400));
+    }
 
     const organizer = await prisma.user.update({
       where: { id, role: 'organizer' },
-      data: updates,
+      data: { isSuspended },
       select: {
         id: true,
         name: true,
@@ -447,6 +453,7 @@ export const updateOrganizerStatusController = async (req: Request, res: Respons
         email: true,
         role: true,
         isVerified: true,
+        isSuspended: true,
         companyName: true,
         createdAt: true,
         updatedAt: true,
