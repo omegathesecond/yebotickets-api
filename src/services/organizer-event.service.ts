@@ -204,6 +204,7 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
     const sold = soldMap.get(tt.id) || 0;
     const available = availableMap.get(tt.id) || 0;
     return {
+      id: tt.id,
       name: tt.name,
       sold,
       available,

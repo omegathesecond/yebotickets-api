@@ -99,6 +99,32 @@ describe('getOrganizerEarnings — derived from real sold tickets', () => {
 });
 
 describe('getEventDetailsForOrganizer — stats from real ticket rows', () => {
+  it('keeps same-name tiers distinct by their existing UUIDs', async () => {
+    const firstId = 'a1111111-1111-4111-8111-111111111111';
+    const secondId = 'b2222222-2222-4222-8222-222222222222';
+    prismaMock.event.findUnique.mockResolvedValue(eventRow({ ticketTypes: [
+      { id: firstId, name: 'General Admission', price: 100, quantity: 50 },
+      { id: secondId, name: 'General Admission', price: 200, quantity: 30 },
+    ] }) as any);
+    prismaMock.ticket.groupBy
+      .mockResolvedValueOnce([
+        { ticketTypeId: secondId, _count: { _all: 5 } },
+        { ticketTypeId: firstId, _count: { _all: 3 } },
+      ] as any)
+      .mockResolvedValueOnce([
+        { ticketTypeId: firstId, _count: { _all: 47 } },
+        { ticketTypeId: secondId, _count: { _all: 25 } },
+      ] as any);
+    prismaMock.ticket.findMany.mockResolvedValue([]);
+
+    const { stats } = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
+
+    expect(stats.ticketTypes).toEqual([
+      { id: firstId, name: 'General Admission', sold: 3, available: 47, revenue: 300 },
+      { id: secondId, name: 'General Admission', sold: 5, available: 25, revenue: 1000 },
+    ]);
+  });
+
   it('computes revenue = sold count x price and pending = reserved value', async () => {
     prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
     // 3 sold of tt-1 @100, 47 available, 0 reserved value here.
@@ -116,7 +142,7 @@ describe('getEventDetailsForOrganizer — stats from real ticket rows', () => {
     expect(stats.totalRevenue).toBe(300);
     expect(stats.pendingPayments).toBe(100);
     expect(stats.ticketTypes).toEqual([
-      { name: 'VIP', sold: 3, available: 47, revenue: 300 },
+      { id: 'tt-1', name: 'VIP', sold: 3, available: 47, revenue: 300 },
     ]);
   });
 });
