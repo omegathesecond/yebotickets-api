@@ -3,7 +3,7 @@ import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
-import { updateProfile, changePassword } from '../services/auth.service';
+import { updateProfile, changePassword, requestOTP, assertOrganizerNotSuspended } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
 import { generateAuthTokens } from '../services/token.service';
@@ -329,18 +329,11 @@ export const loginOrganizerController = async (req: Request, res: Response, next
       return;
     }
 
-    // Check if user is verified
+    assertOrganizerNotSuspended(user);
+
     if (!user.isVerified) {
-      // Generate new OTP for unverified users
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          otpCode: otp,
-          otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
-        },
-      });
-      
+      await requestOTP(user.phoneNumber);
+
       res.status(401).json({
         success: false,
         message: 'Account not verified. A new verification code has been sent to your phone.',

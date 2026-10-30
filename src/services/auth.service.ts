@@ -82,6 +82,13 @@ const comparePassword = async (entered: string, stored: string): Promise<boolean
   return bcrypt.compare(entered, stored);
 };
 
+/** Phone verification never changes administrative suspension. */
+export const assertOrganizerNotSuspended = (user: Pick<User, 'role' | 'isSuspended'>): void => {
+  if (user.role === 'organizer' && user.isSuspended) {
+    throw new ApiError('Organizer account is suspended', 403);
+  }
+};
+
 /**
  * Request OTP via WhatsApp for authentication
  * @param phoneNumber User's phone number
@@ -107,6 +114,8 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
       isNewUser = true;
     }
 
+    assertOrganizerNotSuspended(user);
+
     // Generate OTP
     const otp = generateOTPCode();
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -131,6 +140,7 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     };
   } catch (error) {
     console.error('Error in requestOTP service:', error);
+    if (error instanceof ApiError) throw error;
     throw new ApiError('Failed to send OTP', 500);
   }
 };
@@ -150,6 +160,8 @@ export const verifyOTP = async (
       if (!user) {
         throw new ApiError('User not found', 404);
       }
+
+      assertOrganizerNotSuspended(user);
 
       // Check if OTP exists and is valid
       if (!user.otpCode || !user.otpExpiresAt) {

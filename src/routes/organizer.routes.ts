@@ -1,3 +1,4 @@
+import { requestOtpLimiter } from '../middleware/rateLimit.middleware';
 /**
  * @swagger
  * tags:
@@ -178,7 +179,7 @@ router.post('/signup', validate(organizerSignupValidator), becomeOrganizerContro
  *       401:
  *         description: Invalid credentials
  */
-router.post('/login', validate(organizerLoginValidator), loginOrganizerController);
+router.post('/login', requestOtpLimiter, validate(organizerLoginValidator), loginOrganizerController);
 
 // Protected routes
 router.use(protect);

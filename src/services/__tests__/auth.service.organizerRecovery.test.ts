@@ -1,0 +1,80 @@
+import { mockDeep, mockReset } from 'jest-mock-extended';
+import type { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+jest.mock('crypto', () => ({ ...jest.requireActual('crypto'), randomInt: jest.fn(() => 654321) }));
+jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../yebolink.client', () => ({ YeboLinkClient: { sendWhatsApp: jest.fn() } }));
+jest.mock('../token.service', () => ({ generateAuthTokens: jest.fn(() => ({ token: 'access', refreshToken: 'refresh' })) }));
+import prisma from '../../config/prisma';
+import { YeboLinkClient } from '../yebolink.client';
+const sendOTP = YeboLinkClient.sendWhatsApp;
+import { generateAuthTokens } from '../token.service';
+import { requestOTP, verifyOTP } from '../auth.service';
+import { loginOrganizerController } from '../../controllers/organizer.controller';
+const db = prisma as ReturnType<typeof mockDeep<PrismaClient>>;
+const phoneNumber = '+26878422613';
+let row: any;
+let res: any;
+let next: jest.Mock;
+beforeEach(async () => {
+  mockReset(db); jest.clearAllMocks();
+  row = { id: 'org', role: 'organizer', phoneNumber, email: 'owner@example.com', password: await bcrypt.hash('Password1', 4), isVerified: false, isSuspended: false, otpCode: '123456', otpExpiresAt: new Date(Date.now()+60000), otpAttempts: 4 };
+  db.user.findFirst.mockImplementation(async () => ({...row}));
+  db.user.findUnique.mockImplementation(async () => ({...row}));
+  db.user.update.mockImplementation(async ({ data }: any) => { Object.assign(row, data); return {...row}; });
+  db.$transaction.mockImplementation(async (fn: any) => fn(db));
+  jest.mocked(sendOTP).mockResolvedValue({} as any);
+  res = { status: jest.fn().mockReturnThis(), json: jest.fn() }; next = jest.fn();
+  jest.spyOn(console, 'error').mockImplementation(() => {});
+});
+afterEach(() => jest.restoreAllMocks());
+const login = (password = 'Password1') => loginOrganizerController({ body: { email: row.email, password } } as any, res, next);
+it('delivers a fresh challenge on valid password login, resets attempts, and issues no token until verified', async () => {
+  await login();
+  expect(next).not.toHaveBeenCalled();
+  expect(sendOTP).toHaveBeenCalledWith({ to: phoneNumber, text: expect.stringContaining(row.otpCode) });
+  expect(row.otpCode).toBe('654321');
+  expect(row.otpAttempts).toBe(0);
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ requiresVerification: true, phoneNumber }));
+  expect(generateAuthTokens).not.toHaveBeenCalled();
+  await expect(verifyOTP(phoneNumber, '123456')).rejects.toMatchObject({statusCode:400});
+  expect(generateAuthTokens).not.toHaveBeenCalled();
+  const result = await verifyOTP(phoneNumber, row.otpCode);
+  expect(result).toMatchObject({token:'access', refreshToken:'refresh'});
+  expect(row.isVerified).toBe(true);
+  expect(row.otpCode).toBeNull();
+  await expect(verifyOTP(phoneNumber, '123456')).rejects.toMatchObject({statusCode:400});
+});
+it('propagates delivery failure without claiming sent or issuing tokens', async () => {
+  jest.mocked(sendOTP).mockRejectedValue(new Error('YeboLink unavailable'));
+  await login();
+  expect(next).toHaveBeenCalledWith(expect.objectContaining({statusCode:500}));
+  expect(res.json).not.toHaveBeenCalled();
+  expect(generateAuthTokens).not.toHaveBeenCalled();
+});
+it('does not send a challenge for an invalid password', async () => {
+  await login('wrong');
+  expect(next).toHaveBeenCalledWith(expect.objectContaining({statusCode:401}));
+  expect(sendOTP).not.toHaveBeenCalled();
+});
+it('preserves verified organiser password login', async () => {
+  row.isVerified = true; await login();
+  expect(res.status).toHaveBeenCalledWith(200);
+  expect(generateAuthTokens).toHaveBeenCalledWith('org','organizer');
+  expect(sendOTP).not.toHaveBeenCalled();
+});
+it('blocks suspended login, issuance and verification without reactivating the account', async () => {
+  row.isSuspended = true;
+  await login();
+  expect(next).toHaveBeenCalledWith(expect.objectContaining({statusCode:403}));
+  await expect(requestOTP(phoneNumber)).rejects.toMatchObject({statusCode:403});
+  await expect(verifyOTP(phoneNumber, row.otpCode)).rejects.toMatchObject({statusCode:403});
+  expect(sendOTP).not.toHaveBeenCalled(); expect(generateAuthTokens).not.toHaveBeenCalled();
+  expect(db.user.update).not.toHaveBeenCalled();
+});
+it.each(['000000', 'expired'])('rejects %s challenges without tokens', async (code) => {
+  if (code === 'expired') row.otpExpiresAt = new Date(0);
+  await expect(verifyOTP(phoneNumber, code === 'expired' ? row.otpCode : code)).rejects.toMatchObject({statusCode: code === '000000' ? 429 : 400});
+  expect(generateAuthTokens).not.toHaveBeenCalled();
+});
