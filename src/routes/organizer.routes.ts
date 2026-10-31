@@ -71,6 +71,7 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import { getEventsController, createEventController } from '../controllers/event.controller';
+import { passwordLoginLimiter } from '../middleware/rateLimit.middleware';
 import { protect, authorize } from '../middleware/auth.middleware';
 import { UserRole } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
@@ -177,8 +178,15 @@ router.post('/signup', validate(organizerSignupValidator), becomeOrganizerContro
  *         description: Login successful
  *       401:
  *         description: Invalid credentials
+ *       429:
+ *         description: IP login budget exhausted (10 requests per 15 minutes per API instance)
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds until this IP can retry
+ *             schema:
+ *               type: integer
  */
-router.post('/login', validate(organizerLoginValidator), loginOrganizerController);
+router.post('/login', passwordLoginLimiter, validate(organizerLoginValidator), loginOrganizerController);
 
 // Protected routes
 router.use(protect);

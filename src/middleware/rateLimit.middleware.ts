@@ -19,6 +19,28 @@ import { AuthenticatedRequest } from '../types/auth';
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 
 /**
+ * Password login: 10 requests per IP per 15 minutes, including successes and
+ * invalid payloads. The default IP key normalises IPv6 subnets; identifiers
+ * never enter the key, so rotating emails/phones cannot replenish the budget.
+ * Mount BEFORE validation and the controller to bound database/bcrypt work.
+ *
+ * Like the existing limiters, this uses express-rate-limit's MemoryStore:
+ * counters are per process, reset on restart, and are NOT shared across Cloud
+ * Run instances. N instances can allow up to N budgets; fleet-wide enforcement
+ * requires a shared store or an upstream rate limit. No account is locked.
+ */
+export const passwordLoginLimiter = rateLimit({
+  windowMs: FIFTEEN_MINUTES_MS,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many login attempts. Please wait 15 minutes before trying again.',
+  },
+});
+
+/**
  * Build a rate-limit key from the caller's phone number (when present in the
  * body) AND their IP. Keying on phone alone would let one attacker rotate
  * phones from a single host; keying on IP alone would let a NAT'd network share
