@@ -1,3 +1,4 @@
+import { amountToCents, isCentAmount, orderAmount } from '../utils/money';
 import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
@@ -100,6 +101,7 @@ export const createTicketType = async (
   eventId: string,
   organizerId: string
 ) => {
+  amountToCents(ticketTypeData.price);
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
     // First verify the event belongs to this organizer
@@ -225,6 +227,7 @@ export const updateTicketType = async (
   updateData: Partial<ITicketType>,
   organizerId: string
 ) => {
+  if (updateData.price !== undefined) amountToCents(updateData.price);
   try {
     return await prisma.$transaction(async (tx) => {
       await lockTicketTier(tx, ticketTypeId);
@@ -1373,6 +1376,7 @@ export const purchaseTicket = async (
       assertEventOnSale(ticketType.event);
       assertTierOnSale(ticketType);
       const price = ticketType.price;
+      const totalAmount = orderAmount(price, qty);
       if (price > 0) assertPaymentProvided(payment);
       const attemptRef = `attempt:${crypto.randomUUID()}`;
       const { tickets, availableRemaining } = await claimAvailableTickets(
@@ -1385,10 +1389,10 @@ export const purchaseTicket = async (
       const attempt = await tx.ticketPurchaseAttempt.create({ data: {
         key, userId, fingerprint, attemptRef, ticketIds: tickets.map(t => t.id),
       } });
-      return { replay: false as const, attempt, tickets, price, ticketType };
+      return { replay: false as const, attempt, tickets, price, totalAmount, ticketType };
     });
     if (allocation.replay) return recoverPurchaseAttempt(key, userId);
-    const { tickets: reserved, price, ticketType, attempt } = allocation;
+    const { tickets: reserved, price, totalAmount, ticketType, attempt } = allocation;
     if (price <= 0) return finishIssuedOrder(reserved);
     const validPayment = assertPaymentProvided(payment);
     const attemptRef = attempt.attemptRef;
@@ -1399,7 +1403,7 @@ export const purchaseTicket = async (
     let charge;
     try {
       charge = await createCharge({
-        amount: price * qty,
+        amount: totalAmount,
         currency: TICKET_CURRENCY,
         yeboidSub: userId,
         paymentMethodId: validPayment.paymentMethodId,
@@ -2107,7 +2111,7 @@ const refundAndCancelTicket = async (
   });
   const amount = Number(ticket.amountPaid);
   const cents = (value: number) => Math.round(value * 100);
-  if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
+  if (!isCentAmount(amount) || amount <= 0) {
     return failed('invalid stored ticket amount');
   }
 

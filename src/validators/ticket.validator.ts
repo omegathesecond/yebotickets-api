@@ -1,3 +1,4 @@
+import { amountToCents } from '../utils/money';
 import { assertDateInterval } from '../utils/dateInterval';
 import { body, param } from 'express-validator';
 import { TicketType as TicketTypeEnum } from '../interfaces/ticket.interface';
@@ -19,14 +20,7 @@ export const createTicketTypeValidator = [
   body('price')
     .notEmpty()
     .withMessage('Price is required')
-    .isNumeric()
-    .withMessage('Price must be a number')
-    .custom((value) => {
-      if (parseFloat(value) < 0) {
-        throw new Error('Price cannot be negative');
-      }
-      return true;
-    }),
+    .custom((value) => { amountToCents(value); return true; }),
   
   body('quantity')
     .notEmpty()
@@ -71,14 +65,7 @@ export const updateTicketTypeValidator = [
   
   body('price')
     .optional()
-    .isNumeric()
-    .withMessage('Price must be a number')
-    .custom((value) => {
-      if (parseFloat(value) < 0) {
-        throw new Error('Price cannot be negative');
-      }
-      return true;
-    }),
+    .custom((value) => { amountToCents(value); return true; }),
   
   body('quantity')
     .optional()

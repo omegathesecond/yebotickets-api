@@ -69,6 +69,8 @@ import {
   getEventTicketsForCheckIn,
   getTicketTypes,
   getUserTickets,
+  createTicketType,
+  updateTicketType,
 } from '../ticket.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
@@ -2582,5 +2584,41 @@ describe('first purchase versus organiser backdating', () => {
       expect(row.status).toBe('available');
       expect(createChargeMock).not.toHaveBeenCalled();
     }
+  });
+});
+
+
+describe('SZL cent admission', () => {
+  it.each([10.001, -1, NaN, Infinity, -Infinity, 0.001, Number.MAX_VALUE])('rejects invalid tier price %p in direct writes and checkout before side effects', async price => {
+    await expect(createTicketType({ price } as any, 'event-1', 'org-1')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(updateTicketType('tt-1', { price }, 'org-1')).rejects.toMatchObject({ statusCode: 400 });
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price }) as any);
+    await expect(purchaseTicket('tt-1', 'user-1', PAYMENT)).rejects.toMatchObject({ statusCode: 400 });
+    expect(prismaMock.ticket.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.ticket.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.ticketPurchaseAttempt.create).not.toHaveBeenCalled();
+    expect(prismaMock.ticketType.create).not.toHaveBeenCalled();
+    expect(prismaMock.ticketType.update).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0.29, 10.10])('purchases three tickets at %p with exact cents and refunds the recorded unit amount', async price => {
+    prismaMock.ticketType.findUnique.mockResolvedValue(buildTicketType({ price }) as any);
+    prismaMock.ticket.findFirst.mockResolvedValue({ id: 'ticket-1' } as any);
+    prismaMock.ticket.updateMany.mockResolvedValue({ count: 1 });
+    const sold = buildSoldPaidTicket({ amountPaid: price });
+    prismaMock.ticket.findMany.mockResolvedValueOnce([sold, {...sold, id: 'ticket-2'}, {...sold, id: 'ticket-3'}] as any)
+      .mockResolvedValueOnce([sold, {...sold, id: 'ticket-2'}, {...sold, id: 'ticket-3'}] as any);
+    const total = Math.round(price * 100) * 3 / 100;
+    createChargeMock.mockResolvedValue(buildCharge({ amount: String(total) }) as any);
+    await purchaseTicket('tt-1', 'user-1', PAYMENT, 3);
+    expect(createChargeMock.mock.calls[0][0].amount).toBe(total);
+    expect(prismaMock.ticket.updateMany.mock.calls[0][0].data).toMatchObject({ amountPaid: price });
+    prismaMock.ticket.findUnique.mockResolvedValue(sold as any);
+    prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
+    getChargeMock.mockResolvedValue(buildCharge({ amount: String(total) }) as any);
+    refundChargeMock.mockResolvedValue(buildRefundResult({ status: 'PARTIAL_REFUNDED', refunded_amount: String(price) }) as any);
+    expect(await refundTicket('ticket-1', ORGANIZER)).toMatchObject({ result: 'refunded', amountRefunded: price });
+    expect(refundChargeMock.mock.calls[0][0]).toMatchObject({ amount: price });
   });
 });
