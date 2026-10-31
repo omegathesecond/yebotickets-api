@@ -1,7 +1,7 @@
 import { assertEventVisible } from '../utils/eventVisibility';
 import prisma from '../config/prisma';
 import { assertDateInterval } from '../utils/dateInterval';
-import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
+import { IEvent, IEventInput, IEventUpdateInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
 import { getAvailableQuantities } from './ticket.service';
@@ -244,7 +244,7 @@ export const getEventById = async (
  */
 export const updateEvent = async (
   eventId: string,
-  updateData: Partial<IEventInput>,
+  updateData: IEventUpdateInput,
   organizerId: string
 ) => {
   try {

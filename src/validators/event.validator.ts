@@ -145,7 +145,7 @@ export const updateEventValidator = [
     .withMessage('Category must be a string'),
   
   body('coverImage')
-    .optional()
+    .optional({ values: 'null' })
     .isURL()
     .withMessage('Cover image must be a valid URL'),
   

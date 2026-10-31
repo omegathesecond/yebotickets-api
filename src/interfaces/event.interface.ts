@@ -65,3 +65,8 @@ export function nestEventLocation(event: IEvent): IEventLocation {
       : undefined,
   };
 }
+
+/** null explicitly clears a cover image; omission leaves it unchanged. */
+export type IEventUpdateInput = Partial<Omit<IEventInput, 'coverImage'>> & {
+  coverImage?: string | null;
+};
