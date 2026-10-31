@@ -74,6 +74,12 @@ export const getEventsController = async (req: Request, res: Response, next: Nex
   }
 };
 
+/** ADMIN inventory: lifecycle and history flags cannot be disabled by callers. */
+export const getAdminEventsController = (req: Request, res: Response, next: NextFunction) => {
+  req.query = { ...req.query, showUnpublished: 'true', showCancelled: 'true', includePast: 'true' };
+  return getEventsController(req, res, next);
+};
+
 /**
  * GET /api/events/:id has no protect/authorize middleware — it must stay
  * reachable anonymously for published events. req.user is a sound auth proxy

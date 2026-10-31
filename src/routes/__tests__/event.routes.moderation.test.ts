@@ -174,3 +174,52 @@ describe('PATCH /events/:id/moderation — admin-only event moderation', () => {
     expect(prismaMock.event.findUnique).not.toHaveBeenCalled();
   });
 });
+
+describe('GET /events/admin/inventory', () => {
+  const inventory = Array.from({ length: 105 }, (_, i) => ({
+    id: `event-${i}`, title: `Event ${i}`, organizerId: `org-${i % 2}`,
+    isPublished: i % 4 !== 1, isCancelled: i % 4 === 2,
+    startDate: new Date(i % 4 === 3 ? '2020-01-01' : '2099-01-01'),
+    endDate: new Date(i % 4 === 3 ? '2020-01-02' : '2099-01-02'),
+    ticketTypes: [],
+  }));
+
+  beforeEach(() => {
+    prismaMock.$transaction.mockImplementation(((ops: any[]) => Promise.all(ops)) as any);
+    prismaMock.event.findMany.mockImplementation((async ({ where, skip, take }: any) => {
+      const matching = inventory.filter(e =>
+        (where.isPublished === undefined || e.isPublished === where.isPublished) &&
+        (where.isCancelled === undefined || e.isCancelled === where.isCancelled) &&
+        (!where.endDate || e.endDate >= where.endDate.gte));
+      return matching.slice(skip, skip + take);
+    }) as any);
+    prismaMock.event.count.mockResolvedValue(inventory.length);
+  });
+
+  it('enumerates lifecycle states and history across organizers over multiple pages', async () => {
+    const ids: string[] = [];
+    for (const page of [1, 2]) {
+      const res = await fetch(`${baseUrl}/events/admin/inventory?page=${page}&limit=100&includePast=false&showCancelled=false&showUnpublished=false`, { headers: { 'x-test-role': 'admin' } });
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body).toMatchObject({ total: 105, page, limit: 100, hasMore: page === 1 });
+      ids.push(...body.data.map((e: any) => e.id));
+    }
+    expect(ids).toEqual(inventory.map(e => e.id));
+    expect(prismaMock.event.findMany.mock.calls[0][0]).toMatchObject({ where: {}, orderBy: [{ startDate: 'asc' }, { id: 'asc' }] });
+  });
+
+  it.each([undefined, 'customer', 'organizer'])('denies %s before reading events', async role => {
+    const res = await fetch(`${baseUrl}/events/admin/inventory`, { headers: role ? { 'x-test-role': role } : {} });
+    expect(res.status).toBe(403);
+    expect(prismaMock.event.findMany).not.toHaveBeenCalled();
+  });
+
+  it('keeps public browsing restricted even with a supplied admin header and private flags', async () => {
+    const res = await fetch(`${baseUrl}/events?showUnpublished=true&showCancelled=true`, { headers: { 'x-test-role': 'admin' } });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.every((e: any) => e.isPublished && !e.isCancelled && new Date(e.endDate) > new Date())).toBe(true);
+    expect(prismaMock.event.findMany.mock.calls[0][0]?.where).toMatchObject({ isPublished: true, isCancelled: false, endDate: { gte: expect.any(Date) } });
+  });
+});

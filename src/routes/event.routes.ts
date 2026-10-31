@@ -2,6 +2,7 @@ import express from 'express';
 import {
   createEventController,
   getEventsController,
+  getAdminEventsController,
   getEventByIdController,
   updateEventController,
   deleteEventController,
@@ -102,6 +103,9 @@ router.get(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+// Cross-organizer inventory including drafts, cancellations and history.
+router.get('/admin/inventory', protect, authorize(UserRole.ADMIN), getAdminEventsController);
+
 router.get('/', getEventsController);
 
 /**

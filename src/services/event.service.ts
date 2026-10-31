@@ -177,7 +177,7 @@ export const getEvents = async (query: Record<string, any> = {}) => {
           },
           ticketTypes: true,
         },
-        orderBy: { startDate: 'asc' },
+        orderBy: [{ startDate: 'asc' }, { id: 'asc' }],
         skip,
         take: limit,
       }),
