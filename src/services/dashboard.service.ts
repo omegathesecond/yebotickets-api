@@ -1,4 +1,6 @@
 import prisma from '../config/prisma';
+import { roundMoney } from '../config/platform';
+import { ticketRevenue } from './settlement.service';
 
 /**
  * Platform-wide metrics shared by the CEO dashboard (X-API-Key route) and the
@@ -27,18 +29,18 @@ export const getDashboardMetrics = async () => {
     where: { status: 'sold', purchaseDate: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
   });
 
-  // Revenue = sum of ticketType.price for sold tickets in each window
+  // Revenue = recorded purchase amounts for sold tickets in each window
   const revenueCurrentResult = await prisma.ticket.findMany({
     where: { status: 'sold', purchaseDate: { gte: thirtyDaysAgo } },
     include: { ticketType: { select: { price: true } } },
   });
-  const revenueCurrent = revenueCurrentResult.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const revenueCurrent = roundMoney(revenueCurrentResult.reduce((sum, t) => sum + ticketRevenue(t), 0));
 
   const revenuePreviousResult = await prisma.ticket.findMany({
     where: { status: 'sold', purchaseDate: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
     include: { ticketType: { select: { price: true } } },
   });
-  const revenuePrevious = revenuePreviousResult.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const revenuePrevious = roundMoney(revenuePreviousResult.reduce((sum, t) => sum + ticketRevenue(t), 0));
 
   // Organizers (cumulative counts as of now vs 30 days ago)
   const organizersCurrent = await prisma.user.count({
