@@ -15,7 +15,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@omevision/product-admin-boundary": "file:vendor/omevision-product-admin-boundary-0.3.0.tgz",
+    "@omevision/product-admin-boundary": "file:vendor/omevision-product-admin-boundary-0.5.0.tgz",
     "@prisma/client": "^5.22.0",
     "axios": "^1.8.1",
     "bcryptjs": "^2.4.3",

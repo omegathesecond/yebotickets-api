@@ -1,6 +1,7 @@
 import { Router, Request } from "express";
 import {
   createStaffAdminBoundary,
+  runtimeProductAuthority,
   matchOperation,
 } from "@omevision/product-admin-boundary";
 import prisma, { staffAdminScope } from "../config/prisma";
@@ -116,7 +117,7 @@ export function createCorporateAdminRouter(
   const router = Router();
   router.use(
     createStaffAdminBoundary({
-      product: "yebotickets",
+      product: () => runtimeProductAuthority("yebotickets"),
       verify,
       store,
       context: (actor, run) => staffAdminScope.context(actor, run),

@@ -5,7 +5,7 @@ const email = "fixture-ceo@fixture-project.iam.gserviceaccount.com";
 const assertion = {
   iss: "ceo-dashboard",
   sub: "staff:reviewer",
-  product: "yebotickets",
+  product: "yebotickets:prod",
   action: "dashboard:GET:/capabilities",
   iat: 1,
   exp: 61,
@@ -19,8 +19,8 @@ const req = (value: any = assertion) =>
   }) as any;
 let verify: jest.SpyInstance;
 beforeEach(() => {
+  process.env.K_SERVICE = "yebotickets-api-prod";
   process.env.CEO_DASHBOARD_SERVICE_ACCOUNT = email;
-  process.env.CEO_DASHBOARD_AUDIENCE = "https://api.yebotickets.com";
   verify = jest
     .spyOn(OAuth2Client.prototype, "verifyIdToken")
     .mockResolvedValue({
@@ -30,7 +30,6 @@ beforeEach(() => {
 afterEach(() => {
   jest.restoreAllMocks();
   delete process.env.CEO_DASHBOARD_SERVICE_ACCOUNT;
-  delete process.env.CEO_DASHBOARD_AUDIENCE;
   delete process.env.K_SERVICE;
 });
 it("binds the existing workload caller token to every asserted staff field", async () => {
@@ -71,16 +70,24 @@ it("fails visibly for absent identity configuration or malformed assertions", as
   });
   expect(verify).not.toHaveBeenCalled();
 });
-it("requires the dev audience on the actual dev service instead of accepting production assertions", async () => {
+it("derives the dev workload audience from the actual service without a trigger override", async () => {
   process.env.K_SERVICE = "yebotickets-api-dev";
-  await expect(verifyCorporateWorkload(req())).rejects.toMatchObject({
-    statusCode: 503,
-  });
-  expect(verify).not.toHaveBeenCalled();
-  process.env.CEO_DASHBOARD_AUDIENCE = "https://dev-api.yebotickets.com";
-  await expect(verifyCorporateWorkload(req())).resolves.toEqual(assertion);
+  const devAssertion = { ...assertion, product: "yebotickets:dev" };
+  await expect(verifyCorporateWorkload(req(devAssertion))).resolves.toEqual(
+    devAssertion,
+  );
   expect(verify).toHaveBeenCalledWith({
     idToken: "fixture-google-id-token",
-    audience: workloadAudience("https://dev-api.yebotickets.com", assertion),
+    audience: workloadAudience("https://dev-api.yebotickets.com", devAssertion),
   });
+});
+it("rejects absent, legacy and other-product runtime names before Google verification", async () => {
+  for (const service of [undefined, "yebotickets-api", "yebolearn-api-prod"]) {
+    if (service === undefined) delete process.env.K_SERVICE;
+    else process.env.K_SERVICE = service;
+    await expect(verifyCorporateWorkload(req())).rejects.toMatchObject({
+      status: 503,
+    });
+  }
+  expect(verify).not.toHaveBeenCalled();
 });
