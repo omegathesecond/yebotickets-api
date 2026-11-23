@@ -34,6 +34,8 @@ import {
   generateTickets,
   refundTicket,
   reconcileRefundAttempt,
+  getCheckInDetails,
+  confirmCheckIn,
 } from "../services/ticket.service";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
@@ -301,6 +303,33 @@ export function createCorporateAdminRouter(
           data = { records: result.purchases, total: result.total };
           break;
         }
+        case "admin_admission_preview":
+        case "admin_check_in": {
+          const ticket = await prisma.ticket.findUniqueOrThrow({
+            where: { id: p.id },
+            select: { eventId: true },
+          });
+          if (name === "admin_admission_preview") {
+            const details = await getCheckInDetails(
+              p.id,
+              ticket.eventId,
+              undefined,
+            );
+            data = {
+              ...details.ticket,
+              canCheckIn: details.canCheckIn,
+              message: details.message,
+            };
+          } else {
+            data = await confirmCheckIn(
+              p.id,
+              ticket.eventId,
+              undefined,
+              verifiedStaffOperation(req).id,
+            );
+          }
+          break;
+        }
         case "admin_payouts":
           data = recordsPage(await payouts.listPayoutRequests(p.status), p);
           break;
@@ -378,18 +407,16 @@ export function createCorporateAdminRouter(
               "The original refund is unresolved; check its original proof before another request",
               502,
             );
-          return res
-            .status(receipt.responseStatus)
-            .json({
-              ...receipt.responseBody,
-              data: {
-                ...receipt.responseBody.data,
-                holderNotification: {
-                  notified: outcome.notified,
-                  error: outcome.notifyError ?? null,
-                },
+          return res.status(receipt.responseStatus).json({
+            ...receipt.responseBody,
+            data: {
+              ...receipt.responseBody.data,
+              holderNotification: {
+                notified: outcome.notified,
+                error: outcome.notifyError ?? null,
               },
-            });
+            },
+          });
         }
         case "admin_check_refund": {
           const claim = await prisma.ticketRefundLock.findUnique({

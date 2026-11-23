@@ -3,6 +3,7 @@ import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
 import { operations } from "./operations";
 import { ticketRefundTerms } from "../services/ticket-refund-terms";
+import { getCheckInDetails } from "../services/ticket.service";
 import { CURRENCY } from "../config/platform";
 import { validateOperationInput } from "./inputs";
 const tables: Record<string, string> = {
@@ -83,6 +84,20 @@ export async function review(
   const table = op.target && tables[op.target.model];
   if (!table) throw fail("This operation has no editable target");
   await validateOperationInput(name, parameters);
+  let admissionEvent: any;
+  if (name === "admin_check_in") {
+    const ticket = await prisma.ticket.findUniqueOrThrow({
+      where: { id: parameters.id },
+      select: { eventId: true },
+    });
+    // Same Event -> Ticket order as the existing scanner claim and cancellation.
+    const events = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT id,title,"isCancelled" FROM "Event" WHERE id=$1${lock ? " FOR UPDATE" : ""}`,
+      ticket.eventId,
+    );
+    if (!events.length) throw fail("The admission event was not found", 404);
+    admissionEvent = events[0];
+  }
   const rows = await prisma.$queryRawUnsafe<any[]>(
     `SELECT * FROM "${table}" WHERE id=$1${lock ? " FOR UPDATE" : ""}`,
     parameters[op.target.field],
@@ -90,6 +105,17 @@ export async function review(
   if (!rows.length) throw fail("The product record was not found", 404);
   if (op.target.model === "user" && rows[0].role !== "organizer")
     throw fail("Choose an organiser account", 404);
+  let admissionContext: any;
+  if (name === "admin_check_in") {
+    if (rows[0].eventId !== admissionEvent.id)
+      throw fail("The ticket event changed; prepare a fresh request", 409);
+    admissionContext = await getCheckInDetails(
+      parameters.id,
+      admissionEvent.id,
+      undefined,
+    );
+    if (!admissionContext.canCheckIn) throw fail(admissionContext.message, 409);
+  }
   let refundContext: any;
   if (name === "admin_refund_ticket") {
     const event = await prisma.event.findUniqueOrThrow({
@@ -134,10 +160,22 @@ export async function review(
       inventory,
       tiers,
       refundContext,
+      admissionEvent,
+      admissionContext,
     }),
     workspace: {
       id: rows[0].id,
       name: rows[0].name ?? rows[0].title ?? op.title,
+      ...(admissionContext
+        ? {
+            ticketCode: rows[0].uniqueCode,
+            event: admissionEvent.title,
+            holder: admissionContext.ticket.name,
+            isCheckedIn: rows[0].isCheckedIn,
+            policy:
+              "Admit this exact ticket once. The original operator receipt, corporate audit and CEO operation commit together.",
+          }
+        : {}),
       ...(refundContext
         ? {
             ticketCode: rows[0].uniqueCode,

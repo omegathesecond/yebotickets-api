@@ -461,6 +461,9 @@ export const getEventTickets = async (
 
   const ticketRows = tickets.map((t) => ({
     id: t.id,
+    uniqueCode: t.uniqueCode,
+    isCheckedIn: t.isCheckedIn,
+    checkedInAt: t.checkedInAt,
     ticketType: t.ticketType?.name || 'Unknown',
     price: ticketRevenue(t),
     purchaseDate: t.purchaseDate ?? t.createdAt,

@@ -294,6 +294,23 @@ export const operations: Record<string, any> = {
     { id, ...pagination },
     paged,
   ),
+  admin_admission_preview: read(
+    "Admission details",
+    "/tickets/:id/admission",
+    "tickets",
+    { id },
+  ),
+  admin_check_in: {
+    ...change(
+      "Confirm ticket admission",
+      "/tickets/:id/admission",
+      "tickets",
+      "ticket",
+      {},
+      [],
+    ),
+    method: "POST",
+  },
   admin_payouts: read(
     "Payout requests",
     "/payouts",

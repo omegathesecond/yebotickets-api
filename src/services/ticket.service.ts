@@ -1854,7 +1854,7 @@ export const verifyTicket = async (
 export const getCheckInDetails = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester | undefined
 ): Promise<{ ticket: any; canCheckIn: boolean; message: string }> => {
   try {
     await assertEventAccess(eventId, requester);
@@ -1885,7 +1885,7 @@ export const getCheckInDetails = async (
 export const confirmCheckIn = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester,
+  requester: CheckInRequester | undefined,
   opId: string
 ): Promise<{ ticket: any; valid: boolean; message: string; opId: string; eventId: string; ticketId: string }> => {
   try {
@@ -1893,6 +1893,10 @@ export const confirmCheckIn = async (
     if (typeof opId !== 'string' || !opId.trim() || opId.length > 512) {
       throw new ApiError('Admission operation ID is required (maximum 512 characters)', 400);
     }
+    const corporateActor = staffAdminScope.actor();
+    const operatorId = corporateActor?.id ?? requester?.id;
+    if (!operatorId) throw new ApiError('A verified admission operator is required', 401);
+    const operatorKind = corporateActor ? 'CORPORATE' : 'PRODUCT';
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
     return await prisma.$transaction(async tx => {
       // Serialize the key globally, including attempts to reuse it on a different
@@ -1900,7 +1904,7 @@ export const confirmCheckIn = async (
       await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended(${opId}, 0))`;
       const receipt = await tx.ticketAdmissionReceipt.findUnique({ where: { opId } });
       if (receipt) {
-        if (receipt.operatorId !== requester.id || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {
+        if (receipt.operatorKind !== operatorKind || receipt.operatorId !== operatorId || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {
           throw new ApiError('Admission operation ID belongs to another admission', 409);
         }
         return receipt.response as any;
@@ -1921,7 +1925,7 @@ export const confirmCheckIn = async (
       // by both the initial response and every subsequent replay.
       const persistedResponse = JSON.parse(JSON.stringify(response));
       await tx.ticketAdmissionReceipt.create({ data: {
-        opId, operatorId: requester.id, eventId, ticketId: ticket!.id,
+        opId, operatorId, operatorKind, eventId, ticketId: ticket!.id,
         response: persistedResponse,
       } });
       return persistedResponse;

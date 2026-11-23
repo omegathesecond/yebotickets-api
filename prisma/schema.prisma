@@ -380,6 +380,7 @@ model TicketOrderDelivery {
 model TicketAdmissionReceipt {
   opId       String   @id
   operatorId String
+  operatorKind String @default("PRODUCT")
   eventId    String
   ticketId   String
   response   Json
