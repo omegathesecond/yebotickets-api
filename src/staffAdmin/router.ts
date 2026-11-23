@@ -37,6 +37,12 @@ import {
   getCheckInDetails,
   confirmCheckIn,
 } from "../services/ticket.service";
+import {
+  startCorporateCancellation,
+  cancellationView,
+  checkCorporateCancellation,
+  recoverCorporateCancellations,
+} from "./cancellation";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
@@ -328,6 +334,79 @@ export function createCorporateAdminRouter(
               verifiedStaffOperation(req).id,
             );
           }
+          break;
+        }
+        case "admin_cancel_event": {
+          const outcome = await startCorporateCancellation(
+            verifiedStaffOperation(req),
+          );
+          return res.status(outcome.success ? 200 : 502).json(outcome);
+        }
+        case "admin_cancellations": {
+          const { page: pg, limit } = page(p);
+          const [records, counts] = await Promise.all([
+            prisma.$queryRawUnsafe<any[]>(
+              'SELECT c."operationId" AS id,c."eventTitle",c."createdAt",jsonb_array_length(c.members) AS "ticketCount",o.state AS "operationState" FROM staff_admin_event_cancellations c JOIN staff_admin_operations o ON o.id=c."operationId" ORDER BY c."createdAt" DESC,c."operationId" LIMIT $1 OFFSET $2',
+              limit,
+              (pg - 1) * limit,
+            ),
+            prisma.$queryRawUnsafe<any[]>(
+              "SELECT COUNT(*)::integer AS total FROM staff_admin_event_cancellations",
+            ),
+          ]);
+          data = { records, total: counts[0].total };
+          break;
+        }
+        case "admin_cancellation": {
+          const { records, ...summary } = await cancellationView(p.id);
+          data = summary;
+          break;
+        }
+        case "admin_cancellation_tickets": {
+          const result = await cancellationView(p.id);
+          data = recordsPage(
+            result.records.map((record) => ({
+              ...record,
+              id: record.ticketId,
+            })),
+            p,
+          );
+          break;
+        }
+        case "admin_continue_cancellation": {
+          const original = await cancellationView(p.id);
+          data = {
+            status: "ORIGINAL_WORK_QUEUED",
+            originalOperationId: p.id,
+            originalOperationState: original.operationState,
+            remaining: original.remaining,
+            note: "Only never-started original approved tickets are queued. Unknown and failed refund attempts are never dispatched again. This receipt does not claim a completed cancellation or payment.",
+          };
+          // The real response is sent by the boundary only after this local
+          // request/audit/receipt transaction commits. The durable original
+          // manifest is also picked up by the existing recovery scheduler.
+          const queueOperationId = verifiedStaffOperation(req).id;
+          res.once("finish", () => {
+            (async () => {
+              const queued = await store.get(queueOperationId);
+              if (queued?.state === "completed")
+                await recoverCorporateCancellations(p.id);
+            })().catch((error) =>
+              console.error(
+                "Original event cancellation recovery failed:",
+                error,
+              ),
+            );
+          });
+          break;
+        }
+        case "admin_check_cancellation": {
+          const outcome = await checkCorporateCancellation(p.id);
+          data = {
+            ...outcome.data,
+            originalOperationId: p.id,
+            originalOperationState: outcome.operation.state,
+          };
           break;
         }
         case "admin_payouts":

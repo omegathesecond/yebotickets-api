@@ -2440,6 +2440,24 @@ export interface EventCancellationSummary {
   outcomes: TicketRefundOutcome[];
 }
 
+/** Shared owning transition: stop sales and select the existing cancellation set. */
+export const beginEventCancellation = async (
+  eventId: string,
+  requester: CheckInRequester | undefined,
+) => {
+  await assertEventAccess(eventId, requester);
+  const event = await prisma.event.update({
+    where: { id: eventId },
+    data: { isCancelled: true, cancelledAt: new Date() },
+  });
+  const tickets = await prisma.ticket.findMany({
+    where: { eventId, status: { in: ['sold', 'reserved'] } },
+    include: REFUND_INCLUDE,
+    orderBy: { id: 'asc' },
+  });
+  return { event, tickets };
+};
+
 /**
  * Cancel an EVENT: refund every sold ticket via YeboPay and mark each CANCELLED,
  * notifying each holder.
@@ -2461,22 +2479,7 @@ export const cancelEvent = async (
   requester: CheckInRequester,
 ): Promise<EventCancellationSummary> => {
   try {
-    await assertEventAccess(eventId, requester);
-
-    // Flag the event cancelled (idempotent). This is the flag purchaseTicket
-    // rejects on and getEvents filters out, so sales + public listing stop here
-    // even if some refunds below need a retry.
-    const event = await prisma.event.update({
-      where: { id: eventId },
-      data: { isCancelled: true, cancelledAt: new Date() },
-    });
-
-    // Paid sales and settled cancelled holds are refunded. Unsettled holds
-    // stay owned and referenced until their authoritative payment result arrives.
-    const tickets = await prisma.ticket.findMany({
-      where: { eventId, status: { in: ['sold', 'reserved'] } },
-      include: REFUND_INCLUDE,
-    });
+    const { event, tickets } = await beginEventCancellation(eventId, requester);
 
     const reason = `Event "${event.title}" cancelled by organizer`;
 
@@ -2703,7 +2706,7 @@ export const reconcileRefundAttempt = async (
     'The original refund remains unconfirmed. The charge stays blocked; checking its receipt sends no new payment.';
   await prisma.ticketRefundLock.updateMany({
     where: { chargeId, attemptId },
-    data: { detail, gatewayRequestId: proof.refund_request_id },
+    data: { detail, gatewayRequestId: proof.refund_request_id, lastCheckedAt: new Date() },
   });
   return {
     status: 'REVIEW_REQUIRED',

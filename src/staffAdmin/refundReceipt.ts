@@ -15,6 +15,9 @@ export async function prepareCorporateRefund<T>(
 ): Promise<T> {
   try {
     return await staffAdminScope.transaction(async () => {
+      // Lock the ticket before checking the receipt, so recovery can fence a
+      // delayed sender whose initial audit/claim never committed.
+      const target = await review(context.name, context.parameters, true);
       const receipt = await staffOperationStore.get(context.id);
       if (
         staffAdminScope.actor()?.id !== context.actor.id ||
@@ -25,7 +28,6 @@ export async function prepareCorporateRefund<T>(
         context.name !== "admin_refund_ticket"
       )
         throw fail("The reviewed corporate refund is not active");
-      const target = await review(context.name, context.parameters, true);
       if (target.version !== context.reviewedVersion)
         throw fail("Target changed since review; prepare a fresh request");
       await recordStaffOperation(context, prisma, {

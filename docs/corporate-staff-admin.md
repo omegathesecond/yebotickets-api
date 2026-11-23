@@ -82,8 +82,7 @@ history is manufactured. The receipt capability uses the existing canonical
 Financial completion and holder notifications remain separate outcomes. Immediate
 notification failures are returned explicitly; proof checks send no notice and
 financial receipts make no delivery claim. Durable notice tracking/recovery
-remains part of the outstanding delivery work. Reviewed event cancellation
-batches remain unimplemented.
+remains part of the outstanding delivery work.
 
 Admission uses the existing scanner preview, conditional Event/Ticket admission
 claim and durable operator receipt. Ticket staff select an actual ticket code and
@@ -96,6 +95,46 @@ rolls them back together. Product and verified corporate operator kinds are stor
 separately, so identical actor strings cannot take over each other's receipt.
 Existing receipts are classified as product operators by the additive migration;
 no product account is manufactured for a corporate staff member.
+
+Event cancellation freezes the exact sold/reserved set under the same Event and
+Ticket locks used by existing sale/admission transitions. The existing owning
+cancellation transition stops sales and admission. Its event flag, immutable
+manifest, saved reviewed hash and critical parent audit commit together before
+any refund. Each originally eligible ticket has a fixed child operation identity
+and exact review version; it reuses the existing single-ticket refund service,
+charge-wide lock and original proof. Existing unknown holds are adopted without
+replacement money or manufactured corporate child history.
+
+The existing startup/periodic reservation-recovery driver and authenticated
+manual recovery route now share one ticket-recovery orchestration. It resumes
+only never-started children from durable, actually approved manifests. The saved
+corporate actor and reviewed intent are verified against the immutable audit;
+no product account/session is created. Work is bounded per pass and uses the
+existing per-ticket dispatch gate. Unknown or failed attempts never get an
+automatic replacement. A changed original ticket requires a fresh exact refund
+review. Pending reservations stay owned until the existing purchase/settlement
+lifecycle supplies authoritative evidence; a newly confirmed payment can also
+use the existing exact ticket refund action.
+
+The native continuation action records a local queued request/audit/receipt
+before waking the existing worker. A queued receipt makes no completed-payment
+claim. The original manifest remains recoverable after restart. The native proof
+check never starts a refund or sends a notice. Each pass reads at most one
+original provider attempt and rotates never-checked/oldest pending holds using
+actual `lastCheckedAt` evidence, so large sets commit progress within the gateway
+timeout budget. It reconciles existing holds and
+fences delayed children whose required initial audit/claim never committed.
+Financially completed children remain committed if the aggregate write fails;
+the final parent financial audit and terminal receipt commit together on verified
+original evidence. The shared adapter then refreshes the original central CEO
+decision. Later failed-attempt history is preserved when a separately approved
+fresh ticket refund resolves the parent.
+
+Finance staff can open a named cancellation, read resolved/remaining counts and
+errors, inspect paginated ticket outcomes, and prepare any required exact refund
+from the selected record. Bulk evidence queries reuse saved original allocations;
+there is no per-row API fan-out or current-price substitution. Cancellation
+manifests and their original financial intent cannot be edited or deleted.
 
 ## Reuse inventory
 
@@ -115,10 +154,9 @@ tier's list price cannot change reported revenue. Missing, negative, invalid or
 unsafe original money fails visibly; no list-price or zero substitution is made.
 Existing product dashboards reuse the same repaired calculation.
 
-Event cancellation has external per-ticket effects. Freeze the exact reviewed
-event/ticket set, preserve child refund attempts and reconcile original proof;
-never clear an unknown parent receipt by sending a replacement batch. Reuse
-the existing refund and cancelled-payment lifecycle rather than rebuild it.
+Event cancellation reuses the existing per-ticket refund and cancelled-payment
+lifecycle. An unresolved parent remains held against its original immutable set;
+proof recovery cannot send a replacement batch.
 
 ## Durable refund cutover
 
@@ -148,14 +186,19 @@ invented gateway history. See [recovery](refund-recovery.md) and
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Forty-nine actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- Sixty-four actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
   original receipts, exact native refund/recovery, failure/timeout races,
   financial audit/receipt rollback, automatic central receipt synchronization,
   replay-safe native admission, scanner races, cancelled events, operator-kind
-  isolation and atomic admission/audit/receipt rollback.
+  isolation, atomic admission/audit/receipt rollback, immutable cancellation
+  manifests, same-charge partial outcomes, queued/concurrent original recovery,
+  pending settlement, stale queued work, original-sender fencing and aggregate
+  financial audit/receipt failure recovery, bounded fair proof progress across
+  distinct charges, and an actual blocked-Event/NOWAIT
+  Ticket probe verifying the deadlock repair.
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
@@ -174,7 +217,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
   the explicitly isolated fixture identity, not production authentication.
   Native admission review verified ticket staff preparing an exact code, CEO
   execution, the saved successful operation and reopening the same ticket as
-  used. The mobile 390px document also fit its viewport. An
+  used. The cancellation journey verified a finance request for two recorded
+  SZL50 tickets (tier999), CEO-approved pending outcome, one original proof
+  completing, queued continuation of the remaining original ticket, both refunds
+  confirmed and the original CEO decision synchronized. The mobile 390px document
+  also fit its viewport. An
   unrelated YeboShops review warning is visible because that route is absent
   from this local fixture; no successful data substitutes for it.
 - Proof migration history was replayed from scratch locally. The additional
@@ -183,6 +230,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   new refund association, replayed successfully on a fresh
   `yebotickets_refund_schema_fixture_20261123` database. The admission migration
   was also included in a fresh complete replay of `yebotickets_admin_fixture`.
+  The complete final history through proof-check progress also replayed on a fresh
+  `yebotickets_cancellation_final_schema_fixture_20261123` database.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -207,9 +256,9 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining source inventory and native workflows: event cancellation
-with its reviewed child refund set, durable cancellation-notice
-tracking/delivery recovery, purchase recovery, account workflows and configuration
+Complete the remaining source inventory and native workflows: durable
+cancellation-notice tracking/delivery recovery, purchase recovery, account
+workflows and configuration
 where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
 environment-bound approvals before claiming both environments are manageable.
@@ -228,6 +277,10 @@ critical audit and separate corporate-reviewer fields. Migration
 `20261123180000_corporate_refund_receipts` adds the immutable original association
 and unique attempt identity. Migration `20261123190000_corporate_admission`
 adds separate operator-kind attribution to existing admission receipts.
+`20261123200000_event_cancellation_manifest` preserves one immutable original
+cancellation manifest per event and extends immutable original financial intent.
+`20261123210000_refund_proof_check_progress` records actual nonterminal proof-read
+timestamps on the existing hold; historical rows are not assigned invented reads.
 Preflight duplicate attempt identities before release;
 never rewrite history to make the migration pass.
 

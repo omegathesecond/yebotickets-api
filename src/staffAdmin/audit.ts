@@ -12,6 +12,7 @@ export interface StaffOperationContext {
   targetKey: string;
   parameters: Record<string, any>;
   reviewedVersion: string;
+  parentOperationId?: string;
 }
 export function verifiedStaffOperation(req: Request): StaffOperationContext {
   const actor = staffAdminScope.actor(),
@@ -49,6 +50,9 @@ export async function recordStaffOperation(
     JSON.stringify(
       redact({
         ...context.parameters,
+        ...(context.parentOperationId
+          ? { parentOperationId: context.parentOperationId }
+          : {}),
         ...(detail ? { reviewedEffect: detail } : {}),
       }),
     ),

@@ -354,6 +354,7 @@ model TicketRefundLock {
   gatewayRequestId String?
   corporateOperationId String? @unique @db.Uuid
   detail         String?
+  lastCheckedAt  DateTime?
   createdAt      DateTime @default(now())
 }
 

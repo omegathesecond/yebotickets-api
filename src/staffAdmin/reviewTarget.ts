@@ -3,7 +3,9 @@ import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
 import { operations } from "./operations";
 import { ticketRefundTerms } from "../services/ticket-refund-terms";
+import { cancellationManifest } from "./cancellation";
 import { getCheckInDetails } from "../services/ticket.service";
+import { sumTicketRevenue } from "../services/settlement.service";
 import { CURRENCY } from "../config/platform";
 import { validateOperationInput } from "./inputs";
 const tables: Record<string, string> = {
@@ -43,6 +45,24 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (
+    ["admin_continue_cancellation", "admin_check_cancellation"].includes(name)
+  ) {
+    const manifest = await cancellationManifest(parameters.id);
+    return {
+      version: hashIntent({ name, parameters, manifest }),
+      workspace: {
+        id: manifest.operationId,
+        name: manifest.eventTitle,
+        eventId: manifest.eventId,
+        ticketCount: manifest.members.length,
+        policy:
+          name === "admin_check_cancellation"
+            ? "Read only original refund proof. Never start a refund or send a notification."
+            : "Continue only never-started tickets from the original frozen approval. Existing unknown or failed attempts are never replaced. Changed tickets require a fresh exact refund review.",
+      },
+    };
+  }
   if (name === "admin_check_refund") {
     const locks = await prisma.$queryRawUnsafe<any[]>(
       `SELECT * FROM "TicketRefundLock" WHERE "attemptId"=$1${lock ? " FOR UPDATE" : ""}`,
@@ -105,6 +125,54 @@ export async function review(
   if (!rows.length) throw fail("The product record was not found", 404);
   if (op.target.model === "user" && rows[0].role !== "organizer")
     throw fail("Choose an organiser account", 404);
+  let cancellationContext: any;
+  if (name === "admin_cancel_event") {
+    const prior = await prisma.$queryRawUnsafe<any[]>(
+      'SELECT "operationId" FROM staff_admin_event_cancellations WHERE "eventId"=$1',
+      parameters.id,
+    );
+    if (prior.length)
+      throw fail(
+        "This event already has an original cancellation. Open it to continue or check proof.",
+        409,
+      );
+    const members = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT * FROM "Ticket" WHERE "eventId"=$1 AND status IN ('sold','reserved') ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+      parameters.id,
+    );
+    const holds = await prisma.ticketRefundLock.findMany({
+      where: {
+        OR: [
+          { ticketId: { in: members.map((row) => row.id) } },
+          {
+            chargeId: {
+              in: members.map((row) => row.paymentRef).filter(Boolean),
+            },
+          },
+        ],
+      },
+      orderBy: { chargeId: "asc" },
+    });
+    const refundableMembers: Array<{ amountPaid: number | null }> = [];
+    let awaitingPayment = 0;
+    for (const member of members) {
+      if (
+        member.status === "reserved" &&
+        member.paymentStatus !== "SUCCEEDED"
+      ) {
+        awaitingPayment++;
+        continue;
+      }
+      ticketRefundTerms({ ...member, event: { isCancelled: true } });
+      refundableMembers.push(member);
+    }
+    cancellationContext = {
+      members,
+      holds,
+      recordedRefundAmount: sumTicketRevenue(refundableMembers),
+      awaitingPayment,
+    };
+  }
   let admissionContext: any;
   if (name === "admin_check_in") {
     if (rows[0].eventId !== admissionEvent.id)
@@ -162,10 +230,29 @@ export async function review(
       refundContext,
       admissionEvent,
       admissionContext,
+      cancellationContext,
     }),
     workspace: {
       id: rows[0].id,
       name: rows[0].name ?? rows[0].title ?? op.title,
+      ...(cancellationContext
+        ? {
+            ticketCount: cancellationContext.members.length,
+            recordedRefundAmount: cancellationContext.recordedRefundAmount,
+            currency: CURRENCY,
+            awaitingPayment: cancellationContext.awaitingPayment,
+            originalRefundsHeld: cancellationContext.holds.length,
+            tickets: cancellationContext.members.map((row: any) => ({
+              ticketCode: row.uniqueCode,
+              status: row.status,
+              paymentStatus: row.paymentStatus,
+              recordedAmount: row.amountPaid,
+              isCheckedIn: row.isCheckedIn,
+            })),
+            policy:
+              "Stop event sales and admission, freeze this exact ticket set and use original per-ticket refund attempts. Pending payments and existing holds stay unresolved until authoritative proof; notices are separate outcomes.",
+          }
+        : {}),
       ...(admissionContext
         ? {
             ticketCode: rows[0].uniqueCode,

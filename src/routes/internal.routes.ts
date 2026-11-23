@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { verifyInternalApiKey } from '../middleware/auth.middleware';
-import { runReclaimSweep } from '../services/reservationReclaim.service';
+import { runTicketRecoverySweep } from '../services/reservationReclaim.service';
 
 import { recoverOrderDeliveries } from '../services/ticket.service';
 
@@ -17,7 +17,8 @@ router.post('/recover-ticket-deliveries', verifyInternalApiKey, async (_req, res
  *     description: >
  *       Drives reclaimExpiredReservations() across ALL ticket types, freeing
  *       seats held by abandoned/expired PENDING reservations and reconciling any
- *       missed YeboPay settlement. Intended for a Cloud Scheduler job (~every
+ *       missed YeboPay settlement, then continuing durable CEO-approved event
+ *       cancellation work. Intended for a Cloud Scheduler job (~every
  *       5 min); the API also runs this in-process by default. Idempotent and
  *       safe to retry. Authenticated with INTERNAL_API_KEY (x-internal-key).
  *     tags: [Internal]
@@ -36,7 +37,7 @@ router.post(
   verifyInternalApiKey,
   async (_req: Request, res: Response, next: NextFunction) => {
     try {
-      const summary = await runReclaimSweep();
+      const summary = await runTicketRecoverySweep();
       res.status(200).json({ success: true, summary });
     } catch (error) {
       // A whole-sweep failure (e.g. the DB read failed) is surfaced as a 5xx so
