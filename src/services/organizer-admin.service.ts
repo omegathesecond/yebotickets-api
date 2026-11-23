@@ -19,6 +19,7 @@ export const organizerDirectorySelect = {
   email: true,
   role: true,
   isVerified: true,
+  isActive: true,
   payoutApprovalStatus: true,
   payoutApprovalReviewedByAdminId: true,
   payoutApprovalReviewedByStaff: true,
@@ -88,6 +89,35 @@ export const setOrganizerVerification = (id: string, isVerified: boolean) =>
       updatedAt: true,
     },
   });
+
+/** CEO-reviewed access state; never changes ownership, verification or finances. */
+export const setOrganizerAccess = async (id: string, isActive: boolean) => {
+  if (!staffAdminScope.actor())
+    throw new ApiError(
+      "A verified corporate actor is required to change account access",
+      401,
+    );
+  return withLockedUser({ id }, async (tx, user) => {
+    if (!user || user.role !== "organizer")
+      throw new ApiError("Choose an organiser account", 404);
+    if (user.isActive === isActive)
+      throw new ApiError("Choose a different account access state", 409);
+    return tx.user.update({
+      where: { id },
+      data: {
+        isActive,
+        authVersion: { increment: 1 },
+        otpCode: null,
+        otpExpiresAt: null,
+        otpAttempts: 0,
+        resetCodeHash: null,
+        resetCodeExpiresAt: null,
+        resetCodeAttempts: 0,
+      },
+      select: organizerDirectorySelect,
+    });
+  });
+};
 
 /** Retain business/financial identity: only an unused organiser may be removed. */
 export async function organizerDeletionEvidence(

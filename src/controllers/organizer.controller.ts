@@ -4,9 +4,10 @@ import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
-import { updateProfile, changePassword } from '../services/auth.service';
+import { updateProfile, changePassword, withLockedUser } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
+import { assertAccountActive } from '../services/auth-state';
 import { generateAuthTokens } from '../services/token.service';
 import bcrypt from 'bcryptjs';
 import { CURRENCY } from '../config/platform';
@@ -302,47 +303,26 @@ export const loginOrganizerController = async (req: Request, res: Response, next
       return;
     }
 
-    // Check password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      next(new ApiError('Invalid credentials', 401));
-      return;
-    }
-
-    // Check if user is verified
-    if (!user.isVerified) {
-      // Generate new OTP for unverified users
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          otpCode: otp,
-          otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
-        },
-      });
-      
-      res.status(401).json({
-        success: false,
-        message: 'Account not verified. A new verification code has been sent to your phone.',
-        requiresVerification: true,
-        phoneNumber: user.phoneNumber
-      });
-      return;
-    }
-
-    // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(user.id, user.role);
+    const result = await withLockedUser({ id: user.id }, async (_tx, current) => {
+      if (!current || !['organizer', 'admin'].includes(current.role) || !current.password || !(await bcrypt.compare(password, current.password)))
+        throw new ApiError('Invalid credentials', 401);
+      assertAccountActive(current);
+      if (!current.isVerified)
+        throw new ApiError('Account not verified. Request a verification code to continue.', 403);
+      return { user: current, ...generateAuthTokens(current.id, current.role, current.authVersion) };
+    });
+    const { token, refreshToken, user: signedIn } = result;
 
     res.status(200).json({
       success: true,
       message: 'Login successful',
       data: {
-        id: user.id,
-        name: user.name,
-        phoneNumber: user.phoneNumber,
-        email: user.email,
-        role: user.role,
-        organizerProfile: toOrganizerProfile(user as any),
+        id: signedIn.id,
+        name: signedIn.name,
+        phoneNumber: signedIn.phoneNumber,
+        email: signedIn.email,
+        role: signedIn.role,
+        organizerProfile: toOrganizerProfile(signedIn as any),
         token,
         refreshToken
       }

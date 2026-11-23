@@ -154,6 +154,21 @@ export const operations: Record<string, any> = {
     profileFields,
     [],
   ),
+  admin_organizer_access: change(
+    "Change organiser account access",
+    "/organizers/:id/access",
+    "organizers",
+    "user",
+    {
+      isActive: {
+        type: "boolean",
+        title: "Allow this organiser to sign in",
+        description:
+          "Changing access revokes all existing sessions and verification/reset codes. Reactivation requires a fresh sign-in. Events, tickets and money remain recorded.",
+      },
+    },
+    ["isActive"],
+  ),
   admin_organizer_deletion: read(
     "Check organiser deletion",
     "/organizers/:id/deletion",

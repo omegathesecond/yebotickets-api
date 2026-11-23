@@ -10,6 +10,7 @@ import {
   listOrganizers,
   getOrganizerAccount,
   setOrganizerVerification,
+  setOrganizerAccess,
   organizerDeletionEvidence,
   deleteOrganizer,
 } from "../services/organizer-admin.service";
@@ -208,6 +209,9 @@ export function createCorporateAdminRouter(
           break;
         case "admin_update_organizer_profile":
           data = await updateProfile(p.id, operationInput(p));
+          break;
+        case "admin_organizer_access":
+          data = await setOrganizerAccess(p.id, p.isActive);
           break;
         case "admin_organizer_deletion": {
           const evidence = await organizerDeletionEvidence(p.id);

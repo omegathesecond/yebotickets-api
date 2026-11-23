@@ -4,6 +4,7 @@ import { validateProfileInput } from '../validators/profile.validator';
 import { UserRole, toOrganizerProfile, organizerProfileMapping } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { sendOTP, sendTextMessage } from './comms.service';
+import { assertAccountActive } from './auth-state';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 import { randomInt } from 'crypto';
@@ -108,6 +109,8 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
       isNewUser = true;
     }
 
+    assertAccountActive(user);
+
     // Generate OTP
     const otp = generateOTPCode();
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -115,7 +118,7 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     // Update user with OTP. Reset the failed-attempt counter so a fresh code
     // always starts with a full allowance of verify attempts.
     await prisma.user.update({
-      where: { id: user.id },
+      where: { id: user.id, isActive: true },
       data: {
         otpCode: otp,
         otpExpiresAt,
@@ -132,6 +135,9 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     };
   } catch (error) {
     console.error('Error in requestOTP service:', error);
+    if (error instanceof ApiError) throw error;
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025')
+      throw new ApiError('Account access changed. Request a new code after signing in.', 403);
     throw new ApiError('Failed to send OTP', 500);
   }
 };
@@ -151,6 +157,8 @@ export const verifyOTP = async (
       if (!user) {
         throw new ApiError('User not found', 404);
       }
+
+      assertAccountActive(user);
 
       // Check if OTP exists and is valid
       if (!user.otpCode || !user.otpExpiresAt) {
@@ -206,7 +214,7 @@ export const verifyOTP = async (
     });
 
     // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role);
+    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role, updatedUser.authVersion);
 
     // Return user info (without sensitive data) and tokens
     const userToReturn = {
@@ -309,27 +317,16 @@ export const changePassword = async (
   currentPassword: string,
   newPassword: string
 ): Promise<{ success: true }> => {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-
-  if (!user) {
-    throw new ApiError('User not found', 404);
-  }
-  if (!user.password) {
-    throw new ApiError('No password is set for this account', 400);
-  }
-
-  const isCurrentValid = await comparePassword(currentPassword, user.password);
-  if (!isCurrentValid) {
-    throw new ApiError('Current password is incorrect', 401);
-  }
-
-  const hashed = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: userId },
-    data: { password: hashed },
+  return withLockedUser({ id: userId }, async (tx, user) => {
+    if (!user) throw new ApiError('User not found', 404);
+    assertAccountActive(user);
+    if (!user.password) throw new ApiError('No password is set for this account', 400);
+    if (!(await comparePassword(currentPassword, user.password)))
+      throw new ApiError('Current password is incorrect', 401);
+    const hashed = await hashPassword(newPassword);
+    await tx.user.update({ where: { id: userId }, data: { password: hashed } });
+    return { success: true as const };
   });
-
-  return { success: true };
 };
 
 /**
@@ -371,15 +368,22 @@ export const requestPasswordReset = async (identifier: {
     return { message: GENERIC_RESET_REQUEST_MESSAGE };
   }
 
+  assertAccountActive(user);
   const resetCode = generateOTPCode();
   const resetCodeHash = await hashPassword(resetCode);
   const resetCodeExpiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
 
-  await prisma.user.update({
-    where: { id: user.id },
-    // Reset the attempt counter alongside the fresh code.
-    data: { resetCodeHash, resetCodeExpiresAt, resetCodeAttempts: 0 },
-  });
+  try {
+    await prisma.user.update({
+      where: { id: user.id, isActive: true },
+      // Reset the attempt counter alongside the fresh code.
+      data: { resetCodeHash, resetCodeExpiresAt, resetCodeAttempts: 0 },
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025")
+      throw new ApiError("Account access changed. Request a new reset after signing in.", 403);
+    throw error;
+  }
 
   // Deliver via YeboLink to the account's registered phone. A failure here
   // throws and surfaces to the caller — we never claim success on a failed send.
@@ -408,7 +412,7 @@ export const resetPassword = async (
   const account = await findResetAccount(identifier);
   if (!account) throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
   return withLockedUser({ id: account.id }, async (tx, user) => {
-    if (!user || !['organizer', 'admin'].includes(user.role) || !user.resetCodeHash || !user.resetCodeExpiresAt) {
+    if (!user || !user.isActive || !['organizer', 'admin'].includes(user.role) || !user.resetCodeHash || !user.resetCodeExpiresAt) {
       throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
     }
     if (new Date() >= user.resetCodeExpiresAt) {

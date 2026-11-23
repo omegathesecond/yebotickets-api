@@ -63,6 +63,9 @@ model User {
   password    String?
   role        UserRole @default(user)
   isVerified  Boolean  @default(false)
+  // CEO-reviewed access changes revoke every existing session permanently.
+  isActive    Boolean  @default(true)
+  authVersion Int      @default(0)
   
   // OTP fields
   otpCode     String?

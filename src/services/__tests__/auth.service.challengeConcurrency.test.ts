@@ -49,7 +49,7 @@ beforeEach(async () => {
     otpCode: '123456', otpExpiresAt: new Date(Date.now() + 60000), otpAttempts: 0,
     resetCodeHash: await bcrypt.hash('123456', 4),
     resetCodeExpiresAt: new Date(Date.now() + 60000), resetCodeAttempts: 0,
-    password: 'old-password', isVerified: false,
+    password: 'old-password', isVerified: false, isActive: true, authVersion: 0,
   };
   const read = async () => ({ ...row });
   db.user.findUnique.mockImplementation(read);

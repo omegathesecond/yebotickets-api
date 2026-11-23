@@ -33,6 +33,7 @@ const buildUser = (over: Partial<any> = {}) => ({
   email: null,
   password: null,
   role: 'user',
+  isActive: true, authVersion: 0,
   isVerified: false,
   otpCode: '123456',
   otpExpiresAt: futureExpiry(),

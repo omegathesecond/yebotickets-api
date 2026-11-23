@@ -319,6 +319,11 @@ export async function review(
   if (!rows.length) throw fail("The product record was not found", 404);
   if (op.target.model === "user" && rows[0].role !== "organizer")
     throw fail("Choose an organiser account", 404);
+  if (
+    name === "admin_organizer_access" &&
+    rows[0].isActive === parameters.isActive
+  )
+    throw fail("Choose a different account access state", 409);
   const profileContext =
     name === "admin_update_organizer_profile"
       ? {
@@ -444,6 +449,14 @@ export async function review(
     workspace: {
       id: rows[0].id,
       name: rows[0].name ?? rows[0].title ?? op.title,
+      ...(name === "admin_organizer_access"
+        ? {
+            currentAccess: rows[0].isActive ? "Active" : "Suspended",
+            requestedAccess: parameters.isActive ? "Active" : "Suspended",
+            policy:
+              "Revoke all existing sessions and codes. Reactivation requires a fresh sign-in. Keep all events, tickets, payments and history.",
+          }
+        : {}),
       ...(profileContext
         ? {
             currentProfile: profileContext.current,

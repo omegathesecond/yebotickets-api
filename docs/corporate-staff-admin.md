@@ -301,18 +301,33 @@ account is gone. Failed audits restore the account. New references invalidate an
 approval. A real User-lock/FK-allocation probe verifies that a losing concurrent
 purchase retains available inventory and creates no charge or purchase identity.
 
-The public phone-verification endpoint rejects unsupported flags, including
-`isActive`. That field does not exist in the source model; it cannot honestly claim
-to suspend an account. Actual account suspension remains a source capability gap.
-No compatibility alias or alternative successful payload was introduced.
+Account access uses a separate CEO-reviewed operation, not the public phone-
+verification flag. The source User now has `isActive` and a monotonic `authVersion`.
+Both suspension and reactivation lock the User, increment its session version and
+clear OTP/reset challenges in the same critical audit/receipt transaction. Existing
+access and refresh tokens are revoked permanently, including after reactivation.
+Password login, OTP verification and refresh issue only the current source version;
+protected requests read current access/version from the database. Login/refresh and
+challenge issuance waiting behind a suspension cannot use their stale snapshots.
+The existing phone-verification route still rejects `isActive`, so it cannot bypass
+the separate central access decision. Unverified password login now fails honestly
+and asks for verification instead of claiming a code was sent without sending one.
+
+This is an intentional session-contract cutover: legacy tokens without explicit
+purpose/version fail and existing users must sign in again. No legacy-token or
+secret fallback was added. Missing access/refresh secrets return explicit503 through
+the normal error channel. Read-only inspection confirmed both actual dev/prod
+services already bind their separate access and refresh secrets and use
+`yebotickets-runtime@hiyebo.iam.gserviceaccount.com`; no binding/IAM was changed.
+Apply `20261124010000_organizer_account_access` via Neon DIRECT before serving code.
 
 ## Local evidence
 
-- Product build and 540 tests across 34 suites passed. The tests include workload
+- Product build and 548 tests across 35 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- 136 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- 145 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -404,6 +419,11 @@ No compatibility alias or alternative successful payload was introduced.
   fields. The deleted fixture account no longer appeared in the directory while
   its central receipt remained readable. Retained notice history showed Can
   Delete: No. The 390px profile form fit its viewport; the override was reset.
+  The access walkthrough verified staff preparation with a named Active→Suspended
+  preview, CEO execution with a completed original receipt and the actual directory
+  Active: No state. The 390px access form fit its viewport; tab and override cleaned
+  up. Initial browser approval review treated the target as a real account; actual
+  disposable localhost database/target evidence resolved it before execution.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -422,6 +442,9 @@ No compatibility alias or alternative successful payload was introduced.
   `yebotickets_notice_schema_fixture_20261123`.
   The complete history through reviewed notice retries replayed on fresh
   `yebotickets_notice_retry_schema_fixture_20261123`.
+  The complete final history through account access replayed from scratch on
+  `yebotickets_access_schema_fixture_20261123`. An upgrade from the prior notice-
+  retry schema preserved an existing synthetic organiser and assigned active/version0.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -446,10 +469,10 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining actual account-access/suspension capability and supported
-configuration. Native organiser profile editing and guarded unused-account deletion
-are implemented, with current public route validation/ownership and source history
-retention verified. The model currently has no active/suspended state.
+Complete actual supported runtime configuration. Native organiser profiles, guarded
+unused-account deletion and real source account access/suspension are implemented
+with current route validation/ownership, durable session revocation and source
+history retention verified. Authentication configuration now fails closed.
 Currency/commission currently live in environment configuration; the inspected
 source has no runtime settings API. Do not present fictional working settings.
 Notice tracking, initial recovery, explicit reviewed retries and original proof

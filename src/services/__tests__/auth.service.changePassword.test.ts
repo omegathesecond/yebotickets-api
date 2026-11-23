@@ -30,6 +30,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
   email: 'owner@example.com',
   password: await bcrypt.hash('OldPass1', 10),
   role: 'organizer',
+  isActive: true, authVersion: 0,
   isVerified: true,
   createdAt: new Date('2026-01-01T00:00:00Z'),
   updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -38,6 +39,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
 
 beforeEach(() => {
   mockReset(prismaMock);
+  prismaMock.$transaction.mockImplementation(async (fn: any) => fn(prismaMock));
 });
 
 describe('changePassword', () => {

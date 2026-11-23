@@ -77,10 +77,17 @@ export default {
       bind: { id: "id" },
       actions: [
         "admin_update_organizer_profile",
+        "admin_organizer_access",
         "admin_organizer_verification",
         "admin_organizer_payout_approval",
       ],
-      columns: ["name", "companyName", "isVerified", "payoutApprovalStatus"],
+      columns: [
+        "name",
+        "companyName",
+        "isActive",
+        "isVerified",
+        "payoutApprovalStatus",
+      ],
       related: [
         {
           id: "deletion",
