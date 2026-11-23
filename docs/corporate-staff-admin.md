@@ -279,13 +279,40 @@ migration connection before dependent code. Historical attempts are not assigned
 invented gateway history. See [recovery](refund-recovery.md) and
 [ticket refund accounting](TICKET_REFUNDS.md).
 
+## Organiser accounts
+
+The native organiser view now edits the owning service's existing nested profile:
+name/email, company description/site, social links and address. One field mapping
+serves reads and writes, including address/social-only profiles. One strict schema
+and the existing email/URL validation serve product routes, service and CEO forms.
+Empty/unknown patches and flat aliases fail visibly; optional fields support explicit
+null clearing. Phone login, credentials, roles, verification and payout controls are
+not profile fields. An email change invalidates outstanding reset codes in the same
+User transaction. Public self-service carries the authenticated owner explicitly;
+corporate requests use the verified staff context without inventing a product user.
+
+The existing product-admin deletion route and native deletion use one guarded source
+service and the existing User lock. Only an unused organiser can be removed. Actual
+event, ticket, purchase, payout/review, product-admission and cancellation-notice
+references prevent deletion and are listed in its read-only deletion check. The
+central request additionally requires the exact account name. CEO execution, deletion,
+critical audit and original receipt are atomic; replay remains readable after the
+account is gone. Failed audits restore the account. New references invalidate an
+approval. A real User-lock/FK-allocation probe verifies that a losing concurrent
+purchase retains available inventory and creates no charge or purchase identity.
+
+The public phone-verification endpoint rejects unsupported flags, including
+`isActive`. That field does not exist in the source model; it cannot honestly claim
+to suspend an account. Actual account suspension remains a source capability gap.
+No compatibility alias or alternative successful payload was introduced.
+
 ## Local evidence
 
 - Product build and 540 tests across 34 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- 124 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- 136 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -371,6 +398,12 @@ invented gateway history. See [recovery](refund-recovery.md) and
   original retry/message history. The older unknown attempt remains beside the
   new accepted/queued message. Desktop and 390px layouts passed; temporary
   viewport changes were reset. All sends stayed in the local Link fixture.
+  The account walkthrough verified scoped staff preparing selected nested profile
+  fields and an exact-name unused-account deletion; both waited for CEO review.
+  CEO execution persisted the named company, LinkedIn and Mbabane/Eswatini address
+  fields. The deleted fixture account no longer appeared in the directory while
+  its central receipt remained readable. Retained notice history showed Can
+  Delete: No. The 390px profile form fit its viewport; the override was reset.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -413,9 +446,10 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining source account workflows and configuration where supported.
-The existing organiser deletion route and role-based profile field projection
-remain to be integrated with exact corporate targets and retained financial history.
+Complete the remaining actual account-access/suspension capability and supported
+configuration. Native organiser profile editing and guarded unused-account deletion
+are implemented, with current public route validation/ownership and source history
+retention verified. The model currently has no active/suspended state.
 Currency/commission currently live in environment configuration; the inspected
 source has no runtime settings API. Do not present fictional working settings.
 Notice tracking, initial recovery, explicit reviewed retries and original proof

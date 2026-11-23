@@ -1,3 +1,10 @@
+import {
+  organizerDeletionEvidence,
+  assertOrganizerDeletion,
+} from "../services/organizer-admin.service";
+import { profileChanges } from "../services/auth.service";
+import { toOrganizerProfile } from "../interfaces/user.interface";
+import { operationInput } from "./inputs";
 import { validateParams, hashIntent } from "@omevision/product-admin-boundary";
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
@@ -269,6 +276,25 @@ export async function review(
       },
     };
   }
+  if (name === "admin_delete_organizer") {
+    const evidence = await organizerDeletionEvidence(parameters.id, lock);
+    assertOrganizerDeletion(evidence);
+    if (parameters.confirmName !== evidence.account.name)
+      throw fail(
+        "Type the organiser's full name exactly to confirm permanent deletion",
+        400,
+      );
+    return {
+      version: hashIntent({ name, parameters, evidence }),
+      workspace: {
+        id: evidence.account.id,
+        name: evidence.account.name,
+        companyName: evidence.account.companyName,
+        dependencies: evidence.dependencies,
+        policy: evidence.reason,
+      },
+    };
+  }
   const table = op.target && tables[op.target.model];
   if (!table) throw fail("This operation has no editable target");
   await validateOperationInput(name, parameters);
@@ -293,6 +319,20 @@ export async function review(
   if (!rows.length) throw fail("The product record was not found", 404);
   if (op.target.model === "user" && rows[0].role !== "organizer")
     throw fail("Choose an organiser account", 404);
+  const profileContext =
+    name === "admin_update_organizer_profile"
+      ? {
+          current: {
+            name: rows[0].name,
+            email: rows[0].email,
+            organizerProfile: toOrganizerProfile(rows[0]),
+          },
+          changes: await profileChanges(
+            rows[0].role,
+            operationInput(parameters),
+          ),
+        }
+      : undefined;
   let cancellationContext: any;
   if (name === "admin_cancel_event") {
     const prior = await prisma.$queryRawUnsafe<any[]>(
@@ -399,10 +439,19 @@ export async function review(
       admissionEvent,
       admissionContext,
       cancellationContext,
+      profileContext,
     }),
     workspace: {
       id: rows[0].id,
       name: rows[0].name ?? rows[0].title ?? op.title,
+      ...(profileContext
+        ? {
+            currentProfile: profileContext.current,
+            changedFields: profileContext.changes,
+            policy:
+              "Change only these selected organiser profile fields. Phone login, password, roles, verification and payout decisions are separate. Changing the email invalidates outstanding reset codes.",
+          }
+        : {}),
       ...(cancellationContext
         ? {
             ticketCount: cancellationContext.members.length,

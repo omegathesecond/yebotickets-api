@@ -1,6 +1,7 @@
 import type { Request } from "express";
 import type { ValidationChain } from "express-validator";
 import { assertValidRequest } from "../middleware/validate.middleware";
+import { validateProfileInput } from "../validators/profile.validator";
 import { ApiError } from "../middleware/error.middleware";
 import {
   createEventValidator,
@@ -34,6 +35,8 @@ export async function validateOperationInput(
     !Object.keys(operationInput(parameters)).length
   )
     throw new ApiError("Choose at least one field to change", 400);
+  if (name === "admin_update_organizer_profile")
+    await validateProfileInput(operationInput(parameters));
   if (validators[name]) {
     await assertValidRequest(validators[name], {
       body: operationInput(parameters),

@@ -1,4 +1,4 @@
-import {listOrganizers,setOrganizerVerification} from '../services/organizer-admin.service';
+import { listOrganizers, setOrganizerVerification, deleteOrganizer } from '../services/organizer-admin.service';
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
@@ -137,7 +137,7 @@ export const updateOrganizerProfileController = async (req: Request, res: Respon
     const updateData = req.body;
     
     // Allow additional fields for organizer profiles
-    const result = await updateProfile(userId, updateData);
+    const result = await updateProfile(userId, updateData, { id: authReq.user.id });
     
     res.status(200).json({
       success: true,
@@ -437,9 +437,7 @@ export const deleteOrganizerController = async (req: Request, res: Response, nex
   try {
     const { id } = req.params;
 
-    await prisma.user.delete({
-      where: { id, role: 'organizer' },
-    });
+    await deleteOrganizer(id, (req as AuthenticatedRequest).user);
 
     res.status(200).json({
       success: true,

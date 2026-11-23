@@ -76,11 +76,19 @@ export default {
       detail: "admin_organizer",
       bind: { id: "id" },
       actions: [
+        "admin_update_organizer_profile",
         "admin_organizer_verification",
         "admin_organizer_payout_approval",
       ],
       columns: ["name", "companyName", "isVerified", "payoutApprovalStatus"],
       related: [
+        {
+          id: "deletion",
+          label: "Account deletion check",
+          operation: "admin_organizer_deletion",
+          bind: { id: "id" },
+          actions: ["admin_delete_organizer"],
+        },
         {
           id: "statement",
           label: "Settlement statement",

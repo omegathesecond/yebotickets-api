@@ -1,18 +1,19 @@
 import { Prisma, User } from '@prisma/client';
-import prisma from '../config/prisma';
-import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
+import prisma, { staffAdminScope } from '../config/prisma';
+import { validateProfileInput } from '../validators/profile.validator';
+import { UserRole, toOrganizerProfile, organizerProfileMapping } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { sendOTP, sendTextMessage } from './comms.service';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 import { randomInt } from 'crypto';
 
-/** Serialize challenge decisions with each other and with issuance's User UPDATE.
+/** Serialize account decisions with each other and with challenge issuance's User UPDATE.
  * Read only AFTER acquiring the lock: an earlier snapshot may be superseded.
  * Auth failures are returned through the transaction so attempt/expiry writes
  * commit before the normal error channel rejects the request.
  */
-const withLockedUser = async <T>(
+export const withLockedUser = async <T>(
   where: { id: string } | { phoneNumber: string },
   decide: (tx: Prisma.TransactionClient, user: User | null) => Promise<T>
 ): Promise<T> => {
@@ -229,74 +230,70 @@ export const verifyOTP = async (
   }
 };
 
-/**
- * Update user profile information
- * @param userId User ID
- * @param updateData Data to update
- * @returns Updated user object
- */
-export const updateProfile = async (userId: string, updateData: any): Promise<any> => {
+/** Build only supported profile changes; never roles, credentials, phone or payout fields. */
+export async function profileChanges(role: string, input: Record<string, any>) {
+  await validateProfileInput(input);
+  if (input.organizerProfile && !["organizer", "admin"].includes(role))
+    throw new ApiError(
+      "Company profile fields require an organiser account",
+      403,
+    );
+  const changes: Record<string, string | null> = {};
+  for (const field of ["name", "email"])
+    if (input[field] !== undefined) changes[field] = input[field];
+  for (const [path, column] of Object.entries(organizerProfileMapping)) {
+    const value = path
+      .split(".")
+      .reduce((parent, key) => parent?.[key], input.organizerProfile);
+    if (value !== undefined) changes[column] = value;
+  }
+  if (!Object.keys(changes).length)
+    throw new ApiError("Choose at least one profile field to change", 400);
+  return changes;
+}
+export const updateProfile = async (
+  userId: string,
+  updateData: Record<string, any>,
+  requester?: { id: string },
+) => {
   try {
-    // Get the user to check their role
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
+    if (!staffAdminScope.actor() && requester?.id !== userId)
+      throw new ApiError(
+        "An authenticated owner or verified corporate actor is required to edit a profile",
+        401,
+      );
+    return await withLockedUser({ id: userId }, async (tx, user) => {
+      if (!user) throw new ApiError("User not found", 404);
+      const updates = await profileChanges(user.role, updateData);
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: {
+          ...updates,
+          ...("email" in updates && updates.email !== user.email
+            ? {
+                resetCodeHash: null,
+                resetCodeExpiresAt: null,
+                resetCodeAttempts: 0,
+              }
+            : {}),
+        },
+      });
+      return {
+        id: updated.id,
+        name: updated.name,
+        phoneNumber: updated.phoneNumber,
+        email: updated.email,
+        role: updated.role,
+        isVerified: updated.isVerified,
+        organizerProfile: toOrganizerProfile(updated as any),
+      };
     });
-    
-    if (!user) {
-      throw new ApiError('User not found', 404);
-    }
-    
-    // Build update object
-    const updates: any = {};
-    
-    // Basic fields allowed for all users
-    if (updateData.name) updates.name = updateData.name;
-    if (updateData.email) updates.email = updateData.email;
-    
-    // If user is an organizer or admin, allow organizer-specific fields
-    if (user.role === 'organizer' || user.role === 'admin') {
-      if (updateData.organizerProfile) {
-        const profile = updateData.organizerProfile;
-        if (profile.companyName !== undefined) updates.companyName = profile.companyName;
-        if (profile.description !== undefined) updates.companyDescription = profile.description;
-        if (profile.website !== undefined) updates.website = profile.website;
-        
-        if (profile.socialMedia) {
-          if (profile.socialMedia.facebook !== undefined) updates.socialFacebook = profile.socialMedia.facebook;
-          if (profile.socialMedia.twitter !== undefined) updates.socialTwitter = profile.socialMedia.twitter;
-          if (profile.socialMedia.instagram !== undefined) updates.socialInstagram = profile.socialMedia.instagram;
-          if (profile.socialMedia.linkedin !== undefined) updates.socialLinkedin = profile.socialMedia.linkedin;
-        }
-        
-        if (profile.address) {
-          if (profile.address.street !== undefined) updates.addressStreet = profile.address.street;
-          if (profile.address.city !== undefined) updates.addressCity = profile.address.city;
-          if (profile.address.state !== undefined) updates.addressState = profile.address.state;
-          if (profile.address.zipCode !== undefined) updates.addressZipCode = profile.address.zipCode;
-          if (profile.address.country !== undefined) updates.addressCountry = profile.address.country;
-        }
-      }
-    }
-
-    // Update user
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: updates,
-    });
-
-    return {
-      id: updatedUser.id,
-      name: updatedUser.name,
-      phoneNumber: updatedUser.phoneNumber,
-      email: updatedUser.email,
-      role: updatedUser.role,
-      isVerified: updatedUser.isVerified,
-      organizerProfile: toOrganizerProfile(updatedUser as any),
-    };
-  } catch (error) {
-    console.error('Error in updateProfile service:', error);
+  } catch (error: any) {
+    if (error.code === "P2002")
+      throw new ApiError("That email address belongs to another account", 409);
     if (error instanceof ApiError) throw error;
-    throw new ApiError('Failed to update profile', 500);
+    console.error("Error in updateProfile service:", error);
+    throw new ApiError("Failed to update profile", 500);
   }
 };
 

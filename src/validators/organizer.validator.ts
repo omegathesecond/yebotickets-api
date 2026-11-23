@@ -62,90 +62,6 @@ export const organizerSignupValidator = [
     .withMessage('Description must be between 10 and 1000 characters'),
 ];
 
-export const organizerProfileValidator = [
-  body('name')
-    .optional()
-    .isString()
-    .withMessage('Name must be a string')
-    .isLength({ min: 2, max: 100 })
-    .withMessage('Name must be between 2 and 100 characters'),
-  
-  body('email')
-    .optional()
-    .isEmail()
-    .withMessage('Please provide a valid email address'),
-  
-  // Organizer-specific fields
-  body('companyName')
-    .optional()
-    .isString()
-    .withMessage('Company name must be a string')
-    .isLength({ min: 2, max: 100 })
-    .withMessage('Company name must be between 2 and 100 characters'),
-  
-  body('description')
-    .optional()
-    .isString()
-    .withMessage('Description must be a string')
-    .isLength({ min: 10, max: 1000 })
-    .withMessage('Description must be between 10 and 1000 characters'),
-  
-  body('website')
-    .optional()
-    .isURL()
-    .withMessage('Please provide a valid website URL'),
-  
-  body('socialMedia')
-    .optional()
-    .isObject()
-    .withMessage('Social media must be an object'),
-  
-  body('socialMedia.facebook')
-    .optional()
-    .isURL()
-    .withMessage('Please provide a valid Facebook URL'),
-  
-  body('socialMedia.twitter')
-    .optional()
-    .isURL()
-    .withMessage('Please provide a valid Twitter URL'),
-  
-  body('socialMedia.instagram')
-    .optional()
-    .isURL()
-    .withMessage('Please provide a valid Instagram URL'),
-  
-  body('address')
-    .optional()
-    .isObject()
-    .withMessage('Address must be an object'),
-  
-  body('address.street')
-    .optional()
-    .isString()
-    .withMessage('Street must be a string'),
-  
-  body('address.city')
-    .optional()
-    .isString()
-    .withMessage('City must be a string'),
-  
-  body('address.state')
-    .optional()
-    .isString()
-    .withMessage('State must be a string'),
-  
-  body('address.zipCode')
-    .optional()
-    .isString()
-    .withMessage('Zip code must be a string'),
-  
-  body('address.country')
-    .optional()
-    .isString()
-    .withMessage('Country must be a string'),
-];
-
 export const organizerLoginValidator: ValidationChain[] = [
   body().custom((value, { req }) => {
     if (!req.body.phoneNumber && !req.body.email) {
@@ -173,14 +89,12 @@ export const organizerLoginValidator: ValidationChain[] = [
     .withMessage('Password is required'),
 ];
 
+// isVerified records phone verification; the owning model has no isActive field.
+// Reject unsupported flags instead of silently claiming to suspend an account.
 export const organizerStatusValidator: ValidationChain[] = [
-  body('isVerified')
-    .optional()
-    .isBoolean()
-    .withMessage('isVerified must be a boolean'),
-  
-  body('isActive')
-    .optional()
-    .isBoolean()
-    .withMessage('isActive must be a boolean'),
-]; 
+  body().custom(value => {
+    if (!value || typeof value !== 'object' || Object.keys(value).some(key => key !== 'isVerified')) throw new Error('Only the phone verification flag is supported by this endpoint');
+    return true;
+  }),
+  body('isVerified').isBoolean().withMessage('Choose a phone verification flag'),
+];

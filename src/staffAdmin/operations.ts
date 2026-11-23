@@ -1,3 +1,4 @@
+import { profileFields } from "../validators/profile.validator";
 import { TicketType } from "../interfaces/ticket.interface";
 const id = {
   type: "string",
@@ -145,6 +146,37 @@ export const operations: Record<string, any> = {
     { search, ...pagination },
     paged,
   ),
+  admin_update_organizer_profile: change(
+    "Edit organiser profile",
+    "/organizers/:id/profile",
+    "organizers",
+    "user",
+    profileFields,
+    [],
+  ),
+  admin_organizer_deletion: read(
+    "Check organiser deletion",
+    "/organizers/:id/deletion",
+    "organizers",
+    { id },
+  ),
+  admin_delete_organizer: {
+    ...change(
+      "Delete an unused organiser account",
+      "/organizers/:id",
+      "organizers",
+      "user",
+      {
+        confirmName: {
+          type: "string",
+          title: "Type the organiser's full name to confirm permanent deletion",
+          minLength: 1,
+        },
+      },
+      ["confirmName"],
+    ),
+    method: "DELETE",
+  },
   admin_organizer_verification: change(
     "Set phone verification flag",
     "/organizers/:id/verification",

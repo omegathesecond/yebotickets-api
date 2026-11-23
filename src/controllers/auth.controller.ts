@@ -87,7 +87,7 @@ export const updateProfileController = async (req: Request, res: Response, next:
     const userId = authReq.user.id;
     const updateData = req.body;
     
-    const result = await updateProfile(userId, updateData);
+    const result = await updateProfile(userId, updateData, { id: authReq.user.id });
     
     res.status(200).json({
       success: true,

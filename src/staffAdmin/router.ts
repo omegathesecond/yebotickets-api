@@ -10,6 +10,8 @@ import {
   listOrganizers,
   getOrganizerAccount,
   setOrganizerVerification,
+  organizerDeletionEvidence,
+  deleteOrganizer,
 } from "../services/organizer-admin.service";
 import {
   getEvents,
@@ -24,6 +26,7 @@ import {
   getEventTickets,
   getEventPurchases,
 } from "../services/organizer-event.service";
+import { updateProfile } from "../services/auth.service";
 import * as payouts from "../services/payout.service";
 import {
   listRefundRecovery,
@@ -202,6 +205,23 @@ export function createCorporateAdminRouter(
           break;
         case "admin_organizer":
           data = await getOrganizerAccount(p.id);
+          break;
+        case "admin_update_organizer_profile":
+          data = await updateProfile(p.id, operationInput(p));
+          break;
+        case "admin_organizer_deletion": {
+          const evidence = await organizerDeletionEvidence(p.id);
+          data = {
+            id: p.id,
+            name: evidence.account.name,
+            canDelete: evidence.canDelete,
+            dependencies: evidence.dependencies,
+            reason: evidence.reason,
+          };
+          break;
+        }
+        case "admin_delete_organizer":
+          data = await deleteOrganizer(p.id);
           break;
         case "admin_organizer_verification":
           data = await setOrganizerVerification(p.id, p.isVerified);

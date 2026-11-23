@@ -1,3 +1,4 @@
+import { profileValidator } from '../validators/profile.validator';
 import express from 'express';
 import {
   requestOTPController,
@@ -11,7 +12,6 @@ import {
 import {
   requestOTPValidator,
   verifyOTPValidator,
-  updateProfileValidator,
   refreshTokenValidator,
   requestPasswordResetValidator,
   resetPasswordValidator
@@ -75,6 +75,6 @@ router.post(
 // present, protect + organizer/admin authorize) which is what the scanner
 // calls — no duplicate is added here.
 router.get('/me', protect, getCurrentUserController);
-router.put('/profile', protect, validate(updateProfileValidator), updateProfileController);
+router.put('/profile', protect, validate(profileValidator), updateProfileController);
 
 export default router; 
