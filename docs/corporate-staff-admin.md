@@ -103,9 +103,23 @@ reused seats. Contradictory payment evidence fails visibly.
 
 Ticket staff can browse existing delivery work and its original attempt/status
 inside the same workspace. Detail reads preserve the actual source ID, including
-its colon, through a validated query field. Recorded acceptance is not customer
-receipt. This batch adds visibility only; explicit retry, provider receipt and
-durable cancellation-notice tracking remain outstanding.
+its colon, through a validated query field. New WhatsApp/email attempts preserve
+their original recipient, channel and dispatch identity before any send, with
+separate immutable acknowledgement history. That history survives failure of the
+mutable order result. A lost gateway acknowledgement or failed acknowledgement
+write stays unknown and never silently chooses another channel or resends.
+Definite rejection can use the existing email path, preserving both attempts.
+
+The Tickets client now reads YeboLink's canonical `message_id` send response;
+the former `id` expectation rejected real successful acknowledgements. No
+alternate response alias is accepted. The original workspace-scoped YeboLink
+GET receipt is available through exact central CEO review. It verifies message,
+recipient, channel and recorded intent, preserves accepted/queued separately
+from gateway delivered/read, and rejects conflicting or regressive evidence.
+Critical local audit and receipt progress commit together. Reads dispatch no
+message. Historical or interrupted sends without a saved message identity get
+no invented receipt. Existing permitted buyer retries append history; native
+CEO-reviewed retry and durable cancellation-notice tracking remain outstanding.
 
 Admission uses the existing scanner preview, conditional Event/Ticket admission
 claim and durable operator receipt. Ticket staff select an actual ticket code and
@@ -205,11 +219,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
 
 ## Local evidence
 
-- Product build and 537 tests across 34 suites passed. The tests include workload
+- Product build and 540 tests across 34 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Seventy-six actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- Eighty-four actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -226,6 +240,14 @@ invented gateway history. See [recovery](refund-recovery.md) and
   payment-read outages, concurrent continuation, initial/final audit failures,
   cancelled settlement, original refund proof, failed/reused seats and
   contradictory payment evidence.
+  The delivery additions use the actual YeboLink send/receipt route modules,
+  validators, scopes and rate-limit middleware with injected localhost fixture
+  identity and message storage/send. They verify canonical acknowledgement,
+  original identity/intent, scope/outage failures, immutable history, no
+  automatic duplicate after lost acknowledgement or database failure, stronger
+  receipt preservation and critical audit rollback. This route-contract fixture
+  does not establish live credentials, provider delivery or the full YeboLink
+  credit/queue lifecycle.
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
@@ -255,6 +277,10 @@ invented gateway history. See [recovery](refund-recovery.md) and
   recovery, CEO execution, persisted issued status and one original delivery
   attempt. The 390px delivery-detail document fit the viewport. All payments
   and communications remained simulated on named localhost databases.
+  The message-receipt journey verified ticket staff selecting original message
+  history, preparing a receipt-only central request, CEO approval and a saved
+  result with distinct original queued and later read/delivered evidence. The
+  390px document fit the viewport. No message was resent by receipt checks.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -265,6 +291,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   `yebotickets_cancellation_final_schema_fixture_20261123` database.
   The complete history through purchase intent also replayed on a fresh
   `yebotickets_purchase_schema_fixture_20261123` database.
+  The history through delivery-message receipts also replayed from scratch on
+  `yebotickets_delivery_schema_fixture_20261123`.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -290,7 +318,7 @@ existing organiser business service, not an invented corporate admin identity.
 ## Remaining before whole-product acceptance
 
 Complete the remaining source inventory and native workflows: durable
-cancellation-notice tracking, delivery receipt/retry recovery, account
+cancellation-notice tracking, native CEO-reviewed delivery retry, account
 workflows and configuration
 where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
@@ -316,6 +344,10 @@ cancellation manifest per event and extends immutable original financial intent.
 timestamps on the existing hold; historical rows are not assigned invented reads.
 `20261123220000_purchase_recovery_intent` extends immutable original financial
 intent to the existing purchase-recovery audit.
+`20261123230000_delivery_message_receipts` adds immutable message-attempt history
+without manufacturing identities for past sends. Receipt reads require the
+existing product's YeboLink API key to have `read_messages`; verify actual
+production scopes before release. This change provisions no credential or scope.
 Preflight duplicate attempt identities before release;
 never rewrite history to make the migration pass.
 

@@ -4,7 +4,7 @@ jest.mock('../../config/prisma', () => ({ __esModule: true,
   staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../yebopay.service', () => ({ createCharge: jest.fn(), getCharge: jest.fn(), YeboPayHttpError: class extends Error {} }));
 jest.mock('../qr.service', () => ({ buildTicketQrPayload: jest.fn(() => ({})), generateTicketQrDataUrl: jest.fn(async () => 'QR') }));
-jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(async () => ({})), sendEmailMessage: jest.fn() }));
+jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(async () => ({ messageId: '550e8400-e29b-41d4-a716-446655440000', status: 'queued' })), sendEmailMessage: jest.fn() }));
 import prisma from '../../config/prisma';
 import { purchaseTicket, recoverPurchaseAttempt, handleChargeWebhookEvent, reclaimExpiredReservations } from '../ticket.service';
 import { createCharge, getCharge } from '../yebopay.service';

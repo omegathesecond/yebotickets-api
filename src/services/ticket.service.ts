@@ -7,6 +7,8 @@ import { prepareCorporateRefund, finishCorporateRefund, failCorporateRefund } fr
 import { ticketRefundTerms } from './ticket-refund-terms';
 import { sumTicketRevenue } from './settlement.service';
 import { lockPurchaseIdentity } from '../utils/purchaseIdentity';
+import { sendDeliveryMessage } from './delivery-message.service';
+import { formatPhone } from '../utils/phone';
 import { 
   ITicket, 
   ITicketType, 
@@ -601,8 +603,12 @@ const buildOrderEmailHtml = async (tickets: any[]): Promise<string> => {
  * paid purchase is never rolled back over a comms hiccup, but the failure is
  * surfaced, not swallowed.
  */
-const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult> => {
+const deliverOrderToBuyer = async (tickets: any[], dispatchAttemptId: string): Promise<TicketDeliveryResult> => {
   const first = tickets[0];
+  if (!first?.userId || !first.deliveryOrderId || tickets.some(ticket =>
+    ticket.userId !== first.userId || ticket.eventId !== first.eventId || ticket.deliveryOrderId !== first.deliveryOrderId))
+    throw new ApiError('The original delivery does not have one verified order, buyer and event', 409);
+  tickets.forEach(ticketRefundTerms);
   const phoneNumber = first.user?.phoneNumber;
   const email = first.user?.email;
   const text = buildOrderMessage(tickets);
@@ -611,7 +617,8 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
   // Primary channel: WhatsApp via YeboLink.
   if (phoneNumber) {
     try {
-      await sendTextMessage(phoneNumber, text);
+      await sendDeliveryMessage(first.deliveryOrderId, dispatchAttemptId, 'whatsapp', formatPhone(phoneNumber),
+        metadata => sendTextMessage(phoneNumber, text, metadata));
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via WhatsApp:', error);
@@ -628,14 +635,15 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
   if (email) {
     try {
       const html = await buildOrderEmailHtml(tickets);
-      await sendEmailMessage(
+      await sendDeliveryMessage(first.deliveryOrderId, dispatchAttemptId, 'email', email, metadata => sendEmailMessage(
         email,
         tickets.length > 1
           ? `Your ${tickets.length} tickets for ${first.event?.title ?? 'your event'}`
           : `Your ticket for ${first.event?.title ?? 'your event'}`,
         html,
-        text
-      );
+        text,
+        metadata
+      ));
       return { channel: 'email', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via email:', error);
@@ -916,7 +924,7 @@ export const dispatchOrderDelivery = async (id: string, manual = false, acknowle
       if (events[0].isCancelled || !eligible.length) {
         return { status: 'suppressed', error: 'Order cancelled or refunded. No admission message sent.' };
       }
-      return deliverOrderToBuyer(eligible);
+      return deliverOrderToBuyer(eligible, attemptId);
     }, { timeout: 60_000 });
   } catch (error) {
     console.error('Order delivery outcome unconfirmed:', id, error);

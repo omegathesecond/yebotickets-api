@@ -556,7 +556,32 @@ export const operations: Record<string, any> = {
     "/ticket-delivery",
     "tickets",
     { id: { type: "string", minLength: 1, maxLength: 512 } },
+    { required: ["id"] },
   ),
+  admin_delivery_messages: read(
+    "Original delivery attempts",
+    "/ticket-delivery/messages",
+    "tickets",
+    { id: { type: "string", minLength: 1, maxLength: 512 }, ...pagination },
+    { ...paged, required: ["id"] },
+  ),
+  admin_delivery_message: read(
+    "Original message receipt",
+    "/ticket-delivery-messages/:id",
+    "tickets",
+    { id },
+  ),
+  admin_check_delivery_message: {
+    ...change(
+      "Check original message receipt",
+      "/ticket-delivery-messages/:id/check",
+      "tickets",
+      "deliveryMessage",
+      {},
+      [],
+    ),
+    method: "POST",
+  },
   admin_activity: read(
     "Corporate activity",
     "/activity",

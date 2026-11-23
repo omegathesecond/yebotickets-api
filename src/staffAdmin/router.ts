@@ -52,7 +52,13 @@ import {
   checkCorporatePurchase,
   resumeCorporatePurchase,
 } from "./purchaseRecovery";
-import { listDeliveryRecords, deliveryRecord } from "./deliveryRecords";
+import {
+  listDeliveryRecords,
+  deliveryRecord,
+  listDeliveryMessages,
+  deliveryMessageRecord,
+} from "./deliveryRecords";
+import { checkDeliveryMessage } from "../services/delivery-message.service";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
@@ -666,6 +672,15 @@ export function createCorporateAdminRouter(
           break;
         case "admin_delivery":
           data = await deliveryRecord(p.id);
+          break;
+        case "admin_delivery_messages":
+          data = await listDeliveryMessages(p);
+          break;
+        case "admin_delivery_message":
+          data = await deliveryMessageRecord(p.id);
+          break;
+        case "admin_check_delivery_message":
+          data = await checkDeliveryMessage(p.id);
           break;
         case "admin_operation_receipt":
           data = await store.get(p.operationId);

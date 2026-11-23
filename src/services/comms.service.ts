@@ -9,17 +9,18 @@
  * paid purchase) catch and surface the error rather than swallowing it.
  */
 
-import { YeboLinkClient, YeboLinkMessageResult } from './yebolink.client';
-
-/** Strip anything that isn't a digit or a leading "+" so YeboLink gets E.164. */
-const formatPhone = (phoneNumber: string): string => phoneNumber.replace(/[^\d+]/g, '');
+import { YeboLinkClient, YeboLinkMessageResult } from "./yebolink.client";
+import { formatPhone } from '../utils/phone';
 
 /**
  * Send a one-time passcode to the user over WhatsApp via YeboLink.
  * @param phoneNumber Recipient phone number (with country code)
  * @param otp The 6-digit code
  */
-export const sendOTP = async (phoneNumber: string, otp: string): Promise<YeboLinkMessageResult> =>
+export const sendOTP = async (
+  phoneNumber: string,
+  otp: string,
+): Promise<YeboLinkMessageResult> =>
   YeboLinkClient.sendWhatsApp({
     to: formatPhone(phoneNumber),
     text: `Your YeboTickets verification code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
@@ -32,9 +33,14 @@ export const sendOTP = async (phoneNumber: string, otp: string): Promise<YeboLin
  */
 export const sendTextMessage = async (
   phoneNumber: string,
-  messageText: string
+  messageText: string,
+  metadata?: Record<string, string>,
 ): Promise<YeboLinkMessageResult> =>
-  YeboLinkClient.sendWhatsApp({ to: formatPhone(phoneNumber), text: messageText });
+  YeboLinkClient.sendWhatsApp({
+    to: formatPhone(phoneNumber),
+    text: messageText,
+    metadata,
+  });
 
 /**
  * Send an email to the user via YeboLink. Used as a fallback delivery channel
@@ -48,6 +54,7 @@ export const sendEmailMessage = async (
   to: string,
   subject: string,
   html: string,
-  text?: string
+  text?: string,
+  metadata?: Record<string, string>,
 ): Promise<YeboLinkMessageResult> =>
-  YeboLinkClient.sendEmail({ to, subject, html, text });
+  YeboLinkClient.sendEmail({ to, subject, html, text, metadata });

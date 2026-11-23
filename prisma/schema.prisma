@@ -376,6 +376,32 @@ model TicketOrderDelivery {
   @@index([status, nextAttemptAt])
 }
 
+// Historical outbound attempts are independent of mutable ticket/work rows.
+// Persist before dispatch; never invent message IDs for old or interrupted sends.
+model TicketDeliveryMessage {
+  id String @id @default(uuid())
+  deliveryOrderId String
+  dispatchAttemptId String
+  channel String
+  recipient String
+  state String @default("dispatching")
+  messageId String? @unique
+  acceptanceStatus String?
+  gatewayStatus String?
+  gatewayError String?
+  providerMessageId String?
+  gatewaySentAt DateTime?
+  gatewayDeliveredAt DateTime?
+  gatewayReadAt DateTime?
+  gatewayFailedAt DateTime?
+  error String?
+  checkedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([dispatchAttemptId, channel])
+  @@index([deliveryOrderId, createdAt])
+}
+
 // Immutable admission receipt. Deliberately retained independently of mutable
 // ticket/user rows so an operation key can never be reassigned after deletion.
 model TicketAdmissionReceipt {

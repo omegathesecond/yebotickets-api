@@ -28,8 +28,8 @@ jest.mock('../qr.service', () => ({
 }));
 
 jest.mock('../comms.service', () => ({
-  sendTextMessage: jest.fn(async () => ({ ok: true })),
-  sendEmailMessage: jest.fn(async () => ({ ok: true })),
+  sendTextMessage: jest.fn(async () => ({ messageId: crypto.randomUUID(), status: 'queued' })),
+  sendEmailMessage: jest.fn(async () => ({ messageId: crypto.randomUUID(), status: 'queued' })),
 }));
 
 // Mock the YeboPay client so the purchase flow never hits the gateway. The
@@ -157,9 +157,9 @@ beforeEach(() => {
   // override this.
   prismaMock.ticket.count.mockResolvedValue(0 as any);
   sendTextMessageMock.mockReset();
-  sendTextMessageMock.mockResolvedValue({ ok: true } as any);
+  sendTextMessageMock.mockImplementation(async () => ({ messageId: crypto.randomUUID(), status: 'queued' }));
   sendEmailMessageMock.mockReset();
-  sendEmailMessageMock.mockResolvedValue({ ok: true } as any);
+  sendEmailMessageMock.mockImplementation(async () => ({ messageId: crypto.randomUUID(), status: 'queued' }));
   createChargeMock.mockReset();
   getChargeMock.mockReset();
   getChargeMock.mockResolvedValue(buildCharge());
@@ -208,7 +208,7 @@ const buildAvailableTicket = (over: Partial<any> = {}) => ({
 // A ticket as returned by prisma.ticket.findUnique with PURCHASE_INCLUDE
 // relations (after a claim/reserve/finalize).
 const buildTicketWithRelations = (over: Partial<any> = {}) => ({
-  ...buildAvailableTicket({ userId: 'user-1', status: 'sold', purchaseDate: new Date() }),
+  ...buildAvailableTicket({ userId: 'user-1', status: 'sold', purchaseDate: new Date(), amountPaid: 100 }),
   event: {
     id: 'event-1',
     title: 'Test Fest',

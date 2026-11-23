@@ -1,5 +1,6 @@
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
+import { deliveryMessageView } from "../services/delivery-message.service";
 const ticketSelect = {
   id: true,
   uniqueCode: true,
@@ -53,4 +54,24 @@ export async function deliveryRecord(id: string) {
     })),
     note: "Sent is the source's recorded message-acceptance state. It does not prove customer receipt. Unknown delivery may already have sent a message; it is never automatically resent.",
   };
+}
+
+export async function listDeliveryMessages(p: Record<string, any>) {
+  const where = { deliveryOrderId: p.id };
+  const [rows, total] = await Promise.all([
+    prisma.ticketDeliveryMessage.findMany({
+      where,
+      orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      skip: ((p.page ?? 1) - 1) * (p.limit ?? 20),
+      take: p.limit ?? 20,
+    }),
+    prisma.ticketDeliveryMessage.count({ where }),
+  ]);
+  return { records: rows.map(deliveryMessageView), total };
+}
+export async function deliveryMessageRecord(id: string) {
+  const row = await prisma.ticketDeliveryMessage.findUnique({ where: { id } });
+  if (!row)
+    throw new ApiError("Original ticket delivery attempt was not found", 404);
+  return deliveryMessageView(row);
 }

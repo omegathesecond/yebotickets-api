@@ -226,6 +226,28 @@ export default {
       total: "total",
       detail: "admin_delivery",
       bind: { id: "id" },
+      related: [
+        {
+          id: "deliveryMessages",
+          label: "Original message attempts",
+          operation: "admin_delivery_messages",
+          collection: "records",
+          total: "total",
+          bind: { id: "id" },
+          detail: "admin_delivery_message",
+          actions: ["admin_check_delivery_message"],
+          columns: [
+            "channel",
+            "state",
+            "acceptanceStatus",
+            "gatewayStatus",
+            "error",
+            "gatewayError",
+            "checkedAt",
+            "createdAt",
+          ],
+        },
+      ],
       columns: [
         "eventNames",
         "buyerNames",

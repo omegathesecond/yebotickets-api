@@ -14,6 +14,7 @@ import {
 import { sumTicketRevenue } from "../services/settlement.service";
 import { CURRENCY } from "../config/platform";
 import { validateOperationInput } from "./inputs";
+import { deliveryMessageView } from "../services/delivery-message.service";
 const tables: Record<string, string> = {
   user: "User",
   event: "Event",
@@ -51,6 +52,28 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (name === "admin_check_delivery_message") {
+    if (lock)
+      await prisma.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${parameters.id} FOR UPDATE`;
+    const message = await prisma.ticketDeliveryMessage.findUnique({
+      where: { id: parameters.id },
+    });
+    if (!message) throw fail("Original message attempt was not found", 404);
+    if (!message.messageId)
+      throw fail(
+        "This attempt has no confirmed message identity. Do not assume it was not sent.",
+        409,
+      );
+    return {
+      version: hashIntent({ name, parameters, message }),
+      workspace: {
+        name: "Original ticket message",
+        ...deliveryMessageView(message),
+        policy:
+          "Read only the exact original YeboLink receipt. No message, retry or channel change is sent.",
+      },
+    };
+  }
   if (name === "admin_recover_purchase") {
     const evidence = await purchaseEvidence(parameters.id, lock);
     const source = purchaseView(evidence);
