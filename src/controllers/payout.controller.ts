@@ -89,7 +89,7 @@ export const updatePayoutRequestController = async (req: Request, res: Response,
       next(new ApiError('Payout request id is required', 400));
       return;
     }
-    const data = await payoutService.updatePayoutRequestStatus(id, status, authReq.user.id, { adminNote, reference });
+    const data = await payoutService.updatePayoutRequestStatus(id, status, {productAdminId:authReq.user.id}, { adminNote, reference });
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);
@@ -107,7 +107,7 @@ export const updateOrganizerPayoutApprovalController = async (req: Request, res:
     const authReq = req as AuthenticatedRequest;
     const { id } = req.params;
     const { payoutApprovalStatus } = req.body;
-    const data = await payoutService.setPayoutApprovalStatus(id, payoutApprovalStatus, authReq.user.id);
+    const data = await payoutService.setPayoutApprovalStatus(id, payoutApprovalStatus, {productAdminId:authReq.user.id});
     res.status(200).json({ success: true, data });
   } catch (error) {
     next(error);

@@ -1,4 +1,5 @@
 import prisma from '../config/prisma';
+import { Prisma } from '@prisma/client';
 import { CURRENCY, getPlatformFeePercent, roundMoney } from '../config/platform';
 
 /**
@@ -41,15 +42,23 @@ const SETTLEABLE_TICKET_STATUSES = ['sold', 'cancelled'] as const;
 /** Payout statuses that have consumed balance but not yet settled. */
 export const RESERVED_PAYOUT_STATUSES = ['pending', 'approved'] as const;
 
-/** Money a single ticket actually moved: what YeboPay charged (`amountPaid`)
- *  when present, else the ticket type's list price for legacy rows written
- *  before charges were persisted. Mirrors organizer-event.service.ts's
- *  ticketRevenue so every money figure on the dashboard is derived the same
- *  way — never re-derived from list price when a real charge exists. */
+/** Recorded paid allocation only. Missing history must be reconciled, never priced from today's catalogue. */
 export const ticketRevenue = (t: {
-  amountPaid?: number | null;
-  ticketType?: { price: number } | null;
-}): number => t.amountPaid ?? t.ticketType?.price ?? 0;
+  amountPaid: number | null;
+}): number => {
+  if (typeof t.amountPaid !== 'number' || !Number.isFinite(t.amountPaid))
+    throw new Error('Recorded ticket payment amount is missing; reconcile the original payment before calculating money totals');
+  const amount = new Prisma.Decimal(t.amountPaid);
+  if (amount.isNegative() || amount.decimalPlaces() > 2 || amount.mul(100).gt(Number.MAX_SAFE_INTEGER))
+    throw new Error('Recorded ticket payment amount is invalid for the original currency');
+  return t.amountPaid;
+};
+
+export const sumTicketRevenue = (tickets: {amountPaid:number|null}[]): number => {
+  const total=tickets.reduce((sum,ticket)=>sum.add(ticketRevenue(ticket)),new Prisma.Decimal(0));
+  if(total.mul(100).gt(Number.MAX_SAFE_INTEGER))throw new Error('Recorded payment total exceeds the supported exact-money range');
+  return total.toNumber();
+};
 
 export interface EventSettlementLine {
   eventId: string;

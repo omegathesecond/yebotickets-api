@@ -20,6 +20,7 @@ import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
 import prisma from './config/prisma';
+import { createCorporateAdminRouter } from './staffAdmin/router';
 
 // Load environment variables
 dotenv.config();
@@ -46,6 +47,7 @@ app.use('/api/payments', paymentRoutes);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use('/staff-admin',createCorporateAdminRouter());
 
 // Routes
 //add swagger ui

@@ -125,6 +125,7 @@ model User {
   // payout.service.ts#setPayoutApprovalStatus from the authenticated admin's
   // id; never written by anything else.
   payoutApprovalReviewedByAdminId String?
+  payoutApprovalReviewedByStaff String?
   payoutApprovalReviewedBy        User?     @relation("PayoutApprovalReviewedBy", fields: [payoutApprovalReviewedByAdminId], references: [id])
   payoutApprovalReviewedAt        DateTime?
 
@@ -187,6 +188,7 @@ model PayoutRequest {
   // real money. Set by every branch of payout.service.ts#updatePayoutRequestStatus
   // from the authenticated admin's id; never written by anything else.
   reviewedByAdminId String?
+  reviewedByStaff String?
   reviewedByAdmin   User?    @relation("PayoutRequestReviewedByAdmin", fields: [reviewedByAdminId], references: [id])
   reviewedAt        DateTime?
 

@@ -11,6 +11,7 @@ import type { PrismaClient } from '@prisma/client';
 // regress. Asserting only the forwarded query would miss the latter.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

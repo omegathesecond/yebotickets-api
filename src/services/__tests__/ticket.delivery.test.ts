@@ -1,6 +1,7 @@
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(), sendEmailMessage: jest.fn() }));
 jest.mock('../qr.service', () => ({ buildTicketQrPayload: jest.fn(), generateTicketQrDataUrl: jest.fn() }));
 import prisma from '../../config/prisma';

@@ -5,11 +5,12 @@ import type { PrismaClient } from '@prisma/client';
 // can be exercised against hand-built ticket/event rows without a database.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 
 import prisma from '../../config/prisma';
-import { getOrganizerStatement, splitPayoutFee } from '../settlement.service';
+import { getOrganizerStatement, splitPayoutFee, ticketRevenue, sumTicketRevenue } from '../settlement.service';
 
 const prismaMock = prisma as unknown as DeepMockProxy<PrismaClient>;
 
@@ -81,6 +82,13 @@ afterAll(() => {
 });
 
 describe('getOrganizerStatement — what the organizer is owed', () => {
+  it.each([NaN,Infinity,-1,1.001])('refuses an invalid recorded allocation %s',amountPaid=>{
+    expect(()=>ticketRevenue({amountPaid})).toThrow(/Recorded ticket payment amount/);
+  });
+  it('sums original minor units exactly and distinguishes free tickets from missing data',()=>{
+    expect(sumTicketRevenue([{amountPaid:0.1},{amountPaid:0.2},{amountPaid:0}])).toBe(0.3);
+    expect(()=>ticketRevenue({amountPaid:null})).toThrow(/missing/);
+  });
   it('derives gross sales from what was actually charged, not the list price', async () => {
     // A ticket discounted at checkout: charged 60 against a list price of 100.
     // Settling on list price would pay out money the platform never collected.
@@ -92,12 +100,10 @@ describe('getOrganizerStatement — what the organizer is owed', () => {
     expect(statement.availableBalance).toBe(60);
   });
 
-  it('falls back to the list price only for legacy rows with no recorded charge', async () => {
+  it('refuses missing recorded payments instead of substituting a legacy list price', async () => {
     wire([event('e1', FINISHED)], [ticket('e1', 'sold', null, 100)]);
 
-    const statement = await getOrganizerStatement(ORG, NOW);
-
-    expect(statement.grossSales).toBe(100);
+    await expect(getOrganizerStatement(ORG, NOW)).rejects.toThrow(/Recorded ticket payment amount is missing/);
   });
 
   it('EXCLUDES refunded/cancelled tickets from the available balance', async () => {

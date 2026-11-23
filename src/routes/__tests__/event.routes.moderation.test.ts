@@ -3,6 +3,7 @@ import type { PrismaClient } from '@prisma/client';
 
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

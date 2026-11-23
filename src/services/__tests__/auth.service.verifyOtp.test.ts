@@ -4,6 +4,7 @@ import type { PrismaClient } from '@prisma/client';
 // --- Mock the Prisma singleton ---------------------------------------------
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

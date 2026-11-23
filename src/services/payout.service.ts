@@ -1,6 +1,7 @@
 import prisma from '../config/prisma';
 import type { Prisma } from '@prisma/client';
 import { ApiError } from '../middleware/error.middleware';
+import { reviewActor, ReviewActor } from './review-actor';
 import { CURRENCY, getPlatformFeePercent } from '../config/platform';
 import {
   getOrganizerStatement,
@@ -245,7 +246,8 @@ const VALID_PAYOUT_APPROVAL_STATUSES = ['unreviewed', 'approved', 'rejected'];
  * — recorded alongside the transition so a fraud-review decision on real
  * money movement is always traceable to a specific admin and timestamp.
  */
-export const setPayoutApprovalStatus = async (organizerId: string, status: string, adminId: string) => {
+export const setPayoutApprovalStatus = async (organizerId: string, status: string, actor: ReviewActor) => {
+  const reviewer=reviewActor(actor);
   if (!VALID_PAYOUT_APPROVAL_STATUSES.includes(status)) {
     throw new ApiError('payoutApprovalStatus must be unreviewed, approved or rejected', 400);
   }
@@ -255,7 +257,8 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
       where: { id: organizerId, role: 'organizer' },
       data: {
         payoutApprovalStatus: status as any,
-        payoutApprovalReviewedByAdminId: adminId,
+        payoutApprovalReviewedByAdminId: reviewer.adminId,
+        payoutApprovalReviewedByStaff: reviewer.staffId,
         payoutApprovalReviewedAt: new Date(),
       },
       select: {
@@ -267,6 +270,7 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
         companyName: true,
         payoutApprovalStatus: true,
         payoutApprovalReviewedByAdminId: true,
+        payoutApprovalReviewedByStaff: true,
         payoutApprovalReviewedAt: true,
         payoutApprovalReviewedBy: { select: { id: true, name: true } },
       },
@@ -312,14 +316,16 @@ const transitionPayout = async (
  *  Stays reserved against the balance, so approving changes nothing the
  *  organizer can withdraw. `adminId` (the authenticated admin) is recorded as
  *  the reviewer for compliance traceability. */
-export const approvePayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
+export const approvePayoutRequest = async (id: string, actor: ReviewActor, adminNote?: string) => {
+  const reviewer=reviewActor(actor);
   const now = new Date();
   return transitionPayout(id, ['pending'], {
     status: 'approved',
     approvedAt: now,
     processedAt: now,
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -328,13 +334,15 @@ export const approvePayoutRequest = async (id: string, adminId: string, adminNot
  *  organizer's available balance. Allowed while approved too — nothing has
  *  moved until it is marked paid. `adminId` (the authenticated admin) is
  *  recorded as the reviewer for compliance traceability. */
-export const rejectPayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
+export const rejectPayoutRequest = async (id: string, actor: ReviewActor, adminNote?: string) => {
+  const reviewer=reviewActor(actor);
   const now = new Date();
   return transitionPayout(id, ['pending', 'approved'], {
     status: 'rejected',
     processedAt: now,
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -351,10 +359,11 @@ export const rejectPayoutRequest = async (id: string, adminId: string, adminNote
  */
 export const markPayoutRequestPaid = async (
   id: string,
-  adminId: string,
+  actor: ReviewActor,
   reference: string,
   adminNote?: string
 ) => {
+  const reviewer=reviewActor(actor);
   if (!reference || !reference.trim()) {
     throw new ApiError('An external transfer reference is required to mark a payout paid', 400);
   }
@@ -365,7 +374,8 @@ export const markPayoutRequestPaid = async (
     processedAt: now,
     reference: reference.trim(),
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -381,16 +391,16 @@ export interface PayoutStatusUpdate {
 export const updatePayoutRequestStatus = async (
   id: string,
   status: 'approved' | 'paid' | 'rejected',
-  adminId: string,
+  actor: ReviewActor,
   { adminNote, reference }: PayoutStatusUpdate = {}
 ) => {
   switch (status) {
     case 'approved':
-      return approvePayoutRequest(id, adminId, adminNote);
+      return approvePayoutRequest(id, actor, adminNote);
     case 'rejected':
-      return rejectPayoutRequest(id, adminId, adminNote);
+      return rejectPayoutRequest(id, actor, adminNote);
     case 'paid':
-      return markPayoutRequestPaid(id, adminId, reference ?? '', adminNote);
+      return markPayoutRequestPaid(id, actor, reference ?? '', adminNote);
     default:
       throw new ApiError('Status must be approved, paid or rejected', 400);
   }

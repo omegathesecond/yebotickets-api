@@ -1,3 +1,4 @@
+import {listOrganizers,setOrganizerVerification} from '../services/organizer-admin.service';
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
@@ -8,6 +9,8 @@ import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
 import { generateAuthTokens } from '../services/token.service';
 import bcrypt from 'bcryptjs';
+import { CURRENCY } from '../config/platform';
+import { sumTicketRevenue } from '../services/settlement.service';
 
 /**
  * Upgrade a regular user to an organizer or create a new organizer
@@ -215,24 +218,21 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     }
 
     // Count sold tickets and sum revenue across this organizer's events.
-    // Mirrors the canonical sold/revenue computation in dashboard.service
-    // (status 'sold', revenue = sum of ticketType.price) so the organizer's
-    // own numbers match the platform admin metrics (DRY). A single findMany
-    // with the price included yields both the count and the revenue sum.
+    // Same recorded-payment calculation as platform and settlement views.
     const soldTickets = eventIds.length
       ? await prisma.ticket.findMany({
           where: { eventId: { in: eventIds }, status: 'sold' },
-          include: { ticketType: { select: { price: true } } },
+          select: { amountPaid:true },
         })
       : [];
 
     const ticketStats = {
       totalTypes,
       totalSold: soldTickets.length,
-      totalRevenue: soldTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0),
+      totalRevenue: sumTicketRevenue(soldTickets),
       // Platform currency, matching dashboard.service's revenue metric, so any
       // client rendering totalRevenue labels it truthfully instead of guessing.
-      currency: 'KES',
+      currency: CURRENCY,
     };
     
     res.status(200).json({
@@ -267,27 +267,7 @@ export const getOrganizersController = async (req: Request, res: Response, next:
       return;
     }
     
-    const organizers = await prisma.user.findMany({
-      where: { role: 'organizer' },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        name: true,
-        phoneNumber: true,
-        email: true,
-        role: true,
-        isVerified: true,
-        payoutApprovalStatus: true,
-        payoutApprovalReviewedByAdminId: true,
-        payoutApprovalReviewedAt: true,
-        payoutApprovalReviewedBy: { select: { id: true, name: true } },
-        companyName: true,
-        companyDescription: true,
-        website: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    const {records:organizers}=await listOrganizers({});
 
     res.status(200).json({
       success: true,
@@ -434,24 +414,8 @@ export const updateOrganizerStatusController = async (req: Request, res: Respons
     const { id } = req.params;
     const { isVerified } = req.body;
 
-    const updates: any = {};
-    if (typeof isVerified === 'boolean') updates.isVerified = isVerified;
-
-    const organizer = await prisma.user.update({
-      where: { id, role: 'organizer' },
-      data: updates,
-      select: {
-        id: true,
-        name: true,
-        phoneNumber: true,
-        email: true,
-        role: true,
-        isVerified: true,
-        companyName: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    if(typeof isVerified!=='boolean')throw new ApiError('Choose a phone verification flag',400);
+    const organizer=await setOrganizerVerification(id,isVerified);
 
     res.status(200).json({
       success: true,

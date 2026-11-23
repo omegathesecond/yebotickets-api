@@ -6,6 +6,7 @@ import type { PrismaClient } from '@prisma/client';
 // database.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 
@@ -73,16 +74,16 @@ describe('assertEventAccess — ownership enforcement', () => {
 });
 
 describe('getOrganizerEarnings — derived from real sold tickets', () => {
-  it('sums ticketType.price over sold tickets per event', async () => {
+  it('sums original paid allocations despite later ticket-price edits', async () => {
     prismaMock.event.findMany.mockResolvedValue([
       { id: 'event-1', title: 'Fest A' },
       { id: 'event-2', title: 'Fest B' },
     ] as any);
     // 2 sold for event-1 @100, 1 sold for event-2 @50 -> totals 200 / 50 / 250.
     prismaMock.ticket.findMany.mockResolvedValue([
-      { eventId: 'event-1', ticketType: { price: 100 } },
-      { eventId: 'event-1', ticketType: { price: 100 } },
-      { eventId: 'event-2', ticketType: { price: 50 } },
+      { eventId: 'event-1', amountPaid:100, ticketType: { price: 999 } },
+      { eventId: 'event-1', amountPaid:100, ticketType: { price: 999 } },
+      { eventId: 'event-2', amountPaid:50, ticketType: { price: 999 } },
     ] as any);
 
     const result = await getOrganizerEarnings({ id: 'org-1', role: 'organizer' });
@@ -99,15 +100,12 @@ describe('getOrganizerEarnings — derived from real sold tickets', () => {
 });
 
 describe('getEventDetailsForOrganizer — stats from real ticket rows', () => {
-  it('computes revenue = sold count x price and pending = reserved value', async () => {
+  it('uses recorded sold and reserved allocations instead of changed tier prices', async () => {
     prismaMock.event.findUnique.mockResolvedValue(eventRow() as any);
-    // 3 sold of tt-1 @100, 47 available, 0 reserved value here.
-    prismaMock.ticket.groupBy
-      .mockResolvedValueOnce([{ ticketTypeId: 'tt-1', _count: { _all: 3 } }] as any) // sold
-      .mockResolvedValueOnce([{ ticketTypeId: 'tt-1', _count: { _all: 47 } }] as any); // available
-    prismaMock.ticket.findMany.mockResolvedValue([
-      { ticketType: { price: 100 } }, // one reserved ticket -> pending 100
-    ] as any);
+    prismaMock.ticket.groupBy.mockResolvedValue([{ticketTypeId:'tt-1',_count:{_all:47}}] as any);
+    prismaMock.ticket.findMany
+      .mockResolvedValueOnce([{ticketTypeId:'tt-1',amountPaid:100},{ticketTypeId:'tt-1',amountPaid:100},{ticketTypeId:'tt-1',amountPaid:100}] as any)
+      .mockResolvedValueOnce([{amountPaid:100}] as any);
 
     const { event, stats } = await getEventDetailsForOrganizer('event-1', { id: 'org-1', role: 'organizer' });
 
@@ -131,10 +129,10 @@ describe('getOrganizerDashboardStats — KPIs from real sold tickets', () => {
       { id: 'event-3', isPublished: true, isCancelled: true, endDate: future }, // cancelled
       { id: 'event-4', isPublished: true, isCancelled: false, endDate: past }, // ended
     ] as any);
-    // amountPaid wins when present; falls back to type price for legacy rows.
+    // Recorded allocations are independent of current list prices.
     prismaMock.ticket.findMany.mockResolvedValue([
       { amountPaid: 120, ticketType: { price: 100 } },
-      { amountPaid: null, ticketType: { price: 80 } },
+      { amountPaid: 80, ticketType: { price: 999 } },
     ] as any);
 
     const stats = await getOrganizerDashboardStats({ id: 'org-1', role: 'organizer' });
@@ -315,6 +313,7 @@ describe('getEventTickets — pagination + ownership', () => {
         id: 'ticket-1',
         user: { name: 'Buyer One' },
         ticketType: { name: 'VIP', price: 100 },
+        amountPaid:100,
         purchaseDate: new Date('2026-06-01T10:00:00Z'),
         createdAt: new Date('2026-06-01T09:00:00Z'),
         status: 'sold',
@@ -341,6 +340,7 @@ describe('getEventTickets — pagination + ownership', () => {
         id: 'ticket-2',
         user: { name: 'Buyer Two' },
         ticketType: { name: 'General', price: 50 },
+        amountPaid:50,
         purchaseDate: new Date('2026-06-01T10:00:00Z'),
         createdAt: new Date('2026-06-01T09:00:00Z'),
         status: 'sold',

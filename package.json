@@ -15,6 +15,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@omevision/product-admin-boundary": "file:vendor/omevision-product-admin-boundary-0.3.0.tgz",
     "@prisma/client": "^5.22.0",
     "axios": "^1.8.1",
     "bcryptjs": "^2.4.3",
@@ -24,6 +25,7 @@
     "express-rate-limit": "^8.5.2",
     "express-validator": "^7.0.1",
     "form-data": "^4.0.5",
+    "google-auth-library": "10.6.2",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.0",
     "morgan": "^1.10.0",

@@ -5,6 +5,7 @@ import type { PrismaClient } from '@prisma/client';
 // jest mock so getEvents' query is inspected without touching a database.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

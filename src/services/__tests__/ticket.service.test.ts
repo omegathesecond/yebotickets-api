@@ -9,6 +9,7 @@ import type { PrismaClient } from '@prisma/client';
 // typed jest.fn we can stub per-test — no database is touched.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

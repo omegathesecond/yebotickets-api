@@ -2,7 +2,8 @@ import { mockDeep, mockReset } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../comms.service', () => ({ sendOTP: jest.fn(), sendTextMessage: jest.fn() }));
 jest.mock('../token.service', () => ({ generateAuthTokens: jest.fn(() => ({ token: 'access', refreshToken: 'refresh' })) }));
 import prisma from '../../config/prisma';

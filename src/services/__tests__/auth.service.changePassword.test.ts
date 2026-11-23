@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 // auth.service imports `prisma` as the DEFAULT export of ../config/prisma.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

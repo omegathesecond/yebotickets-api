@@ -6,9 +6,32 @@ CEO-authority decisions must use the existing central decision queue. Product
 customers/organisers keep their existing business identities. Never manufacture
 a product admin account or session for a corporate staff member.
 
-Status: refund dependency implementation and isolated validation are complete for
-this batch. Native CEO catalogue/controls, grants, live configuration and cutover
-are still unimplemented. No production migration or deployment has occurred.
+Status: the native corporate boundary, scoped CEO controls and durable refund
+caller cutover are implemented and tested locally in drafts. This is an initial
+native workflow batch, not whole-product acceptance. No production migration,
+workload configuration or deployment has occurred.
+
+## Implemented native workflows
+
+The existing shared CEO workspace renders source-owned sections for overview,
+organisers, events, ticket records, settlements, payout requests, unresolved
+original refunds and corporate audit history. Staff choose named organisers and
+events; ticket-only staff receive minimal event context without organiser
+contacts. The existing product services own queries, event visibility,
+verification, unpublishing, settlement and payout transitions.
+
+Writes prepare exact record versions in the existing central CEO decision queue.
+Current authority is checked again at execution. Product mutations, the critical
+corporate audit and the original receipt commit together; audit failure rolls
+back the business change. Corporate staff are verified request actors, never
+product sessions or manufactured product `User` records. Reviewer fields store
+corporate staff separately from product-admin foreign keys.
+
+Payout approval reserves an existing request. Recording paid requires a reference
+for an external transfer already completed; it sends no payment. Terminal paid
+requests cannot be rejected. Native refund recovery is currently a read-only
+work queue; executing an exact refund/check or event cancellation through the
+CEO boundary remains open.
 
 ## Reuse inventory
 
@@ -22,18 +45,11 @@ are still unimplemented. No production migration or deployment has occurred.
 | `config/platform.ts` | Shared SZL currency and platform fee settings; the ticket charge/refund path now imports this existing currency definition |
 | Corporate product-admin boundary and CEO native adapter | Existing actor verification, schema forms, scoped grants, exact target reviews, central approvals and durable receipts |
 
-Do not expose the existing dashboard metrics as authoritative finance unchanged:
-`getDashboardMetrics` currently sums ticket-type list prices and labels them KES,
-and `settlement.service.ts#ticketRevenue` substitutes list price for missing stored
-payments. Those are real reuse gaps, not verified original-currency money. Do not
-copy those substitutions into new native controls. Reconcile missing original
-payment evidence and surface an error where required rather than inventing revenue.
-
-Payout reviewer fields currently reference product `User` IDs. A corporate actor
-must receive separate, attributed audit fields in the shared business operation,
-with local changes and its corporate receipt in one transaction. Passing a CEO
-staff ID as a product-user foreign key is invalid. Marking an approved payout
-paid records an external transfer reference; it does not send a bank payment.
+Platform, organiser and event money read models now share recorded ticket
+allocations and the existing SZL currency definition. Later edits to a ticket
+tier's list price cannot change reported revenue. Missing, negative, invalid or
+unsafe original money fails visibly; no list-price or zero substitution is made.
+Existing product dashboards reuse the same repaired calculation.
 
 Event cancellation has external per-ticket effects. Freeze the exact reviewed
 event/ticket set, preserve child refund attempts and reconcile original proof;
@@ -64,16 +80,29 @@ invented gateway history. See [recovery](refund-recovery.md) and
 
 ## Local evidence
 
-- Product build passed; 506 tests passed across 29 suites.
-- Full migration history, including the proof migration, applied to the named
-  disposable `yebotickets_admin_fixture` database only.
-- Eleven actual Tickets/YeboPay HTTP/PostgreSQL checks passed with a non-superuser
-  Tickets role. Payment and notification transports were simulated; there was
-  no real payment, message, product sign-in or CEO-interface acceptance test.
-- Checks cover shared-charge allocations, pending/failed refunds, gateway and
-  processor acknowledgement loss, atomic local failure/recovery, original
-  completion overlapping recovery, two concurrent reconcilers, currency mismatch
-  before dispatch and immutable completed proof.
+- Product build and 519 tests across 32 suites passed. The tests include workload
+  audience/caller rejection and the shared workspace label/binding contract.
+  Google token verification is mocked in the unit tests; this is not live OIDC
+  acceptance.
+- Fifteen actual native Tickets/CEO HTTP/PostgreSQL checks passed with a
+  non-superuser Tickets role: grants, private context, exact pagination, original
+  paid amounts, central review, stale targets, revoked grants, separate corporate
+  reviewers, atomic audit rollback, payout transitions, scope isolation and
+  original receipts.
+- The separate actual Tickets/YeboPay refund fixture verifies original proof and
+  reconciliation. Payment and notification transports are simulated; no real
+  payment or message is sent.
+- CEO guarded build and focused native permission tests passed; 324 frontend
+  tests and the guarded frontend build passed.
+- Disposable local desktop/mobile browser review verified a finance request,
+  named organiser selection, CEO-only execution, saved corporate attribution and
+  related ticket records. The 390px document fit its viewport. Sign-in uses the
+  explicitly isolated fixture identity, not production authentication. An
+  unrelated YeboShops review warning is visible because that route is absent
+  from this local fixture; no successful data substitutes for it.
+- Proof migration history was replayed from scratch locally. The additional
+  corporate administration migration has been applied to the named localhost
+  fixture only; production migration remains pending.
 
 Run the shared fixture from the CEO API checkout after building both APIs:
 
@@ -91,21 +120,34 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Implement the source-owned catalogue and real corporate actor path, resource
-grants and environment-bound approvals; repair the money read models above;
-connect the native CEO controls and central decisions; verify desktop/mobile
-request/approval/recovery journeys and scoped data access. Inspect current
-runtime bindings and services rather than following dated deployment notes.
-Then complete coordinated migrations/deployment, authenticated production checks
-and operator acceptance before retiring separate corporate admin entry points.
+Complete the remaining source inventory and native workflows: exact refund
+execution/original-proof checks, event cancellation with its reviewed child
+refund set, inventory and event creation/editing/deletion, admission, delivery
+and purchase recovery, and configuration where the owning product supports it.
+Add explicit environment selection, environment-scoped grants and
+environment-bound approvals before claiming both environments are manageable.
+Current connection registration targets production only.
 
-Read-only runtime check on 23 November 2026: domain mappings identify
+The canonical boundary is `/staff-admin` at the verified API origin. Source
+Cloud Build configuration adds `CEO_DASHBOARD_SERVICE_ACCOUNT` and
+`CEO_DASHBOARD_AUDIENCE` through the existing additive env list, preserving every
+secret binding. The dev trigger must explicitly override the audience to
+`https://dev-api.yebotickets.com`; the runtime rejects an audience that does not
+match its actual prod/dev `K_SERVICE`. No trigger or runtime was updated.
+CEO migration 129 uses the existing workload-auth registry contract and preserves
+an explicitly disabled connection. Product migration
+`20261123160000_corporate_administration` adds the shared operation store,
+critical audit and separate corporate-reviewer fields.
+
+Read-only runtime check on 23 November 2026 identified domain mappings for
 `yebotickets-api-prod` and `yebotickets-api-dev`, both running as
-`yebotickets-runtime@hiyebo.iam.gserviceaccount.com`. Their database and YeboPay
-secret references are separated by environment. Neither runtime has
-`DASHBOARD_API_KEY`; no Tickets dashboard API-key secret was found by name, and
-the CEO runtime has no Tickets environment binding. Nothing was provisioned.
-Prefer the already implemented workload-identity boundary used for YeboLearn,
-with the verified CEO runtime `ceodashboard-runtime@hiyebo.iam.gserviceaccount.com`,
-over inventing a second authentication system or borrowing a payment secret.
-Verify that identity path end to end before enabling the native connection.
+`yebotickets-runtime@hiyebo.iam.gserviceaccount.com`. Database and YeboPay secret
+references are separated. Neither runtime had `DASHBOARD_API_KEY`; the native
+integration instead reuses the verified CEO workload principal
+`ceodashboard-runtime@hiyebo.iam.gserviceaccount.com`. No credential or IAM was
+provisioned. Running-image provenance remains to be established before release.
+
+Coordinate all active YeboPay caller cutovers and direct Neon schema/code
+release. Verify real workload authentication, production reads, the operator's
+accepted workflows and the approved cutover before retiring separate corporate
+admin entry points. Drafts and local fixture evidence do not establish that cutover.

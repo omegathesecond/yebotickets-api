@@ -103,7 +103,7 @@ steps:
       # owed 100% of gross) until the business sets a rate; change it via the
       # trigger substitution, never by hand, so a redeploy cannot reset it.
       - '--update-env-vars'
-      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT}'
+      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT},CEO_DASHBOARD_SERVICE_ACCOUNT=${_CEO_DASHBOARD_SERVICE_ACCOUNT},CEO_DASHBOARD_AUDIENCE=${_CEO_DASHBOARD_AUDIENCE}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
@@ -134,6 +134,10 @@ substitutions:
   # a non-numeric value makes the API fail loudly rather than quietly settle at
   # 0% and give away the platform's revenue.
   _PLATFORM_FEE_PERCENT: '0'
+  _CEO_DASHBOARD_SERVICE_ACCOUNT: 'ceodashboard-runtime@hiyebo.iam.gserviceaccount.com'
+  # Dev trigger MUST override this to https://dev-api.yebotickets.com.
+  # The runtime rejects an origin that does not match its actual K_SERVICE.
+  _CEO_DASHBOARD_AUDIENCE: 'https://api.yebotickets.com'
 
 options:
   logging: CLOUD_LOGGING_ONLY

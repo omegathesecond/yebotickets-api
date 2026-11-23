@@ -1,6 +1,7 @@
 import { mockDeep, mockReset } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../yebopay.service', () => ({ createCharge: jest.fn(), getCharge: jest.fn(), YeboPayHttpError: class extends Error {} }));
 jest.mock('../qr.service', () => ({ buildTicketQrPayload: jest.fn(() => ({})), generateTicketQrDataUrl: jest.fn(async () => 'QR') }));
 jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(async () => ({})), sendEmailMessage: jest.fn() }));

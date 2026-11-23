@@ -1,8 +1,8 @@
-import prisma from '../config/prisma';
+import prisma, { staffAdminScope } from '../config/prisma';
 import { ApiError } from '../middleware/error.middleware';
 import { UserRole } from '../interfaces/user.interface';
 import { CURRENCY } from '../config/platform';
-import { ticketRevenue } from './settlement.service';
+import { ticketRevenue, sumTicketRevenue } from './settlement.service';
 
 /**
  * Organizer-dashboard read models.
@@ -70,7 +70,7 @@ const toDashboardEvent = (event: any, ticketsSold: number) => ({
  * it belongs to another organizer — so ownership can never be bypassed by
  * guessing an id.
  */
-export const assertEventAccess = async (eventId: string, requester: Requester) => {
+export const assertEventAccess = async (eventId: string, requester: Requester | undefined) => {
   const event = await prisma.event.findUnique({
     where: { id: eventId },
     include: { ticketTypes: true },
@@ -80,7 +80,7 @@ export const assertEventAccess = async (eventId: string, requester: Requester) =
     throw new ApiError('Event not found', 404);
   }
 
-  if (requester.role !== UserRole.ADMIN && event.organizerId !== requester.id) {
+  if (!staffAdminScope.actor() && (!requester || requester.role !== UserRole.ADMIN && event.organizerId !== requester.id)) {
     throw new ApiError('You do not have permission to access this event', 403);
   }
 
@@ -173,18 +173,17 @@ export const getOrganizerEarnings = async (requester: Requester) => {
  * Full stats for a single event the organizer owns (GET /api/events/:id/details).
  * All counts/revenue are computed from real ticket rows:
  *  - sold/available counts per ticket type (from the inventory rows),
- *  - revenue per type = sold count × that type's price,
+ *  - revenue per type = recorded allocations of its sold tickets,
  *  - pendingPayments = value of tickets still RESERVED (held, awaiting an async
  *    mobile-money confirmation) — i.e. outstanding unpaid money.
  */
-export const getEventDetailsForOrganizer = async (eventId: string, requester: Requester) => {
+export const getEventDetailsForOrganizer = async (eventId: string, requester: Requester | undefined) => {
   const event = await assertEventAccess(eventId, requester);
 
-  const [soldByType, availableByType, reservedTickets] = await Promise.all([
-    prisma.ticket.groupBy({
-      by: ['ticketTypeId'],
+  const [soldTickets, availableByType, reservedTickets] = await Promise.all([
+    prisma.ticket.findMany({
       where: { eventId, status: 'sold' },
-      _count: { _all: true },
+      select: { ticketTypeId:true, amountPaid:true },
     }),
     prisma.ticket.groupBy({
       by: ['ticketTypeId'],
@@ -193,27 +192,26 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
     }),
     prisma.ticket.findMany({
       where: { eventId, status: 'reserved' },
-      select: { ticketType: { select: { price: true } } },
+      select: { amountPaid:true },
     }),
   ]);
 
-  const soldMap = new Map(soldByType.map((g) => [g.ticketTypeId, g._count._all]));
   const availableMap = new Map(availableByType.map((g) => [g.ticketTypeId, g._count._all]));
 
   const ticketTypes = event.ticketTypes.map((tt) => {
-    const sold = soldMap.get(tt.id) || 0;
+    const sold = soldTickets.filter(ticket=>ticket.ticketTypeId===tt.id);
     const available = availableMap.get(tt.id) || 0;
     return {
       name: tt.name,
-      sold,
+      sold: sold.length,
       available,
-      revenue: sold * tt.price,
+      revenue: sumTicketRevenue(sold),
     };
   });
 
   const totalTicketsSold = ticketTypes.reduce((sum, t) => sum + t.sold, 0);
-  const totalRevenue = ticketTypes.reduce((sum, t) => sum + t.revenue, 0);
-  const pendingPayments = reservedTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const totalRevenue = sumTicketRevenue(soldTickets);
+  const pendingPayments = sumTicketRevenue(reservedTickets);
 
   return {
     event: toDashboardEvent(event, totalTicketsSold),
@@ -231,7 +229,7 @@ export const getEventDetailsForOrganizer = async (eventId: string, requester: Re
  * (GET /api/user/dashboard-stats). All figures are scoped to the caller's own
  * events and computed from real ticket rows — never stored/mocked totals:
  *  - totalRevenue: sum of what was actually charged over the organizer's SOLD
- *    tickets (amountPaid, falling back to the type price for legacy rows),
+ *    tickets (missing original payments require reconciliation),
  *  - ticketsSold: count of those sold tickets,
  *  - averageTicketPrice: totalRevenue / ticketsSold (0 when nothing is sold),
  *  - activeEvents: published, non-cancelled events that have not yet ended.
@@ -259,7 +257,7 @@ export const getOrganizerDashboardStats = async (requester: Requester) => {
       select: { amountPaid: true, ticketType: { select: { price: true } } },
     });
     ticketsSold = soldTickets.length;
-    totalRevenue = soldTickets.reduce((sum, t) => sum + ticketRevenue(t), 0);
+    totalRevenue = sumTicketRevenue(soldTickets);
   }
 
   const averageTicketPrice = ticketsSold > 0 ? totalRevenue / ticketsSold : 0;
@@ -388,7 +386,7 @@ const parsePagination = (page?: any, limit?: any) => {
  */
 export const getEventPurchases = async (
   eventId: string,
-  requester: Requester,
+  requester: Requester | undefined,
   pageParam?: any,
   limitParam?: any
 ) => {
@@ -416,7 +414,7 @@ export const getEventPurchases = async (
     customerName: t.user?.name || 'Unknown',
     ticketType: t.ticketType?.name || 'Unknown',
     quantity: 1,
-    totalAmount: t.amountPaid ?? t.ticketType?.price ?? 0,
+    totalAmount: ticketRevenue(t),
     purchaseDate: t.purchaseDate ?? t.createdAt,
     status: t.status,
     refundRequestedAt: t.refundRequestedAt ?? null,
@@ -425,6 +423,7 @@ export const getEventPurchases = async (
 
   return {
     purchases,
+    total,
     currentPage: page,
     totalPages: Math.max(1, Math.ceil(total / limit)),
   };
@@ -437,7 +436,7 @@ export const getEventPurchases = async (
  */
 export const getEventTickets = async (
   eventId: string,
-  requester: Requester,
+  requester: Requester | undefined,
   pageParam?: any,
   limitParam?: any
 ) => {
@@ -463,7 +462,7 @@ export const getEventTickets = async (
   const ticketRows = tickets.map((t) => ({
     id: t.id,
     ticketType: t.ticketType?.name || 'Unknown',
-    price: t.ticketType?.price ?? 0,
+    price: ticketRevenue(t),
     purchaseDate: t.purchaseDate ?? t.createdAt,
     validUntil: event.endDate,
     status: t.status,
@@ -474,6 +473,7 @@ export const getEventTickets = async (
 
   return {
     tickets: ticketRows,
+    total,
     currentPage: page,
     totalPages: Math.max(1, Math.ceil(total / limit)),
   };
