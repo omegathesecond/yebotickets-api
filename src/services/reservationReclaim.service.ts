@@ -204,6 +204,8 @@ export const runTicketRecoverySweep = async () => {
   const summary = await runReclaimSweep();
   const { recoverCorporateCancellations } = await import('../staffAdmin/cancellation');
   await recoverCorporateCancellations();
+  const { recoverCorporatePurchases } = await import('../staffAdmin/purchaseRecovery');
+  await recoverCorporatePurchases();
   return summary;
 };
 

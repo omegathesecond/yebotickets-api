@@ -5,6 +5,8 @@ import prisma, { staffAdminScope } from '../config/prisma';
 import type { StaffOperationContext } from '../staffAdmin/audit';
 import { prepareCorporateRefund, finishCorporateRefund, failCorporateRefund } from '../staffAdmin/refundReceipt';
 import { ticketRefundTerms } from './ticket-refund-terms';
+import { sumTicketRevenue } from './settlement.service';
+import { lockPurchaseIdentity } from '../utils/purchaseIdentity';
 import { 
   ITicket, 
   ITicketType, 
@@ -847,7 +849,7 @@ const commitSettlement = async (
 
 const refundCancelledSettlement = async (tickets: any[]) => {
   for (const ticket of tickets) {
-    const outcome = await refundAndCancelTicket(ticket, 'Event cancelled before payment settled');
+    const outcome = await refundAndCancelTicket(ticket, 'Event cancelled before payment settled', undefined, 'cancelled-settlement');
     if (outcome.result === 'refund_failed') throw new ApiError(outcome.error!, 502);
   }
 };
@@ -1375,7 +1377,7 @@ export const purchaseTicket = async (
     const allocation = await prisma.$transaction(async tx => {
       // Global key ownership also rejects reuse by a different principal.
       // This lock ends before any gateway or delivery call.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+      await lockPurchaseIdentity(tx, key);
       const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
       if (prior) {
         if (prior.userId !== userId || prior.fingerprint !== fingerprint) {
@@ -1495,56 +1497,83 @@ export const purchaseTicket = async (
   }
 };
 
+/** Validate the actual original payment before recovery can issue or refund tickets. */
+export const assertOriginalPurchaseCharge = (chargeId: string, charge: ChargeResult, tickets: { amountPaid: number | null }[]) => {
+  const amount = sumTicketRevenue(tickets);
+  const paid = Number(charge.amount);
+  if (charge.id !== chargeId || charge.currency !== TICKET_CURRENCY || !Number.isFinite(paid) || paid !== amount)
+    throw new ApiError('Original payment identity, currency or recorded purchase amount does not match; retain the purchase for reconciliation', 409);
+};
+const finalPurchaseOutcome = async (tickets: any[]) => {
+  if (tickets.every(ticket => ticket.status === 'cancelled'))
+    return { pending: false as const, failed: true as const, message: 'Order cancelled or refunded. No admission tickets remain.', tickets: [] };
+  if (tickets.every(ticket => ticket.status === 'sold')) {
+    tickets.forEach(ticketRefundTerms);
+    return finishIssuedOrder(tickets);
+  }
+  return null;
+};
+
 /** Recover only; never dispatch a second charge, including after a process crash. */
-export const recoverPurchaseAttempt = async (key: string, userId: string) => {
+export const recoverPurchaseAttempt = async (key: string, userId: string | undefined) => {
+  const corporate = staffAdminScope.actor();
+  if (!corporate && !userId) throw new ApiError('A verified buyer or corporate recovery actor is required', 401);
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new ApiError('Invalid purchase key', 400);
   const attempt = await prisma.$transaction(async tx => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    await lockPurchaseIdentity(tx, key);
     const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
     if (prior) {
-      if (prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
+      if (!corporate && prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
       return prior;
     }
+    if (corporate) throw new ApiError('The saved purchase attempt was not found', 404);
     // Fence a request that never arrived (or was rejected before allocation).
     // A delayed POST with this key can no longer start a charge after recovery.
     return tx.ticketPurchaseAttempt.create({ data: {
-      key, userId, fingerprint: 'closed-before-allocation', ticketIds: [],
+      key, userId: userId!, fingerprint: 'closed-before-allocation', ticketIds: [],
       attemptRef: `attempt:${crypto.randomUUID()}`,
       failure: 'No purchase was dispatched. This attempt is closed.',
     } });
   });
+  const ownerId = attempt.userId;
   if (attempt.failure) {
     // A crash may occur after recording FAILED but before returning inventory.
     // Match the immutable reference too: the same buyer may now hold these
     // physical seats under a deliberate later attempt.
     if (attempt.ticketIds.length) await prisma.ticket.updateMany({
-      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved',
+      where: { id: { in: attempt.ticketIds }, userId: ownerId, status: 'reserved',
         paymentRef: { in: [attempt.attemptRef, ...(attempt.chargeId ? [attempt.chargeId] : [])] },
         paymentStatus: { not: 'SUCCEEDED' } },
       data: { status: 'available', userId: null, reservedAt: null, paymentRef: null, paymentStatus: null, amountPaid: null },
     });
     return { pending: false as const, failed: true as const, message: attempt.failure, tickets: [] };
   }
-  let tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
-  if (tickets.length !== attempt.ticketIds.length) throw new ApiError('Purchase requires reconciliation. Do not pay again.', 409);
-  if (tickets.every(t => t.status === 'cancelled')) return { pending: false as const, failed: true as const, message: 'Order cancelled or refunded. No admission tickets remain.', tickets: [] };
-  if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+  let tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId: ownerId }, include: PURCHASE_INCLUDE });
+  if (!attempt.ticketIds.length || tickets.length !== attempt.ticketIds.length) throw new ApiError('Purchase requires reconciliation. Do not pay again.', 409);
+  const initial = await finalPurchaseOutcome(tickets);
+  if (initial) return initial;
   const chargeId = attempt.chargeId || tickets.find(t => t.paymentRef && !t.paymentRef.startsWith('attempt:'))?.paymentRef;
   if (chargeId) {
+    const charge = await getCharge(chargeId);
+    assertOriginalPurchaseCharge(chargeId, charge, tickets);
+    const refundedCharge = ['PARTIAL_REFUNDED', 'REFUNDED'].includes(charge.status);
+    if (refundedCharge && tickets.some(ticket => ticket.status !== 'cancelled' &&
+      (!ticket.event?.isCancelled || ticket.paymentStatus !== 'SUCCEEDED')))
+      throw new ApiError('The original payment has refund history; reconcile the original tickets before issuance', 409);
     // Recover a crash between persisting the charge identity and attaching it
     // to the reservations. Never allocate or dispatch in this path.
     await prisma.ticket.updateMany({
-      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved', paymentRef: attempt.attemptRef },
+      where: { id: { in: attempt.ticketIds }, userId: ownerId, status: 'reserved', paymentRef: attempt.attemptRef },
       data: { paymentRef: chargeId },
     });
-    const charge = await getCharge(chargeId);
-    if (charge.status === 'SUCCEEDED') await settleSucceededCharge(chargeId);
+    if (charge.status === 'SUCCEEDED' || refundedCharge) await settleSucceededCharge(chargeId);
     else if (charge.status === 'FAILED') {
       const outcome = await settleFailedCharge(chargeId);
       if (outcome.result === 'released') return recoverPurchaseAttempt(key, userId);
     }
-    tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
-    if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+    tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId: ownerId }, include: PURCHASE_INCLUDE });
+    const final = await finalPurchaseOutcome(tickets);
+    if (final) return final;
   }
   return { ...buildPendingOrderResult(tickets, chargeId || attempt.attemptRef),
     unknown: !chargeId, message: chargeId ? 'Payment pending. Do not pay again.' : 'Payment outcome unconfirmed. Your seats remain held. Do not pay again.' };
@@ -2081,10 +2110,13 @@ const notifyHolderOfCancellation = async (
 const refundAndCancelTicket = async (
   ticket: any,
   reason: string,
-  operation?: StaffOperationContext
+  operation?: StaffOperationContext,
+  origin: 'organizer' | 'cancelled-settlement' = 'organizer'
 ): Promise<TicketRefundOutcome> => {
   const base = { ticketId: ticket.id, uniqueCode: ticket.uniqueCode };
-  if (staffAdminScope.actor() && !operation) {
+  const cancelledSettlement = origin === 'cancelled-settlement' && ticket.event?.isCancelled &&
+    ticket.paymentStatus === 'SUCCEEDED' && ['sold', 'reserved'].includes(ticket.status);
+  if (staffAdminScope.actor() && !operation && !cancelledSettlement) {
     throw new ApiError('A saved corporate refund operation is required', 401);
   }
 

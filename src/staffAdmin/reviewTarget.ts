@@ -5,6 +5,12 @@ import { operations } from "./operations";
 import { ticketRefundTerms } from "../services/ticket-refund-terms";
 import { cancellationManifest } from "./cancellation";
 import { getCheckInDetails } from "../services/ticket.service";
+import {
+  purchaseEvidence,
+  purchaseSnapshot,
+  purchaseView,
+  purchaseRecoveryReceipt,
+} from "./purchaseRecovery";
 import { sumTicketRevenue } from "../services/settlement.service";
 import { CURRENCY } from "../config/platform";
 import { validateOperationInput } from "./inputs";
@@ -45,6 +51,51 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (name === "admin_recover_purchase") {
+    const evidence = await purchaseEvidence(parameters.id, lock);
+    const source = purchaseView(evidence);
+    return {
+      version: hashIntent({
+        name,
+        parameters,
+        snapshot: purchaseSnapshot(evidence),
+      }),
+      workspace: {
+        id: source.id,
+        name: source.buyerName ?? source.id,
+        eventNames: source.eventNames,
+        status: source.status,
+        originalTicketCount: source.originalTicketCount,
+        recordedAmount: source.recordedAmount,
+        currency: source.currency,
+        chargeId: source.chargeId,
+        originalAttemptRef: source.originalAttemptRef,
+        policy:
+          "Recover only this saved purchase. Never create another charge or allocate new seats. The existing service can issue confirmed paid tickets, deliver the tracked order, or refund a confirmed payment for a cancelled event. Unknown refunds and deliveries retain their original safeguards.",
+      },
+    };
+  }
+  if (
+    [
+      "admin_check_purchase_recovery",
+      "admin_continue_purchase_recovery",
+    ].includes(name)
+  ) {
+    const record = await purchaseRecoveryReceipt(parameters.id);
+    return {
+      version: hashIntent({ name, parameters, id: record.id }),
+      workspace: {
+        id: record.id,
+        name: record.source.buyerName ?? record.source.id,
+        purchase: record.source.id,
+        status: record.source.status,
+        policy:
+          name === "admin_check_purchase_recovery"
+            ? "Read original source/payment proof. No charge, ticket message or refund is dispatched by this check."
+            : "Queue only the original approved purchase recovery. It cannot create a charge or allocate new seats; original refund and delivery holds remain authoritative.",
+      },
+    };
+  }
   if (
     ["admin_continue_cancellation", "admin_check_cancellation"].includes(name)
   ) {

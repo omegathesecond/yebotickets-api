@@ -1,3 +1,4 @@
+jest.mock('../../staffAdmin/purchaseRecovery', () => ({ recoverCorporatePurchases: jest.fn(async () => undefined) }));
 jest.mock('../../staffAdmin/cancellation', () => ({ recoverCorporateCancellations: jest.fn(async () => undefined) }));
 // Unit tests for the global reclaim sweep + in-process scheduler.
 //
@@ -27,6 +28,7 @@ jest.mock('../../config/prisma', () => ({
 }));
 
 import { recoverCorporateCancellations } from '../../staffAdmin/cancellation';
+import { recoverCorporatePurchases } from '../../staffAdmin/purchaseRecovery';
 import { reclaimExpiredReservations, RECLAIM_BATCH } from '../ticket.service';
 import {
   runReclaimSweep,
@@ -210,6 +212,7 @@ describe('startReservationReclaimScheduler', () => {
 
     expect(reclaimMock).toHaveBeenCalled();
     expect(recoverCorporateCancellations).toHaveBeenCalledTimes(2);
+    expect(recoverCorporatePurchases).toHaveBeenCalledTimes(2);
   });
 
   it('is idempotent — a second start returns the same timer without a new interval', () => {

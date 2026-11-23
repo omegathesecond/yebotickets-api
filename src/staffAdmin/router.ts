@@ -43,6 +43,16 @@ import {
   checkCorporateCancellation,
   recoverCorporateCancellations,
 } from "./cancellation";
+import {
+  purchaseEvidence,
+  purchaseView,
+  listPurchases,
+  recoverCorporatePurchase,
+  purchaseRecoveryReceipt,
+  checkCorporatePurchase,
+  resumeCorporatePurchase,
+} from "./purchaseRecovery";
+import { listDeliveryRecords, deliveryRecord } from "./deliveryRecords";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
@@ -588,6 +598,74 @@ export function createCorporateAdminRouter(
               ({ action, ...record }) => ({ ...record, id: record.ticketId }),
             ),
           };
+          break;
+        case "admin_purchases":
+          data = await listPurchases(p);
+          break;
+        case "admin_purchase": {
+          const { tickets, ...summary } = purchaseView(
+            await purchaseEvidence(p.id),
+          );
+          data = summary;
+          break;
+        }
+        case "admin_purchase_tickets":
+          data = recordsPage(
+            purchaseView(await purchaseEvidence(p.id)).tickets,
+            p,
+          );
+          break;
+        case "admin_recover_purchase":
+          return res.json(
+            await recoverCorporatePurchase(verifiedStaffOperation(req)),
+          );
+        case "admin_purchase_recoveries": {
+          const { page: pg, limit } = page(p);
+          const [records, count] = await Promise.all([
+            prisma.$queryRawUnsafe<any[]>(
+              `SELECT a.id,a."staffName",a."createdAt",a.parameters->>'id' AS "purchaseId",o.state AS "operationState" FROM staff_admin_audit a JOIN staff_admin_operations o ON o.id=a.id WHERE a.operation=$1 ORDER BY a."createdAt" DESC,a.id LIMIT $2 OFFSET $3`,
+              "admin_recover_purchase",
+              limit,
+              (pg - 1) * limit,
+            ),
+            prisma.$queryRawUnsafe<any[]>(
+              "SELECT COUNT(*)::integer AS total FROM staff_admin_audit WHERE operation=$1",
+              "admin_recover_purchase",
+            ),
+          ]);
+          data = { records, total: count[0].total };
+          break;
+        }
+        case "admin_purchase_recovery":
+          data = await purchaseRecoveryReceipt(p.id);
+          break;
+        case "admin_check_purchase_recovery":
+          data = await checkCorporatePurchase(p.id);
+          break;
+        case "admin_continue_purchase_recovery": {
+          const original = await purchaseRecoveryReceipt(p.id),
+            queuedId = verifiedStaffOperation(req).id;
+          data = {
+            status: "ORIGINAL_RECOVERY_QUEUED",
+            originalOperationId: p.id,
+            originalOperationState: original.operationState,
+            note: "Queued is not a confirmed payment, ticket or delivery outcome.",
+          };
+          res.once("finish", () => {
+            (async () => {
+              if ((await store.get(queuedId))?.state === "completed")
+                await resumeCorporatePurchase(p.id);
+            })().catch((error) =>
+              console.error("Original purchase recovery failed:", error),
+            );
+          });
+          break;
+        }
+        case "admin_deliveries":
+          data = await listDeliveryRecords(p);
+          break;
+        case "admin_delivery":
+          data = await deliveryRecord(p.id);
           break;
         case "admin_operation_receipt":
           data = await store.get(p.operationId);

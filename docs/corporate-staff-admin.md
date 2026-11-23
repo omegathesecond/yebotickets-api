@@ -84,6 +84,29 @@ notification failures are returned explicitly; proof checks send no notice and
 financial receipts make no delivery claim. Durable notice tracking/recovery
 remains part of the outstanding delivery work.
 
+Finance staff can now select an existing saved purchase, inspect its original
+buyer, allocations and charge, and prepare recovery through the central CEO
+queue. Recovery reuses the owning purchase service and advisory identity lock;
+it cannot start a new charge or allocate replacement seats. Original payment
+identity, currency and recorded total are checked before repairing references,
+issuing admission or refunding a cancelled-event payment. The shared lock query
+returns a supported scalar so actual PostgreSQL/Prisma recovery works.
+
+The immutable initial recovery audit freezes the saved purchase identity and
+recorded allocations. Source-owned original checks and queued continuation reuse
+that audit and actual corporate actor, including after a process restart. The
+existing recovery driver resumes interrupted requests; critical final audit and
+original receipt commit together. A completed one-shot recovery request can
+truthfully report pending payment; `sourceFinal` separately reports whether the
+purchase is resolved. Failed allocations cannot expose or reset later buyers'
+reused seats. Contradictory payment evidence fails visibly.
+
+Ticket staff can browse existing delivery work and its original attempt/status
+inside the same workspace. Detail reads preserve the actual source ID, including
+its colon, through a validated query field. Recorded acceptance is not customer
+receipt. This batch adds visibility only; explicit retry, provider receipt and
+durable cancellation-notice tracking remain outstanding.
+
 Admission uses the existing scanner preview, conditional Event/Ticket admission
 claim and durable operator receipt. Ticket staff select an actual ticket code and
 see its current admission state and holder/event details. Confirmation prepares
@@ -186,7 +209,7 @@ invented gateway history. See [recovery](refund-recovery.md) and
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Sixty-four actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- Seventy-six actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -198,7 +221,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
   pending settlement, stale queued work, original-sender fencing and aggregate
   financial audit/receipt failure recovery, bounded fair proof progress across
   distinct charges, and an actual blocked-Event/NOWAIT
-  Ticket probe verifying the deadlock repair.
+  Ticket probe verifying the deadlock repair. Purchase checks also cover saved
+  allocation recovery, no new charge, original amount/currency mismatch,
+  payment-read outages, concurrent continuation, initial/final audit failures,
+  cancelled settlement, original refund proof, failed/reused seats and
+  contradictory payment evidence.
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
@@ -224,6 +251,10 @@ invented gateway history. See [recovery](refund-recovery.md) and
   also fit its viewport. An
   unrelated YeboShops review warning is visible because that route is absent
   from this local fixture; no successful data substitutes for it.
+  Purchase browser review verified finance preparing a two-ticket SZL100
+  recovery, CEO execution, persisted issued status and one original delivery
+  attempt. The 390px delivery-detail document fit the viewport. All payments
+  and communications remained simulated on named localhost databases.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -232,6 +263,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   was also included in a fresh complete replay of `yebotickets_admin_fixture`.
   The complete final history through proof-check progress also replayed on a fresh
   `yebotickets_cancellation_final_schema_fixture_20261123` database.
+  The complete history through purchase intent also replayed on a fresh
+  `yebotickets_purchase_schema_fixture_20261123` database.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -257,7 +290,7 @@ existing organiser business service, not an invented corporate admin identity.
 ## Remaining before whole-product acceptance
 
 Complete the remaining source inventory and native workflows: durable
-cancellation-notice tracking/delivery recovery, purchase recovery, account
+cancellation-notice tracking, delivery receipt/retry recovery, account
 workflows and configuration
 where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
@@ -281,6 +314,8 @@ adds separate operator-kind attribution to existing admission receipts.
 cancellation manifest per event and extends immutable original financial intent.
 `20261123210000_refund_proof_check_progress` records actual nonterminal proof-read
 timestamps on the existing hold; historical rows are not assigned invented reads.
+`20261123220000_purchase_recovery_intent` extends immutable original financial
+intent to the existing purchase-recovery audit.
 Preflight duplicate attempt identities before release;
 never rewrite history to make the migration pass.
 
