@@ -1,4 +1,4 @@
-import { assertEventVisible } from '../utils/eventVisibility';
+import { assertEventVisible, eventOwnershipFilter } from '../utils/eventVisibility';
 import prisma from '../config/prisma';
 import { assertDateInterval } from '../utils/dateInterval';
 import { IEvent, IEventInput, flattenEventLocation, nestEventLocation } from '../interfaces/event.interface';
@@ -245,7 +245,7 @@ export const getEventById = async (
 export const updateEvent = async (
   eventId: string,
   updateData: Partial<IEventInput>,
-  organizerId: string
+  organizerId: string | undefined
 ) => {
   try {
     return await prisma.$transaction(async (tx) => {
@@ -255,7 +255,7 @@ export const updateEvent = async (
       const existingEvent = await tx.event.findFirst({
         where: {
           id: eventId,
-          organizerId,
+          ...eventOwnershipFilter(organizerId),
         },
       });
 
@@ -360,27 +360,39 @@ export const adminUnpublishEvent = async (eventId: string) => {
  */
 export const deleteEvent = async (
   eventId: string,
-  organizerId: string
+  organizerId: string | undefined
 ): Promise<{ message: string }> => {
   try {
-    // Check if the event exists and belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: eventId,
-        organizerId,
-      },
+    return await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Event" WHERE "id" = ${eventId} FOR UPDATE`;
+      // Check if the event exists and belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: eventId,
+          ...eventOwnershipFilter(organizerId),
+        },
+      });
+
+      if (!event) {
+        throw new ApiError(
+          'Event not found or you do not have permission to delete it',
+          404
+        );
+      }
+
+      if (await tx.ticket.count({ where: { eventId } }))
+        throw new ApiError(
+          'This event has ticket records. Delete only unissued tiers first, or unpublish/cancel the event; keep issued ticket and payment history.',
+          409
+        );
+
+      // Only an empty event can be deleted; its empty tier definitions may cascade.
+      await tx.event.delete({
+        where: { id: eventId },
+      });
+
+      return { message: 'Event deleted successfully' };
     });
-
-    if (!event) {
-      throw new ApiError('Event not found or you do not have permission to delete it', 404);
-    }
-
-    // Delete the event (cascade will delete related ticketTypes and tickets)
-    await prisma.event.delete({
-      where: { id: eventId },
-    });
-
-    return { message: 'Event deleted successfully' };
   } catch (error) {
     console.error('Error in deleteEvent service:', error);
     if (error instanceof ApiError) throw error;

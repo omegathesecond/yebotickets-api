@@ -20,6 +20,26 @@ events; ticket-only staff receive minimal event context without organiser
 contacts. The existing product services own queries, event visibility,
 verification, unpublishing, settlement and payout transitions.
 
+Event staff can create an event for a named real organiser, edit its details and
+publication, and delete an empty event. Ticket staff can select an event and tier,
+create/edit tiers, generate available inventory and delete unissued tiers. These
+native actions reuse the same product validators, date checks, tier locks and
+capacity calculation. Generation does not sell, charge or send tickets. Empty
+edits fail visibly, and validation errors explain the existing product rule.
+
+Tier reviews freeze the existing inventory records as well as the tier. Empty
+event deletion freezes the tier definitions it would remove. New allocations or
+definitions invalidate stale approvals. Deletion is transactional and preserves
+reserved, sold and cancelled records; critical audit failure rolls back generated
+inventory. Original event ownership and the post-sale settlement end-date guard
+remain enforced. An omitted product owner is accepted only within the verified
+corporate request context.
+
+The shared event location conversion now preserves valid zero coordinates.
+Shared frontend nested forms use their proper React component boundary, source
+field titles and existing record path helper; this fixes a browser-observed event
+form crash and missing nested organiser names without a separate Tickets renderer.
+
 Writes prepare exact record versions in the existing central CEO decision queue.
 Current authority is checked again at execution. Product mutations, the critical
 corporate audit and the original receipt commit together; audit failure rolls
@@ -80,11 +100,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
 
 ## Local evidence
 
-- Product build and 519 tests across 32 suites passed. The tests include workload
+- Product build and 524 tests across 33 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Fifteen actual native Tickets/CEO HTTP/PostgreSQL checks passed with a
+- Twenty-five actual native Tickets/CEO HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -92,11 +112,14 @@ invented gateway history. See [recovery](refund-recovery.md) and
 - The separate actual Tickets/YeboPay refund fixture verifies original proof and
   reconciliation. Payment and notification transports are simulated; no real
   payment or message is sent.
-- CEO guarded build and focused native permission tests passed; 324 frontend
+- CEO guarded build and focused native permission tests passed; 326 frontend
   tests and the guarded frontend build passed.
 - Disposable local desktop/mobile browser review verified a finance request,
   named organiser selection, CEO-only execution, saved corporate attribution and
-  related ticket records. The 390px document fit its viewport. Sign-in uses the
+  related ticket records. A second browser journey verified ticket-only named
+event/tier selection, a two-seat generation request, CEO execution, saved count,
+remaining inventory and full event creation with structured address/date fields.
+The 390px document fit its viewport. Sign-in uses the
   explicitly isolated fixture identity, not production authentication. An
   unrelated YeboShops review warning is visible because that route is absent
   from this local fixture; no successful data substitutes for it.
@@ -122,7 +145,7 @@ existing organiser business service, not an invented corporate admin identity.
 
 Complete the remaining source inventory and native workflows: exact refund
 execution/original-proof checks, event cancellation with its reviewed child
-refund set, inventory and event creation/editing/deletion, admission, delivery
+refund set, admission, delivery
 and purchase recovery, and configuration where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
 environment-bound approvals before claiming both environments are manageable.

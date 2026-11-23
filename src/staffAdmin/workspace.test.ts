@@ -9,12 +9,18 @@ it("supplies usable labels and record bindings to the existing CEO workspace", (
     expect(section.label.trim()).not.toBe("");
     expect(operations[section.operation]).toBeDefined();
     if (section.detail) {
-      expect(section.bind).toEqual({ id: "id" });
+      expect(Object.values(section.bind)).toContain("id");
+      const detail = operations[section.detail];
+      expect(
+        Object.keys(detail.properties).some(
+          (key) => section.bind[key] === "id",
+        ),
+      ).toBe(true);
       expect(operations[section.detail]).toBeDefined();
     }
     for (const related of section.related || []) {
       check(related);
-      expect(related.bind).toEqual({ id: "id" });
+      expect(Object.values(related.bind)).toContain("id");
     }
   };
   workspace.sections.forEach(check);

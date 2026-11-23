@@ -1,3 +1,4 @@
+import { TicketType } from "../interfaces/ticket.interface";
 const id = {
   type: "string",
   pattern:
@@ -42,6 +43,60 @@ const change = (
   properties: { id, reason, ...properties },
   required: ["id", "reason", ...required],
   target: { model, field: "id" },
+});
+const dateTime = { type: "string", format: "date-time" };
+const text = { type: "string", minLength: 1 };
+const eventFields = {
+  title: { ...text, minLength: 3, maxLength: 100 },
+  description: text,
+  location: {
+    type: "object",
+    properties: {
+      address: text,
+      city: text,
+      country: text,
+      coordinates: {
+        description: "Optional. Leave both coordinates blank to use the address.",
+        type: "object",
+        properties: { lat: { type: "number" }, lng: { type: "number" } },
+        required: ["lat", "lng"],
+        additionalProperties: false,
+      },
+    },
+    required: ["address", "city", "country"],
+    additionalProperties: false,
+  },
+  startDate: dateTime,
+  endDate: dateTime,
+  category: text,
+  coverImage: { type: "string" },
+  isPublished: { type: "boolean" },
+};
+const tierFields = {
+  name: { ...text, minLength: 2, maxLength: 50 },
+  description: { type: "string" },
+  price: { type: "number", minimum: 0 },
+  quantity: { type: "integer", minimum: 1 },
+  type: { type: "string", enum: Object.values(TicketType) },
+  saleStartDate: dateTime,
+  saleEndDate: dateTime,
+};
+const create = (
+  title: string,
+  path: string,
+  area: string,
+  model: string,
+  field: string,
+  properties: any,
+  required: string[],
+) => ({
+  title,
+  path,
+  area,
+  method: "POST",
+  properties: { reason, ...properties },
+  required: [field, "reason", ...required],
+  target: { model, field },
 });
 const paged = { collection: "records", total: "total" };
 export const operations: Record<string, any> = {
@@ -117,6 +172,85 @@ export const operations: Record<string, any> = {
     paged,
   ),
   admin_event: read("Event details", "/events/:id", "events", { id }),
+  admin_create_event: create(
+    "Create an event",
+    "/events",
+    "events",
+    "user",
+    "organizerId",
+    { organizerId: organizer, ...eventFields },
+    ["title", "description", "location", "startDate", "endDate", "category"],
+  ),
+  admin_update_event: change(
+    "Edit event details",
+    "/events/:id",
+    "events",
+    "event",
+    eventFields,
+    [],
+  ),
+  admin_delete_event: {
+    ...change(
+      "Delete an empty event",
+      "/events/:id",
+      "events",
+      "event",
+      {},
+      [],
+    ),
+    method: "DELETE",
+  },
+  admin_event_inventory: read(
+    "Ticket tiers and remaining inventory",
+    "/events/:eventId/inventory",
+    "tickets",
+    { eventId: id },
+    { collection: "records", accessAreas: ["tickets", "events"] },
+  ),
+  admin_ticket_type: read(
+    "Ticket tier details",
+    "/ticket-types/:ticketTypeId",
+    "tickets",
+    { ticketTypeId: id },
+    { accessAreas: ["tickets", "events"] },
+  ),
+  admin_create_ticket_type: create(
+    "Create a ticket tier",
+    "/events/:eventId/inventory",
+    "tickets",
+    "event",
+    "eventId",
+    { eventId: id, ...tierFields },
+    ["name", "price", "quantity", "saleStartDate", "saleEndDate"],
+  ),
+  admin_update_ticket_type: change(
+    "Edit ticket tier",
+    "/ticket-types/:id",
+    "tickets",
+    "ticketType",
+    tierFields,
+    [],
+  ),
+  admin_delete_ticket_type: {
+    ...change(
+      "Delete unsold ticket tier",
+      "/ticket-types/:id",
+      "tickets",
+      "ticketType",
+      {},
+      [],
+    ),
+    method: "DELETE",
+  },
+  admin_generate_inventory: create(
+    "Generate available tickets",
+    "/ticket-types/:id/generate",
+    "tickets",
+    "ticketType",
+    "id",
+    { id, quantity: { type: "integer", minimum: 1, maximum: 1000 } },
+    ["quantity"],
+  ),
   admin_ticket_events: read(
     "Choose an event for ticket records",
     "/ticket-events",

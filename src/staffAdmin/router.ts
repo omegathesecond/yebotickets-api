@@ -19,6 +19,9 @@ import {
   getEvents,
   getEventById,
   adminUnpublishEvent,
+  createEvent,
+  updateEvent,
+  deleteEvent,
 } from "../services/event.service";
 import {
   getEventDetailsForOrganizer,
@@ -26,10 +29,18 @@ import {
   getEventPurchases,
 } from "../services/organizer-event.service";
 import * as payouts from "../services/payout.service";
-import { listRefundRecovery } from "../services/ticket.service";
+import {
+  listRefundRecovery,
+  getTicketTypes,
+  createTicketType,
+  updateTicketType,
+  deleteTicketType,
+  generateTickets,
+} from "../services/ticket.service";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
+import { operationInput, validateOperationInput } from "./inputs";
 
 const store = createPostgresOperationStore(async (query, values) => ({
   rows: await prisma.$queryRawUnsafe<any[]>(query, ...values),
@@ -38,6 +49,7 @@ const tables: Record<string, string> = {
   user: "User",
   event: "Event",
   payoutRequest: "PayoutRequest",
+  ticketType: "TicketType",
 };
 const fail = (message: string, status = 400) => new ApiError(message, status);
 function checked(name: string, parameters: Record<string, any>) {
@@ -61,7 +73,7 @@ function checked(name: string, parameters: Record<string, any>) {
 const targetKey = (name: string, parameters: Record<string, any>) => {
   const op = checked(name, parameters);
   if (!op.target) throw fail("Choose an operation that changes a record");
-  return "yebotickets:" + op.target.model + ":" + parameters.id;
+  return "yebotickets:" + op.target.model + ":" + parameters[op.target.field];
 };
 async function review(
   name: string,
@@ -71,18 +83,51 @@ async function review(
   const op = checked(name, parameters),
     table = op.target && tables[op.target.model];
   if (!table) throw fail("This operation has no editable target");
+  await validateOperationInput(name, parameters);
   const rows = await prisma.$queryRawUnsafe<any[]>(
     `SELECT * FROM "${table}" WHERE id=$1${lock ? " FOR UPDATE" : ""}`,
-    parameters.id,
+    parameters[op.target.field],
   );
   if (!rows.length) throw fail("The product record was not found", 404);
   if (op.target.model === "user" && rows[0].role !== "organizer")
     throw fail("Choose an organiser account", 404);
+  const inventory =
+    op.target.model === "ticketType" || name === "admin_delete_event"
+      ? await prisma.$queryRawUnsafe<any[]>(
+          `SELECT id,status,"userId","updatedAt" FROM "Ticket" WHERE "${op.target.model === "ticketType" ? "ticketTypeId" : "eventId"}"=$1 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+          parameters[op.target.field],
+        )
+      : undefined;
+  const tiers =
+    name === "admin_delete_event"
+      ? await prisma.$queryRawUnsafe<any[]>(
+          `SELECT * FROM "TicketType" WHERE "eventId"=$1 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+          parameters[op.target.field],
+        )
+      : undefined;
   return {
-    version: hashIntent({ name, parameters, rows }),
+    version: hashIntent({ name, parameters, rows, inventory, tiers }),
     workspace: {
       id: rows[0].id,
       name: rows[0].name ?? rows[0].title ?? op.title,
+      ...(name === "admin_delete_event"
+        ? {
+            ticketRecords: inventory!.length,
+            tierDefinitions: tiers!.length,
+            policy:
+              "Delete only an empty event. Its reviewed empty tier definitions will also be removed. Issued inventory and payment history must be kept.",
+          }
+        : {}),
+      ...(op.target.model === "ticketType"
+        ? {
+            eventId: rows[0].eventId,
+            price: rows[0].price,
+            capacity: rows[0].quantity,
+            inventoryRecords: inventory!.length,
+            policy:
+              "Capacity includes sold, reserved and cancelled records. Generation adds available tickets; it does not sell, charge or send them. Deletion retains issued ticket and payment history.",
+          }
+        : {}),
       ...(op.target.model === "payoutRequest"
         ? {
             amount: rows[0].amount,
@@ -145,7 +190,7 @@ export function createCorporateAdminRouter(
           req.res!.locals.native.parameters,
           lock,
         ),
-      onVerified(req) {
+      async onVerified(req) {
         const matched = matchOperation(operations, req.method, req.path);
         if (!matched && !["/capabilities", "/review-target"].includes(req.path))
           throw fail("Unknown Tickets administration route", 404);
@@ -157,6 +202,7 @@ export function createCorporateAdminRouter(
             ...matched.parameters,
           };
           checked(matched.name, parameters);
+          await validateOperationInput(matched.name, parameters);
           req.res!.locals.native = { ...matched, parameters };
         }
       },
@@ -278,6 +324,44 @@ export function createCorporateAdminRouter(
         }
         case "admin_event":
           data = await getEventById(p.id);
+          break;
+        case "admin_create_event":
+          data = await createEvent(operationInput(p) as any, p.organizerId);
+          break;
+        case "admin_update_event":
+          data = await updateEvent(p.id, operationInput(p), undefined);
+          break;
+        case "admin_delete_event":
+          data = await deleteEvent(p.id, undefined);
+          break;
+        case "admin_event_inventory":
+          data = { records: await getTicketTypes(p.eventId) };
+          break;
+        case "admin_ticket_type": {
+          const tier = await prisma.ticketType.findUniqueOrThrow({
+            where: { id: p.ticketTypeId },
+          });
+          data = (await getTicketTypes(tier.eventId)).find(
+            (record) => record.id === p.ticketTypeId,
+          );
+          if (!data) throw fail("Ticket tier was not found", 404);
+          break;
+        }
+        case "admin_create_ticket_type":
+          data = await createTicketType(
+            operationInput(p),
+            p.eventId,
+            undefined,
+          );
+          break;
+        case "admin_update_ticket_type":
+          data = await updateTicketType(p.id, operationInput(p), undefined);
+          break;
+        case "admin_delete_ticket_type":
+          data = await deleteTicketType(p.id, undefined);
+          break;
+        case "admin_generate_inventory":
+          data = await generateTickets(p.id, p.quantity, undefined);
           break;
         case "admin_ticket_event": {
           const event = await getEventById(p.id);

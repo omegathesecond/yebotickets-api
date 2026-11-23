@@ -49,8 +49,8 @@ export function flattenEventLocation(location: IEventLocation) {
     locationAddress: location.address,
     locationCity: location.city,
     locationCountry: location.country,
-    locationLat: location.coordinates?.lat || null,
-    locationLng: location.coordinates?.lng || null,
+    locationLat: location.coordinates?.lat ?? null,
+    locationLng: location.coordinates?.lng ?? null,
   };
 }
 
@@ -60,7 +60,8 @@ export function nestEventLocation(event: IEvent): IEventLocation {
     address: event.locationAddress,
     city: event.locationCity,
     country: event.locationCountry,
-    coordinates: event.locationLat && event.locationLng
+    coordinates: event.locationLat !== null && event.locationLat !== undefined &&
+      event.locationLng !== null && event.locationLng !== undefined
       ? { lat: event.locationLat, lng: event.locationLng }
       : undefined,
   };

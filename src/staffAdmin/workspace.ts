@@ -1,3 +1,53 @@
+const eventRecords = [
+  {
+    id: "tickets",
+    label: "Tickets",
+    operation: "admin_event_tickets",
+    bind: { id: "id" },
+    collection: "records",
+    total: "total",
+    columns: ["ownerName", "ticketType", "status", "refundRequestedAt"],
+  },
+  {
+    id: "purchases",
+    label: "Purchase records",
+    operation: "admin_event_purchases",
+    bind: { id: "id" },
+    collection: "records",
+    total: "total",
+    columns: ["customerName", "totalAmount", "status"],
+  },
+  {
+    id: "stats",
+    label: "Event paid allocations",
+    operation: "admin_event_stats",
+    bind: { id: "id" },
+  },
+  {
+    id: "inventory",
+    label: "Ticket inventory",
+    operation: "admin_event_inventory",
+    bind: { eventId: "id", ticketTypeId: "id" },
+    collection: "records",
+    detail: "admin_ticket_type",
+    actionBind: { id: "id" },
+    create: ["admin_create_ticket_type"],
+    actions: [
+      "admin_update_ticket_type",
+      "admin_generate_inventory",
+      "admin_delete_ticket_type",
+    ],
+    columns: [
+      "name",
+      "price",
+      "quantity",
+      "availableQuantity",
+      "saleStartDate",
+      "saleEndDate",
+    ],
+  },
+];
+
 export default {
   description:
     "Events, organisers, tickets and payment decisions in the CEO super-admin.",
@@ -41,7 +91,12 @@ export default {
       total: "total",
       detail: "admin_event",
       bind: { id: "id" },
-      actions: ["admin_unpublish_event"],
+      actions: [
+        "admin_update_event",
+        "admin_unpublish_event",
+        "admin_delete_event",
+      ],
+      create: ["admin_create_event"],
       columns: [
         "title",
         "organizer.name",
@@ -49,32 +104,8 @@ export default {
         "isCancelled",
         "startDate",
       ],
-      related: [
-        {
-          id: "tickets",
-          label: "Tickets",
-          operation: "admin_event_tickets",
-          bind: { id: "id" },
-          collection: "records",
-          total: "total",
-          columns: ["ownerName", "ticketType", "status", "refundRequestedAt"],
-        },
-        {
-          id: "purchases",
-          label: "Purchase records",
-          operation: "admin_event_purchases",
-          bind: { id: "id" },
-          collection: "records",
-          total: "total",
-          columns: ["customerName", "totalAmount", "status"],
-        },
-        {
-          id: "stats",
-          label: "Event paid allocations",
-          operation: "admin_event_stats",
-          bind: { id: "id" },
-        },
-      ],
+      columnLabels: { "organizer.name": "Organiser" },
+      related: eventRecords,
     },
     {
       id: "ticketEvents",
@@ -85,32 +116,7 @@ export default {
       detail: "admin_ticket_event",
       bind: { id: "id" },
       columns: ["title", "startDate", "endDate", "isCancelled"],
-      related: [
-        {
-          id: "tickets",
-          label: "Tickets",
-          operation: "admin_event_tickets",
-          bind: { id: "id" },
-          collection: "records",
-          total: "total",
-          columns: ["ownerName", "ticketType", "status", "refundRequestedAt"],
-        },
-        {
-          id: "purchases",
-          label: "Purchase records",
-          operation: "admin_event_purchases",
-          bind: { id: "id" },
-          collection: "records",
-          total: "total",
-          columns: ["customerName", "totalAmount", "status"],
-        },
-        {
-          id: "stats",
-          label: "Event paid allocations",
-          operation: "admin_event_stats",
-          bind: { id: "id" },
-        },
-      ],
+      related: eventRecords,
     },
     {
       id: "settlements",
@@ -144,6 +150,7 @@ export default {
         "admin_reject_payout",
         "admin_record_paid_payout",
       ],
+      columnLabels: { "organizer.name": "Organiser" },
       columns: [
         "organizer.name",
         "amount",

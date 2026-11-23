@@ -1,4 +1,4 @@
-import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
+import { assertEventVisible, eventOwnershipFilter, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
@@ -101,7 +101,7 @@ const mapTicketStatus = (status: string): TicketStatus => {
 export const createTicketType = async (
   ticketTypeData: Partial<ITicketType>, 
   eventId: string,
-  organizerId: string
+  organizerId: string | undefined
 ) => {
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
@@ -109,7 +109,7 @@ export const createTicketType = async (
     const event = await prisma.event.findFirst({
       where: {
         id: eventId,
-        organizerId,
+        ...eventOwnershipFilter(organizerId),
       },
     });
 
@@ -226,7 +226,7 @@ const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string
 export const updateTicketType = async (
   ticketTypeId: string,
   updateData: Partial<ITicketType>,
-  organizerId: string
+  organizerId: string | undefined
 ) => {
   try {
     return await prisma.$transaction(async (tx) => {
@@ -244,7 +244,7 @@ export const updateTicketType = async (
       const event = await tx.event.findFirst({
         where: {
           id: ticketType.eventId,
-          organizerId,
+          ...eventOwnershipFilter(organizerId),
         },
       });
 
@@ -295,56 +295,65 @@ export const updateTicketType = async (
  */
 export const deleteTicketType = async (
   ticketTypeId: string,
-  organizerId: string
+  organizerId: string | undefined
 ): Promise<{ message: string }> => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
+    return await prisma.$transaction(async (tx) => {
+      await lockTicketTier(tx, ticketTypeId);
+      // Find ticket type
+      const ticketType = await tx.ticketType.findUnique({
+        where: { id: ticketTypeId },
+      });
+
+      if (!ticketType) {
+        throw new ApiError('Ticket type not found', 404);
+      }
+
+      // Verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: ticketType.eventId,
+          ...eventOwnershipFilter(organizerId),
+        },
+      });
+
+      if (!event) {
+        throw new ApiError(
+          'You do not have permission to delete this ticket type',
+          403
+        );
+      }
+
+      // Preserve issued, held and cancelled records; deletion is only for unsold inventory.
+      const issuedTicketsCount = await tx.ticket.count({
+        where: {
+          ticketTypeId,
+          status: { not: 'available' },
+        },
+      });
+
+      if (issuedTicketsCount > 0) {
+        throw new ApiError(
+          'Cannot delete a ticket tier with issued, reserved or cancelled tickets; keep its original history',
+          400
+        );
+      }
+
+      // Delete all available tickets of this type first
+      await tx.ticket.deleteMany({
+        where: {
+          ticketTypeId,
+          status: 'available',
+        },
+      });
+
+      // Delete the ticket type
+      await tx.ticketType.delete({
+        where: { id: ticketTypeId },
+      });
+
+      return { message: 'Ticket type deleted successfully' };
     });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to delete this ticket type', 403);
-    }
-
-    // Check if there are any tickets of this type that are already sold
-    const soldTicketsCount = await prisma.ticket.count({
-      where: {
-        ticketTypeId,
-        status: { in: ['sold', 'reserved'] },
-      },
-    });
-
-    if (soldTicketsCount > 0) {
-      throw new ApiError('Cannot delete ticket type that has sold tickets', 400);
-    }
-
-    // Delete all available tickets of this type first
-    await prisma.ticket.deleteMany({
-      where: {
-        ticketTypeId,
-        status: 'available',
-      },
-    });
-
-    // Delete the ticket type
-    await prisma.ticketType.delete({
-      where: { id: ticketTypeId },
-    });
-
-    return { message: 'Ticket type deleted successfully' };
   } catch (error) {
     console.error('Error in deleteTicketType service:', error);
     if (error instanceof ApiError) throw error;
@@ -362,7 +371,7 @@ export const deleteTicketType = async (
 export const generateTickets = async (
   ticketTypeId: string,
   quantity: number,
-  organizerId: string
+  organizerId: string | undefined
 ): Promise<{ message: string; count: number }> => {
   try {
     return await prisma.$transaction(async (tx) => {
@@ -380,7 +389,7 @@ export const generateTickets = async (
       const event = await tx.event.findFirst({
         where: {
           id: ticketType.eventId,
-          organizerId,
+          ...eventOwnershipFilter(organizerId),
         },
       });
 
