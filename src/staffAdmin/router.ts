@@ -59,6 +59,12 @@ import {
   deliveryMessageRecord,
 } from "./deliveryRecords";
 import { checkDeliveryMessage } from "../services/delivery-message.service";
+import {
+  retryCorporateDelivery,
+  deliveryRetryView,
+  checkOriginalDeliveryRetry,
+  reconcileDeliveryRetryForMessage,
+} from "./deliveryRetries";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
@@ -680,7 +686,37 @@ export function createCorporateAdminRouter(
           data = await deliveryMessageRecord(p.id);
           break;
         case "admin_check_delivery_message":
-          data = await checkDeliveryMessage(p.id);
+          data = {
+            ...(await checkDeliveryMessage(p.id)),
+            ...(await reconcileDeliveryRetryForMessage(p.id)),
+          };
+          break;
+        case "admin_retry_delivery": {
+          const body = await retryCorporateDelivery(
+            verifiedStaffOperation(req),
+          );
+          return res.status(body.success ? 200 : 502).json(body);
+        }
+        case "admin_delivery_retries": {
+          const { page: pg, limit } = page(p);
+          const [records, count] = await Promise.all([
+            prisma.$queryRawUnsafe<any[]>(
+              `SELECT a.id,a."staffName",a."createdAt",a.parameters->>'id' AS "deliveryOrderId",a.parameters->'reviewedEffect'->>'dispatchAttemptId' AS "dispatchAttemptId",o.state AS "operationState" FROM staff_admin_audit a JOIN staff_admin_operations o ON o.id=a.id WHERE a.operation='admin_retry_delivery' ORDER BY a."createdAt" DESC,a.id LIMIT $1 OFFSET $2`,
+              limit,
+              (pg - 1) * limit,
+            ),
+            prisma.$queryRawUnsafe<any[]>(
+              "SELECT COUNT(*)::integer AS total FROM staff_admin_audit WHERE operation='admin_retry_delivery'",
+            ),
+          ]);
+          data = { records, total: count[0].total };
+          break;
+        }
+        case "admin_delivery_retry":
+          data = await deliveryRetryView(p.id);
+          break;
+        case "admin_check_delivery_retry":
+          data = await checkOriginalDeliveryRetry(p.id);
           break;
         case "admin_operation_receipt":
           data = await store.get(p.operationId);

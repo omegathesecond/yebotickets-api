@@ -15,6 +15,12 @@ import { sumTicketRevenue } from "../services/settlement.service";
 import { CURRENCY } from "../config/platform";
 import { validateOperationInput } from "./inputs";
 import { deliveryMessageView } from "../services/delivery-message.service";
+import {
+  deliveryReviewEvidence,
+  assertDeliveryReview,
+  lockOrderDelivery,
+} from "../services/delivery-state.service";
+import { deliveryRetryView } from "./deliveryRetries";
 const tables: Record<string, string> = {
   user: "User",
   event: "Event",
@@ -44,7 +50,13 @@ export function checked(name: string, parameters: Record<string, any>) {
 export const targetKey = (name: string, parameters: Record<string, any>) => {
   const op = checked(name, parameters);
   if (!op.target) throw fail("Choose an operation that changes a record");
-  return "yebotickets:" + op.target.model + ":" + parameters[op.target.field];
+  return (
+    "yebotickets:" +
+    op.target.model +
+    ":" +
+    parameters[op.target.field] +
+    (name === "admin_retry_delivery" ? ":" + parameters.generationId : "")
+  );
 };
 export async function review(
   name: string,
@@ -52,13 +64,58 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (name === "admin_retry_delivery") {
+    const evidence = await deliveryReviewEvidence(parameters.id, lock);
+    const policy = assertDeliveryReview(
+      evidence,
+      parameters.acknowledgeDuplicateRisk === true,
+      parameters.generationId,
+    );
+    return {
+      version: hashIntent({ name, parameters, evidence }),
+      workspace: {
+        id: evidence.order.id,
+        name: evidence.tickets[0].event.title,
+        buyerName: evidence.tickets[0].user?.name,
+        event: evidence.tickets[0].event.title,
+        previousAttemptId: evidence.order.attemptId,
+        previousDeliveryStatus: evidence.order.status,
+        acknowledgeDuplicateRisk: parameters.acknowledgeDuplicateRisk === true,
+        duplicateRisk: policy.duplicateRisk,
+        policy: policy.reason,
+      },
+    };
+  }
+  if (name === "admin_check_delivery_retry") {
+    const original = await deliveryRetryView(parameters.id);
+    return {
+      version: hashIntent({
+        name,
+        parameters,
+        id: original.id,
+        attempt: original.dispatchAttemptId,
+      }),
+      workspace: {
+        id: original.id,
+        name: "Original approved delivery retry",
+        dispatchAttemptId: original.dispatchAttemptId,
+        status: original.status,
+        policy: original.note,
+      },
+    };
+  }
   if (name === "admin_check_delivery_message") {
-    if (lock)
-      await prisma.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${parameters.id} FOR UPDATE`;
-    const message = await prisma.ticketDeliveryMessage.findUnique({
+    let message = await prisma.ticketDeliveryMessage.findUnique({
       where: { id: parameters.id },
     });
     if (!message) throw fail("Original message attempt was not found", 404);
+    if (lock) {
+      await lockOrderDelivery(prisma, message.deliveryOrderId);
+      await prisma.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${parameters.id} FOR UPDATE`;
+      message = await prisma.ticketDeliveryMessage.findUniqueOrThrow({
+        where: { id: parameters.id },
+      });
+    }
     if (!message.messageId)
       throw fail(
         "This attempt has no confirmed message identity. Do not assume it was not sent.",

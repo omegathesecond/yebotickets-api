@@ -226,6 +226,8 @@ export default {
       total: "total",
       detail: "admin_delivery",
       bind: { id: "id" },
+      actionBind: { id: "id", generationId: "generationId" },
+      actions: ["admin_retry_delivery"],
       related: [
         {
           id: "deliveryMessages",
@@ -257,6 +259,17 @@ export default {
         "error",
         "attemptedAt",
       ],
+    },
+    {
+      id: "deliveryRetries",
+      label: "Delivery retry requests",
+      operation: "admin_delivery_retries",
+      collection: "records",
+      total: "total",
+      detail: "admin_delivery_retry",
+      bind: { id: "id" },
+      actions: ["admin_check_delivery_retry"],
+      columns: ["deliveryOrderId", "operationState", "staffName", "createdAt"],
     },
     {
       id: "cancellations",

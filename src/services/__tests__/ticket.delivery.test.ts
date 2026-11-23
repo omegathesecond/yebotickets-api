@@ -14,6 +14,7 @@ let row: any;
 let tickets: any[];
 beforeEach(() => {
   mockReset(db); send.mockReset(); send.mockResolvedValue({ messageId: '550e8400-e29b-41d4-a716-446655440000', status: 'queued' });
+  db.ticketDeliveryMessage.findMany.mockResolvedValue([]);
   row = { id: 'paid:charge', status: 'pending', attempts: 0, attemptId: null, attemptedAt: null,
     channel: null, error: null, nextAttemptAt: new Date(0) };
   tickets = ['ONE', 'TWO'].map(uniqueCode => ({ id: uniqueCode, eventId: 'event', userId: 'buyer',

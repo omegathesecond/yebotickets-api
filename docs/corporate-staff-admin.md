@@ -119,7 +119,31 @@ from gateway delivered/read, and rejects conflicting or regressive evidence.
 Critical local audit and receipt progress commit together. Reads dispatch no
 message. Historical or interrupted sends without a saved message identity get
 no invented receipt. Existing permitted buyer retries append history; native
-CEO-reviewed retry and durable cancellation-notice tracking remain outstanding.
+CEO-reviewed retries now reuse that same claim and dispatcher. Durable
+cancellation-notice tracking remains outstanding.
+
+Retry requests bind the exact current work generation as well as the reviewed
+order. A genuinely unattempted order has no fabricated attempt record. The
+existing source/central unresolved-operation guards stay intact: an explicitly
+acknowledged new generation does not clear or rewrite an older unknown command.
+Distinct approvals for one generation compete on one conditional claim. The
+initial corporate audit and claim commit together before dispatch; the final
+audit, work result and original receipt commit together. Original message proof
+can finish an interrupted original command and refresh its central CEO decision
+without sending anything. An accepted command remains distinct from later
+gateway delivery, and sealed command outcomes survive later retries.
+
+Known delivered/read proof blocks resend in both native and buyer flows. Any
+older unknown send still requires explicit duplicate-risk acknowledgement after
+a later proven failure; the background worker holds it instead of replacing it.
+Stronger proof arriving after approval suppresses the claimed replacement before
+dispatch. Contacts are locked before the existing Event/Ticket order, followed by
+work and history; original content/proof is rechecked under those locks before
+sending. Changed recipients cannot receive a previously approved order. The
+immutable message history and exact command receipt remain readable when mutable
+delivery work is removed. Source-owned generation and action bindings reuse the
+existing workspace controls; no separate renderer or product staff identity is
+added.
 
 Admission uses the existing scanner preview, conditional Event/Ticket admission
 claim and durable operator receipt. Ticket staff select an actual ticket code and
@@ -223,7 +247,7 @@ invented gateway history. See [recovery](refund-recovery.md) and
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Eighty-four actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- One hundred and one actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -248,6 +272,12 @@ invented gateway history. See [recovery](refund-recovery.md) and
   receipt preservation and critical audit rollback. This route-contract fixture
   does not establish live credentials, provider delivery or the full YeboLink
   credit/queue lifecycle.
+  Retry checks include explicit risk acknowledgement, older uncertainty, central
+  request/executor attribution, generation races, immutable intent, initial/final
+  audit and receipt failures, original CEO-receipt synchronization, revoked
+  grants, post-claim cancellation/contact/proof changes, historical outcomes and
+  concurrent retained-history reads. An actual blocked-User/NOWAIT Event/Ticket
+  probe verifies the contact-lock order.
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
@@ -281,6 +311,12 @@ invented gateway history. See [recovery](refund-recovery.md) and
   history, preparing a receipt-only central request, CEO approval and a saved
   result with distinct original queued and later read/delivered evidence. The
   390px document fit the viewport. No message was resent by receipt checks.
+  The retry walkthrough verified a known rejection and an unknown send: ticket
+  staff prepares both; unknown preparation fails without explicit risk
+  acknowledgement; the CEO approves; accepted original commands and executor
+  receipts are saved. The older unknown history remains visible beside the new
+  queued acknowledgement. The 390px document fits its viewport. The message
+  gateway remains the owning local route-contract fixture, not a real provider.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -293,6 +329,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   `yebotickets_purchase_schema_fixture_20261123` database.
   The history through delivery-message receipts also replayed from scratch on
   `yebotickets_delivery_schema_fixture_20261123`.
+  The complete history through corporate delivery retry intent replayed on fresh
+  `yebotickets_retry_schema_fixture_20261123`.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -318,7 +356,7 @@ existing organiser business service, not an invented corporate admin identity.
 ## Remaining before whole-product acceptance
 
 Complete the remaining source inventory and native workflows: durable
-cancellation-notice tracking, native CEO-reviewed delivery retry, account
+cancellation-notice tracking and recovery, account
 workflows and configuration
 where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
@@ -348,6 +386,8 @@ intent to the existing purchase-recovery audit.
 without manufacturing identities for past sends. Receipt reads require the
 existing product's YeboLink API key to have `read_messages`; verify actual
 production scopes before release. This change provisions no credential or scope.
+`20261123233000_corporate_delivery_retries` preserves original corporate retry
+intent and one owning audit association per planned dispatch generation.
 Preflight duplicate attempt identities before release;
 never rewrite history to make the migration pass.
 

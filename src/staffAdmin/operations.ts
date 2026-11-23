@@ -581,6 +581,57 @@ export const operations: Record<string, any> = {
       [],
     ),
     method: "POST",
+    reconcilesOriginalReceipt: true,
+  },
+  admin_retry_delivery: {
+    ...change(
+      "Retry original ticket delivery",
+      "/ticket-delivery/retry",
+      "tickets",
+      "deliveryOrder",
+      {
+        id: { type: "string", minLength: 1, maxLength: 512 },
+        generationId: {
+          type: "string",
+          title: "Original delivery generation",
+          pattern:
+            "^(unattempted|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+        },
+        acknowledgeDuplicateRisk: {
+          type: "boolean",
+          title: "I understand this retry may send a duplicate message",
+          default: false,
+        },
+      },
+      ["generationId"],
+    ),
+    method: "POST",
+    external: true,
+  },
+  admin_delivery_retries: read(
+    "Corporate delivery retries",
+    "/ticket-delivery-retries",
+    "tickets",
+    { ...pagination },
+    paged,
+  ),
+  admin_delivery_retry: read(
+    "Original delivery retry",
+    "/ticket-delivery-retries/:id",
+    "tickets",
+    { id },
+  ),
+  admin_check_delivery_retry: {
+    ...change(
+      "Check original delivery retry",
+      "/ticket-delivery-retries/:id/check",
+      "tickets",
+      "deliveryRetry",
+      {},
+      [],
+    ),
+    method: "POST",
+    reconcilesOriginalReceipt: true,
   },
   admin_activity: read(
     "Corporate activity",

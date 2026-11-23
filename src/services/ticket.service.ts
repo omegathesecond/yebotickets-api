@@ -9,6 +9,8 @@ import { sumTicketRevenue } from './settlement.service';
 import { lockPurchaseIdentity } from '../utils/purchaseIdentity';
 import { sendDeliveryMessage } from './delivery-message.service';
 import { formatPhone } from '../utils/phone';
+import { PURCHASE_INCLUDE } from './ticket-includes';
+import { deliveryDispatchState, deliveryDispatchPolicy, deliveryAttemptOutcome, lockOrderDelivery } from './delivery-state.service';
 import { 
   ITicket, 
   ITicketType, 
@@ -442,41 +444,6 @@ export const generateTickets = async (
 };
 
 /**
- * Prisma include used when issuing a ticket on purchase so we have everything
- * needed to render the QR and the delivery message: the event (title, date,
- * venue), the ticket-type label, and the buyer's phone number.
- */
-const PURCHASE_INCLUDE = {
-  event: {
-    select: {
-      isCancelled: true,
-      id: true,
-      title: true,
-      startDate: true,
-      endDate: true,
-      locationAddress: true,
-      locationCity: true,
-      locationCountry: true,
-    },
-  },
-  ticketType: {
-    select: {
-      id: true,
-      name: true,
-      type: true,
-    },
-  },
-  user: {
-    select: {
-      id: true,
-      name: true,
-      phoneNumber: true,
-      email: true,
-    },
-  },
-} as const;
-
-/**
  * Outcome of attempting to deliver an issued ORDER to the buyer. `status:
  * 'failed'` is returned (never thrown) so the purchase response can surface the
  * failure loudly without pretending the message was sent — the buyer still
@@ -871,72 +838,212 @@ const enqueueOrderDelivery = async (tx: Prisma.TransactionClient, tickets: any[]
   tickets.forEach(t => { t.deliveryOrderId = id; });
 };
 
-const deliveryView = (row: { status: string; channel: string | null; error: string | null; attemptedAt: Date | null }) => ({
-  status: row.status as TicketDeliveryResult['status'], channel: row.channel,
-  error: row.error || undefined, attemptedAt: row.attemptedAt,
+const deliveryView = (row: {
+  status: string;
+  channel: string | null;
+  error: string | null;
+  attemptedAt: Date | null;
+}) => ({
+  status: row.status as TicketDeliveryResult["status"],
+  channel: row.channel,
+  error: row.error || undefined,
+  attemptedAt: row.attemptedAt,
 });
 
-/** A DB compare-and-set owns dispatch across workers and buyer retries.
- * Never reclaim sending automatically: after a crash the provider may have
- * accepted the message. Only an explicit buyer retry accepts that risk. */
-export const dispatchOrderDelivery = async (id: string, manual = false, acknowledgeDuplicateRisk = false): Promise<TicketDeliveryResult> => {
-  const row = await prisma.ticketOrderDelivery.findUnique({ where: { id } });
-  if (!row) throw new ApiError('Delivery record not found', 404);
-  if (row.status === 'sent' || row.status === 'suppressed') return deliveryView(row);
-  const stale = row.status === 'sending' && row.attemptedAt && Date.now() - row.attemptedAt.getTime() > 120_000;
-  if (row.status === 'sending' && !stale) return deliveryView(row);
-  if ((row.status === 'unknown' || stale) && (!manual || !acknowledgeDuplicateRisk)) {
-    if (manual) throw new ApiError('Delivery is unconfirmed. Confirm that retrying may send a duplicate message.', 409);
-    return { ...deliveryView(row), status: 'unknown' };
+/** One source-owned claim for workers, buyers and reviewed corporate retries. */
+export const claimOrderDelivery = async (
+  id: string,
+  manual = false,
+  acknowledgeDuplicateRisk = false,
+  attemptId = crypto.randomUUID(),
+) => {
+  const state = await deliveryDispatchState(id),
+    row = state.order;
+  const policy = deliveryDispatchPolicy(state);
+  if (!policy.canRetry)
+    return {
+      outcome: {
+        ...deliveryView(row),
+        status: policy.status as TicketDeliveryResult["status"],
+        error: policy.status === "sent" ? undefined : policy.reason,
+      },
+    };
+  if (policy.duplicateRisk && (!manual || !acknowledgeDuplicateRisk)) {
+    if (manual) throw new ApiError(policy.reason, 409);
+    if (row.status !== "unknown")
+      await prisma.ticketOrderDelivery.updateMany({
+        where: { id, status: row.status, attemptId: row.attemptId },
+        data: { status: "unknown", error: policy.reason },
+      });
+    return {
+      outcome: {
+        ...deliveryView(row),
+        status: "unknown" as const,
+        error: policy.reason,
+      },
+    };
   }
-  if (manual && row.attemptedAt && Date.now() - row.attemptedAt.getTime() < 60_000) {
-    throw new ApiError('Please wait one minute before retrying delivery.', 429);
-  }
-  const attemptId = crypto.randomUUID();
+  if (
+    manual &&
+    row.attemptedAt &&
+    Date.now() - row.attemptedAt.getTime() < 60_000
+  )
+    throw new ApiError("Please wait one minute before retrying delivery.", 429);
   const claim = await prisma.ticketOrderDelivery.updateMany({
-    where: { id, status: row.status, attemptId: row.attemptId,
-      ...(!manual ? { nextAttemptAt: { lte: new Date() } } : {}) },
-    data: { status: 'sending', attemptId, attemptedAt: new Date(), attempts: { increment: 1 }, error: null },
+    where: {
+      id,
+      status: row.status,
+      attemptId: row.attemptId,
+      ...(!manual ? { nextAttemptAt: { lte: new Date() } } : {}),
+    },
+    data: {
+      status: "sending",
+      attemptId,
+      attemptedAt: new Date(),
+      attempts: { increment: 1 },
+      error: null,
+    },
   });
-  if (!claim.count) return deliveryView((await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } })));
+  if (!claim.count)
+    return {
+      outcome: deliveryView(
+        await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }),
+      ),
+    };
+  return { attemptId };
+};
+
+/** Dispatch only the already committed original generation; never claim a replacement. */
+export const dispatchClaimedOrderDelivery = async (
+  id: string,
+  attemptId: string,
+  finalize?: () => Promise<unknown>,
+  beforeSend?: () => Promise<void>,
+): Promise<TicketDeliveryResult> => {
+  const row = await prisma.ticketOrderDelivery.findUniqueOrThrow({
+    where: { id },
+  });
+  if (row.status !== "sending" || row.attemptId !== attemptId)
+    return deliveryView(row);
   let outcome: TicketDeliveryResult;
   try {
-    // Lock Event then Ticket in the same order as cancellation. Re-read tickets
-    // under row locks so individual refunds cannot race an admission message.
-    outcome = await prisma.$transaction(async tx => {
-      await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${id} FOR UPDATE`;
-      const owner = await tx.ticketOrderDelivery.findUniqueOrThrow({ where: { id } });
-      if (owner.status !== 'sending' || owner.attemptId !== attemptId) return deliveryView(owner);
-      const members = await tx.ticket.findMany({ where: { deliveryOrderId: id }, select: { eventId: true } });
-      if (!members.length) return { status: 'suppressed', error: 'No tickets remain in this order.' };
-      const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
-        SELECT "isCancelled" FROM "Event" WHERE "id" = ${members[0].eventId} FOR SHARE
-      `;
-      await tx.$queryRaw`SELECT "id" FROM "Ticket" WHERE "deliveryOrderId" = ${id} ORDER BY "id" FOR UPDATE`;
-      const tickets = await tx.ticket.findMany({ where: { deliveryOrderId: id }, include: PURCHASE_INCLUDE });
-      const chargeId = tickets[0]?.paymentRef;
-      if (chargeId && await tx.ticketRefundLock.findUnique({ where: { chargeId } })) {
-        return { status: 'failed', error: 'A refund is in progress or awaiting reconciliation. Delivery will be checked again.' };
-      }
-      const eligible = tickets.filter(t => t.status === 'sold' && !t.refundedAt && !t.cancelledAt &&
-        (t.paymentStatus === 'SUCCEEDED' || t.paymentStatus === 'FREE'));
-      if (!events[0]) throw new ApiError('Event missing during order delivery', 500);
-      if (events[0].isCancelled || !eligible.length) {
-        return { status: 'suppressed', error: 'Order cancelled or refunded. No admission message sent.' };
-      }
-      return deliverOrderToBuyer(eligible, attemptId);
-    }, { timeout: 60_000 });
+    outcome = await prisma.$transaction(
+      async (tx) => {
+        const events = await lockOrderDelivery(tx, id);
+        const owner = await tx.ticketOrderDelivery.findUniqueOrThrow({
+          where: { id },
+        });
+        if (owner.status !== "sending" || owner.attemptId !== attemptId)
+          return deliveryView(owner);
+        const state = await deliveryDispatchState(id, tx);
+        const original = deliveryAttemptOutcome(
+          state.messages.filter(
+            (message) => message.dispatchAttemptId === attemptId,
+          ),
+        );
+        if (original)
+          return {
+            status: original.status === "accepted" ? "sent" : original.status,
+            channel: original.channel,
+            error: original.error ?? undefined,
+          };
+        const policy = deliveryDispatchPolicy(state);
+        if (!policy.canRetry && policy.status === "sent")
+          return { status: "suppressed", error: policy.reason };
+
+        const tickets = await tx.ticket.findMany({
+          where: { deliveryOrderId: id },
+          include: PURCHASE_INCLUDE,
+        });
+        if (!tickets.length)
+          return {
+            status: "suppressed",
+            error: "No tickets remain in this order.",
+          };
+        const charges = [
+          ...new Set(
+            tickets
+              .map((ticket) => ticket.paymentRef)
+              .filter((ref): ref is string => !!ref),
+          ),
+        ];
+        for (const chargeId of charges)
+          if (await tx.ticketRefundLock.findUnique({ where: { chargeId } }))
+            return {
+              status: "failed",
+              error:
+                "A refund is in progress or awaiting reconciliation. Delivery will be checked again.",
+            };
+        const eligible = tickets.filter(
+          (t) =>
+            t.status === "sold" &&
+            !t.refundedAt &&
+            !t.cancelledAt &&
+            (t.paymentStatus === "SUCCEEDED" || t.paymentStatus === "FREE"),
+        );
+        if (!events.length)
+          throw new ApiError("Event missing during order delivery", 500);
+        if (events.some((event) => event.isCancelled) || !eligible.length)
+          return {
+            status: "suppressed",
+            error: "Order cancelled or refunded. No admission message sent.",
+          };
+        if (beforeSend) {
+          try {
+            await beforeSend();
+          } catch (error) {
+            if (!(error instanceof ApiError) || error.statusCode !== 409)
+              throw error;
+            return { status: "failed", error: error.message };
+          }
+        }
+        return deliverOrderToBuyer(eligible, attemptId);
+      },
+      { timeout: 60_000 },
+    );
   } catch (error) {
-    console.error('Order delivery outcome unconfirmed:', id, error);
-    outcome = { status: 'unknown', error: 'Delivery could not be confirmed. A message may already have been sent.' };
+    console.error("Order delivery outcome unconfirmed:", id, error);
+    outcome = {
+      status: "unknown",
+      error:
+        "Delivery could not be confirmed. A message may already have been sent.",
+    };
   }
-  const recorded = await prisma.ticketOrderDelivery.updateMany({ where: { id, attemptId, status: 'sending' }, data: {
-    status: outcome.status, channel: outcome.channel, error: outcome.error || null,
-    sentAt: outcome.status === 'sent' ? new Date() : null,
-    nextAttemptAt: new Date(Date.now() + Math.min(60, 2 ** Math.min(row.attempts, 6)) * 60_000),
-  } });
-  if (!recorded.count) return deliveryView(await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }));
-  return outcome;
+  const record = async () => {
+    const recorded = await prisma.ticketOrderDelivery.updateMany({
+      where: { id, attemptId, status: "sending" },
+      data: {
+        status: outcome.status,
+        channel: outcome.channel,
+        error: outcome.error || null,
+        sentAt: outcome.status === "sent" ? new Date() : null,
+        nextAttemptAt: new Date(
+          Date.now() +
+            Math.min(60, 2 ** Math.min(Math.max(0, row.attempts - 1), 6)) *
+              60_000,
+        ),
+      },
+    });
+    if (finalize) await finalize();
+    if (!recorded.count)
+      return deliveryView(
+        await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }),
+      );
+    return outcome;
+  };
+  return finalize ? staffAdminScope.transaction(record) : record();
+};
+
+/** A source claim owns dispatch across workers and explicit retries. Unknown sends are never automatically replaced. */
+export const dispatchOrderDelivery = async (
+  id: string,
+  manual = false,
+  acknowledgeDuplicateRisk = false,
+): Promise<TicketDeliveryResult> => {
+  const claim = await claimOrderDelivery(id, manual, acknowledgeDuplicateRisk);
+  return claim.attemptId
+    ? dispatchClaimedOrderDelivery(id, claim.attemptId)
+    : claim.outcome!;
 };
 
 const deliverSettledOrder = async (tickets: any[]): Promise<TicketDeliveryResult> =>

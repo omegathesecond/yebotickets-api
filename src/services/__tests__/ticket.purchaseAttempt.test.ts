@@ -31,6 +31,7 @@ function matches(row: any, where: any): boolean {
 }
 beforeEach(() => {
   mockReset(db); jest.clearAllMocks();
+  db.ticketDeliveryMessage.findMany.mockResolvedValue([]);
   attempts = new Map(); orders = new Map(); locks = new Map(); activeIdentityLocks = 0;
   tickets = Array.from({length: 4}, (_, i) => ({ id: `seat-${i}`, uniqueCode: `code-${i}`, eventId: 'event', ticketTypeId: 'tier', userId: null,
     status: 'available', paymentRef: null, paymentStatus: null, event, ticketType: tier, user: { phoneNumber: '+26878422613' } }));

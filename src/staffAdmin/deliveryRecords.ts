@@ -1,6 +1,12 @@
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
 import { deliveryMessageView } from "../services/delivery-message.service";
+import {
+  deliveryDispatchPolicy,
+  deliveryReviewEvidence,
+  assertDeliveryReview,
+  deliveryGeneration,
+} from "../services/delivery-state.service";
 const ticketSelect = {
   id: true,
   uniqueCode: true,
@@ -35,14 +41,31 @@ export async function listDeliveryRecords(p: Record<string, any>) {
   };
 }
 export async function deliveryRecord(id: string) {
-  const row = await prisma.ticketOrderDelivery.findUnique({
-    where: { id },
-    include: { tickets: { select: ticketSelect } },
-  });
-  if (!row)
-    throw new ApiError("The original ticket delivery was not found", 404);
+  const evidence = await deliveryReviewEvidence(id);
+  const policy = deliveryDispatchPolicy(evidence);
+  let retryAvailable = policy.canRetry,
+    retryReason = policy.reason;
+  if (retryAvailable) {
+    try {
+      assertDeliveryReview(evidence, true, deliveryGeneration(evidence.order));
+    } catch (error) {
+      if (
+        !(error instanceof ApiError) ||
+        ![409, 429].includes(error.statusCode)
+      )
+        throw error;
+      retryAvailable = false;
+      retryReason = error.message;
+    }
+  }
+  const row = { ...evidence.order, tickets: evidence.tickets };
   return {
     ...row,
+    generationId: deliveryGeneration(evidence.order),
+    retryAvailable,
+    duplicateRiskAcknowledgementRequired:
+      policy.canRetry && policy.duplicateRisk,
+    retryReason,
     tickets: row.tickets.map((ticket) => ({
       id: ticket.id,
       ticketCode: ticket.uniqueCode,

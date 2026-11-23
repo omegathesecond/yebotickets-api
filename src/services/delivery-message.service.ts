@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
+import { lockOrderDelivery } from "./delivery-state.service";
 import {
   YeboLinkClient,
   YeboLinkMessageResult,
@@ -126,6 +127,7 @@ export async function checkDeliveryMessage(id: string) {
   };
   // A stale provider read must never erase a stronger confirmed outcome.
   return prisma.$transaction(async (tx) => {
+    await lockOrderDelivery(tx, original.deliveryOrderId);
     await tx.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${id} FOR UPDATE`;
     const current = await tx.ticketDeliveryMessage.findUniqueOrThrow({
       where: { id },
@@ -168,6 +170,31 @@ export async function checkDeliveryMessage(id: string) {
         checkedAt: new Date(),
       },
     });
+    if (
+      [
+        "scheduled",
+        "queued",
+        "sent",
+        "delivered",
+        "read",
+        "dispatching",
+      ].includes(receipt.status)
+    )
+      await tx.ticketOrderDelivery.updateMany({
+        where: {
+          id: current.deliveryOrderId,
+          attemptId: current.dispatchAttemptId,
+          status: { in: ["unknown", "sending"] },
+        },
+        data: {
+          status: "sent",
+          channel: current.channel,
+          error: null,
+          ...(timestamps.gatewaySentAt
+            ? { sentAt: timestamps.gatewaySentAt }
+            : {}),
+        },
+      });
     return deliveryMessageView(row);
   });
 }

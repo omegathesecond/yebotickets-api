@@ -87,6 +87,7 @@ beforeEach(() => {
   // Reset return-value stubs between tests (clearMocks in jest.config only
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
+  prismaMock.ticketDeliveryMessage.findMany.mockResolvedValue([]);
   recoveryLock = null;
   prismaMock.ticketPurchaseAttempt.findUnique.mockResolvedValue(null);
   prismaMock.ticketPurchaseAttempt.create.mockImplementation(async ({data}: any) => ({...data}));
