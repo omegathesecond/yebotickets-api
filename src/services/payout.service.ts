@@ -1,7 +1,9 @@
 import prisma from '../config/prisma';
 import type { Prisma } from '@prisma/client';
 import { ApiError } from '../middleware/error.middleware';
-import { CURRENCY, getPlatformFeePercent } from '../config/platform';
+import { reviewActor, ReviewActor } from './review-actor';
+import { assertAccountActive } from './auth-state';
+import { CURRENCY, getPlatformFeePercent, getPlatformSettings } from '../config/platform';
 import {
   getOrganizerStatement,
   splitPayoutFee,
@@ -30,6 +32,7 @@ import {
  */
 
 const PAYOUT_METHOD_SELECT = {
+  isActive: true,
   payoutMethod: true,
   payoutBankName: true,
   payoutBankAccountName: true,
@@ -48,8 +51,8 @@ const PRISMA_UNIQUE_VIOLATION = 'P2002';
 export const getOrganizerBalance = async (organizerId: string): Promise<OrganizerStatement> =>
   getOrganizerStatement(organizerId);
 
-export const getPayoutMethod = async (organizerId: string) => {
-  const user = await prisma.user.findUnique({
+export const getPayoutMethod = async (organizerId: string, client: Prisma.TransactionClient = prisma) => {
+  const user = await client.user.findUnique({
     where: { id: organizerId },
     select: PAYOUT_METHOD_SELECT,
   });
@@ -140,62 +143,72 @@ export const createPayoutRequest = async (organizerId: string, amount: number) =
     throw new ApiError('Amount must be a positive number', 400);
   }
 
-  const method = await getPayoutMethod(organizerId);
+  return prisma.$transaction(async (tx) => {
+    // Lock settings before the User: a CEO fee update and a payout reservation
+    // serialize at the same source configuration row, then use one exact rate.
+    await getPlatformSettings(tx, 'share');
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id=${organizerId} FOR UPDATE`;
+    const method = await getPayoutMethod(organizerId, tx);
+    assertAccountActive(method);
 
-  // Staff review gate — deliberately independent of User.isVerified, which is
-  // set automatically by phone-OTP with no human review. See the schema
-  // comment on PayoutApprovalStatus.
-  if (method.payoutApprovalStatus !== 'approved') {
-    throw new ApiError('Your organizer account is pending approval before you can request a payout', 403);
-  }
+    // Staff review gate — deliberately independent of User.isVerified, which is
+    // set automatically by phone-OTP with no human review. See the schema
+    // comment on PayoutApprovalStatus.
+    if (method.payoutApprovalStatus !== 'approved') {
+      throw new ApiError(
+        'Your organizer account is pending approval before you can request a payout',
+        403
+      );
+    }
 
-  if (!method.payoutMethod) {
-    throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
-  }
+    if (!method.payoutMethod) {
+      throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
+    }
 
-  // One open request at a time: an organizer with two open requests could
-  // request the same balance twice before either is settled.
-  const open = await prisma.payoutRequest.findFirst({
-    where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
-    select: { id: true, status: true },
-  });
-  if (open) {
-    throw new ApiError(
-      'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
-      409
-    );
-  }
-
-  const statement = await getOrganizerStatement(organizerId);
-  if (amount > statement.availableBalance) {
-    throw new ApiError(
-      `Amount exceeds your available balance of ${statement.currency} ${statement.availableBalance.toFixed(2)}`,
-      400
-    );
-  }
-
-  try {
-    return await prisma.payoutRequest.create({
-      data: {
-        organizerId,
-        ...splitPayoutFee(amount, statement.feePercent),
-        currency: statement.currency,
-        status: 'pending',
-        ...destinationSnapshot(method),
-      },
+    // One open request at a time: an organizer with two open requests could
+    // request the same balance twice before either is settled.
+    const open = await tx.payoutRequest.findFirst({
+      where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
+      select: { id: true, status: true }
     });
-  } catch (error: any) {
-    // Lost the race against a concurrent request: the partial unique index
-    // rejected the second insert. Surface the same conflict the check above
-    // would have produced rather than a raw 500.
-    if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+    if (open) {
       throw new ApiError(
         'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
         409
       );
     }
-    throw error;
-  }
+
+    const statement = await getOrganizerStatement(organizerId, new Date(), tx);
+    if (amount > statement.availableBalance) {
+      throw new ApiError(
+        `Amount exceeds your available balance of ${statement.currency} ${statement.availableBalance.toFixed(2)}`,
+        400
+      );
+    }
+
+    try {
+      return await tx.payoutRequest.create({
+        data: {
+          organizerId,
+          ...splitPayoutFee(amount, statement.feePercent),
+          currency: statement.currency,
+          status: 'pending',
+          ...destinationSnapshot(method)
+        }
+      });
+    } catch (error: any) {
+      // Lost the race against a concurrent request: the partial unique index
+      // rejected the second insert. Surface the same conflict the check above
+      // would have produced rather than a raw 500.
+      if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+        throw new ApiError(
+          'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
+          409
+        );
+      }
+      throw error;
+    }
+  });
 };
 
 export const getOrganizerPayoutRequests = async (organizerId: string) =>
@@ -245,7 +258,8 @@ const VALID_PAYOUT_APPROVAL_STATUSES = ['unreviewed', 'approved', 'rejected'];
  * — recorded alongside the transition so a fraud-review decision on real
  * money movement is always traceable to a specific admin and timestamp.
  */
-export const setPayoutApprovalStatus = async (organizerId: string, status: string, adminId: string) => {
+export const setPayoutApprovalStatus = async (organizerId: string, status: string, actor: ReviewActor) => {
+  const reviewer=reviewActor(actor);
   if (!VALID_PAYOUT_APPROVAL_STATUSES.includes(status)) {
     throw new ApiError('payoutApprovalStatus must be unreviewed, approved or rejected', 400);
   }
@@ -255,7 +269,8 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
       where: { id: organizerId, role: 'organizer' },
       data: {
         payoutApprovalStatus: status as any,
-        payoutApprovalReviewedByAdminId: adminId,
+        payoutApprovalReviewedByAdminId: reviewer.adminId,
+        payoutApprovalReviewedByStaff: reviewer.staffId,
         payoutApprovalReviewedAt: new Date(),
       },
       select: {
@@ -267,6 +282,7 @@ export const setPayoutApprovalStatus = async (organizerId: string, status: strin
         companyName: true,
         payoutApprovalStatus: true,
         payoutApprovalReviewedByAdminId: true,
+        payoutApprovalReviewedByStaff: true,
         payoutApprovalReviewedAt: true,
         payoutApprovalReviewedBy: { select: { id: true, name: true } },
       },
@@ -312,14 +328,16 @@ const transitionPayout = async (
  *  Stays reserved against the balance, so approving changes nothing the
  *  organizer can withdraw. `adminId` (the authenticated admin) is recorded as
  *  the reviewer for compliance traceability. */
-export const approvePayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
+export const approvePayoutRequest = async (id: string, actor: ReviewActor, adminNote?: string) => {
+  const reviewer=reviewActor(actor);
   const now = new Date();
   return transitionPayout(id, ['pending'], {
     status: 'approved',
     approvedAt: now,
     processedAt: now,
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -328,13 +346,15 @@ export const approvePayoutRequest = async (id: string, adminId: string, adminNot
  *  organizer's available balance. Allowed while approved too — nothing has
  *  moved until it is marked paid. `adminId` (the authenticated admin) is
  *  recorded as the reviewer for compliance traceability. */
-export const rejectPayoutRequest = async (id: string, adminId: string, adminNote?: string) => {
+export const rejectPayoutRequest = async (id: string, actor: ReviewActor, adminNote?: string) => {
+  const reviewer=reviewActor(actor);
   const now = new Date();
   return transitionPayout(id, ['pending', 'approved'], {
     status: 'rejected',
     processedAt: now,
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -351,10 +371,11 @@ export const rejectPayoutRequest = async (id: string, adminId: string, adminNote
  */
 export const markPayoutRequestPaid = async (
   id: string,
-  adminId: string,
+  actor: ReviewActor,
   reference: string,
   adminNote?: string
 ) => {
+  const reviewer=reviewActor(actor);
   if (!reference || !reference.trim()) {
     throw new ApiError('An external transfer reference is required to mark a payout paid', 400);
   }
@@ -365,7 +386,8 @@ export const markPayoutRequestPaid = async (
     processedAt: now,
     reference: reference.trim(),
     adminNote,
-    reviewedByAdminId: adminId,
+    reviewedByAdminId: reviewer.adminId,
+    reviewedByStaff: reviewer.staffId,
     reviewedAt: now,
   });
 };
@@ -381,16 +403,16 @@ export interface PayoutStatusUpdate {
 export const updatePayoutRequestStatus = async (
   id: string,
   status: 'approved' | 'paid' | 'rejected',
-  adminId: string,
+  actor: ReviewActor,
   { adminNote, reference }: PayoutStatusUpdate = {}
 ) => {
   switch (status) {
     case 'approved':
-      return approvePayoutRequest(id, adminId, adminNote);
+      return approvePayoutRequest(id, actor, adminNote);
     case 'rejected':
-      return rejectPayoutRequest(id, adminId, adminNote);
+      return rejectPayoutRequest(id, actor, adminNote);
     case 'paid':
-      return markPayoutRequestPaid(id, adminId, reference ?? '', adminNote);
+      return markPayoutRequestPaid(id, actor, reference ?? '', adminNote);
     default:
       throw new ApiError('Status must be approved, paid or rejected', 400);
   }

@@ -55,6 +55,16 @@ enum PayoutApprovalStatus {
   rejected
 }
 
+model PlatformSettings {
+  id                      String   @id @db.Uuid
+  feePercent              Float
+  revision                Int      @default(0)
+  initializedFromRevision String
+  updatedByStaff          String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
 model User {
   id          String   @id @default(uuid())
   name        String
@@ -63,6 +73,9 @@ model User {
   password    String?
   role        UserRole @default(user)
   isVerified  Boolean  @default(false)
+  // CEO-reviewed access changes revoke every existing session permanently.
+  isActive    Boolean  @default(true)
+  authVersion Int      @default(0)
   
   // OTP fields
   otpCode     String?
@@ -125,6 +138,7 @@ model User {
   // payout.service.ts#setPayoutApprovalStatus from the authenticated admin's
   // id; never written by anything else.
   payoutApprovalReviewedByAdminId String?
+  payoutApprovalReviewedByStaff String?
   payoutApprovalReviewedBy        User?     @relation("PayoutApprovalReviewedBy", fields: [payoutApprovalReviewedByAdminId], references: [id])
   payoutApprovalReviewedAt        DateTime?
 
@@ -162,7 +176,7 @@ model PayoutRequest {
   currency      String               @default("SZL")
 
   // Platform fee frozen at request time. Storing the rate AND the money means a
-  // later change to PLATFORM_FEE_PERCENT never restates a historic payout:
+  // later commission change never restates a historic payout:
   // grossAmount = amount + feeAmount is the ticket revenue this payout consumed.
   feePercent    Float                @default(0)
   feeAmount     Float                @default(0)
@@ -187,6 +201,7 @@ model PayoutRequest {
   // real money. Set by every branch of payout.service.ts#updatePayoutRequestStatus
   // from the authenticated admin's id; never written by anything else.
   reviewedByAdminId String?
+  reviewedByStaff String?
   reviewedByAdmin   User?    @relation("PayoutRequestReviewedByAdmin", fields: [reviewedByAdminId], references: [id])
   reviewedAt        DateTime?
 
@@ -315,6 +330,8 @@ model Ticket {
   // records when the money was returned; cancelledAt records when the ticket
   // was voided (set for free tickets too, which are cancelled without a refund).
   refundRef     String?
+  refundAttemptId String? @unique
+  refundGatewayRequestId String? @unique
   refundedAt    DateTime?
   cancelledAt   DateTime?
 
@@ -344,10 +361,13 @@ model TicketRefundLock {
   ticketId       String
   amount         Float
   refundedBefore Float?
-  attemptId      String   @default(uuid())
+  attemptId      String   @unique @default(uuid())
   phase          String   @default("REVIEW")
   confirmedRef   String?
+  gatewayRequestId String?
+  corporateOperationId String? @unique @db.Uuid
   detail         String?
+  lastCheckedAt  DateTime?
   createdAt      DateTime @default(now())
 }
 
@@ -369,11 +389,40 @@ model TicketOrderDelivery {
   @@index([status, nextAttemptAt])
 }
 
+// Historical outbound attempts are independent of mutable ticket/work rows.
+// Persist before dispatch; never invent message IDs for old or interrupted sends.
+model TicketDeliveryMessage {
+  id String @id @default(uuid())
+  deliveryOrderId String?
+  cancellationNoticeId String?
+  dispatchAttemptId String
+  channel String
+  recipient String
+  state String @default("dispatching")
+  messageId String? @unique
+  acceptanceStatus String?
+  gatewayStatus String?
+  gatewayError String?
+  providerMessageId String?
+  gatewaySentAt DateTime?
+  gatewayDeliveredAt DateTime?
+  gatewayReadAt DateTime?
+  gatewayFailedAt DateTime?
+  error String?
+  checkedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([dispatchAttemptId, channel])
+  @@index([deliveryOrderId, createdAt])
+  @@index([cancellationNoticeId, createdAt])
+}
+
 // Immutable admission receipt. Deliberately retained independently of mutable
 // ticket/user rows so an operation key can never be reassigned after deletion.
 model TicketAdmissionReceipt {
   opId       String   @id
   operatorId String
+  operatorKind String @default("PRODUCT")
   eventId    String
   ticketId   String
   response   Json
@@ -391,4 +440,30 @@ model TicketPurchaseAttempt {
   chargeId String? @unique
   failure String?
   createdAt DateTime @default(now())
+}
+
+// Original cancellation intent and independent notification work. Retain without
+// parent foreign keys: account/ticket deletion must not erase external-send proof.
+model TicketCancellationNotice {
+  id String @id @default(uuid())
+  ticketId String @unique
+  eventId String
+  userId String?
+  ticketCode String
+  eventTitle String
+  recipient String?
+  refunded Boolean
+  amount Float
+  currency String
+  refundAttemptId String? @unique
+  refundGatewayRequestId String? @unique
+  content String
+  status String @default("pending")
+  attemptId String?
+  attemptedAt DateTime?
+  sentAt DateTime?
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status, createdAt])
 }

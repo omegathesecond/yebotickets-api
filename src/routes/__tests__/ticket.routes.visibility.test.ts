@@ -1,6 +1,7 @@
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 import express from 'express';
 import http from 'http';
 import type { AddressInfo } from 'net';
@@ -39,9 +40,9 @@ const read = (authorization?: string, query = '') => fetch(baseUrl + '/tickets/t
   headers: authorization === undefined ? {} : { authorization },
 });
 const authenticate = (id: string, role: string) => {
-  db.user.findUnique.mockResolvedValue({ id, role } as any);
+  db.user.findUnique.mockResolvedValue({ id, role, isActive: true, authVersion: 0 } as any);
   // Even a signed role claim cannot override the database role.
-  return `Bearer ${jwt.sign({ id, role: 'admin' }, secret)}`;
+  return `Bearer ${jwt.sign({ id, role: 'admin', type: 'access', authVersion: 0 }, secret)}`;
 };
 it('returns published inventory anonymously', async () => {
   db.event.findUnique.mockResolvedValue({ organizerId: 'owner', isPublished: true, isCancelled: false } as any);

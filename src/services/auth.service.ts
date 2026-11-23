@@ -1,18 +1,20 @@
 import { Prisma, User } from '@prisma/client';
-import prisma from '../config/prisma';
-import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
+import prisma, { staffAdminScope } from '../config/prisma';
+import { validateProfileInput } from '../validators/profile.validator';
+import { UserRole, toOrganizerProfile, organizerProfileMapping } from '../interfaces/user.interface';
 import { ApiError } from '../middleware/error.middleware';
 import { sendOTP, sendTextMessage } from './comms.service';
+import { assertAccountActive } from './auth-state';
 import { generateAuthTokens } from './token.service';
 import bcrypt from 'bcryptjs';
 import { randomInt } from 'crypto';
 
-/** Serialize challenge decisions with each other and with issuance's User UPDATE.
+/** Serialize account decisions with each other and with challenge issuance's User UPDATE.
  * Read only AFTER acquiring the lock: an earlier snapshot may be superseded.
  * Auth failures are returned through the transaction so attempt/expiry writes
  * commit before the normal error channel rejects the request.
  */
-const withLockedUser = async <T>(
+export const withLockedUser = async <T>(
   where: { id: string } | { phoneNumber: string },
   decide: (tx: Prisma.TransactionClient, user: User | null) => Promise<T>
 ): Promise<T> => {
@@ -107,6 +109,8 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
       isNewUser = true;
     }
 
+    assertAccountActive(user);
+
     // Generate OTP
     const otp = generateOTPCode();
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -114,7 +118,7 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     // Update user with OTP. Reset the failed-attempt counter so a fresh code
     // always starts with a full allowance of verify attempts.
     await prisma.user.update({
-      where: { id: user.id },
+      where: { id: user.id, isActive: true },
       data: {
         otpCode: otp,
         otpExpiresAt,
@@ -131,6 +135,9 @@ export const requestOTP = async (phoneNumber: string): Promise<{ message: string
     };
   } catch (error) {
     console.error('Error in requestOTP service:', error);
+    if (error instanceof ApiError) throw error;
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025')
+      throw new ApiError('Account access changed. Request a new code after signing in.', 403);
     throw new ApiError('Failed to send OTP', 500);
   }
 };
@@ -150,6 +157,8 @@ export const verifyOTP = async (
       if (!user) {
         throw new ApiError('User not found', 404);
       }
+
+      assertAccountActive(user);
 
       // Check if OTP exists and is valid
       if (!user.otpCode || !user.otpExpiresAt) {
@@ -205,7 +214,7 @@ export const verifyOTP = async (
     });
 
     // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role);
+    const { token, refreshToken } = generateAuthTokens(updatedUser.id, updatedUser.role, updatedUser.authVersion);
 
     // Return user info (without sensitive data) and tokens
     const userToReturn = {
@@ -229,74 +238,70 @@ export const verifyOTP = async (
   }
 };
 
-/**
- * Update user profile information
- * @param userId User ID
- * @param updateData Data to update
- * @returns Updated user object
- */
-export const updateProfile = async (userId: string, updateData: any): Promise<any> => {
+/** Build only supported profile changes; never roles, credentials, phone or payout fields. */
+export async function profileChanges(role: string, input: Record<string, any>) {
+  await validateProfileInput(input);
+  if (input.organizerProfile && !["organizer", "admin"].includes(role))
+    throw new ApiError(
+      "Company profile fields require an organiser account",
+      403,
+    );
+  const changes: Record<string, string | null> = {};
+  for (const field of ["name", "email"])
+    if (input[field] !== undefined) changes[field] = input[field];
+  for (const [path, column] of Object.entries(organizerProfileMapping)) {
+    const value = path
+      .split(".")
+      .reduce((parent, key) => parent?.[key], input.organizerProfile);
+    if (value !== undefined) changes[column] = value;
+  }
+  if (!Object.keys(changes).length)
+    throw new ApiError("Choose at least one profile field to change", 400);
+  return changes;
+}
+export const updateProfile = async (
+  userId: string,
+  updateData: Record<string, any>,
+  requester?: { id: string },
+) => {
   try {
-    // Get the user to check their role
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
+    if (!staffAdminScope.actor() && requester?.id !== userId)
+      throw new ApiError(
+        "An authenticated owner or verified corporate actor is required to edit a profile",
+        401,
+      );
+    return await withLockedUser({ id: userId }, async (tx, user) => {
+      if (!user) throw new ApiError("User not found", 404);
+      const updates = await profileChanges(user.role, updateData);
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: {
+          ...updates,
+          ...("email" in updates && updates.email !== user.email
+            ? {
+                resetCodeHash: null,
+                resetCodeExpiresAt: null,
+                resetCodeAttempts: 0,
+              }
+            : {}),
+        },
+      });
+      return {
+        id: updated.id,
+        name: updated.name,
+        phoneNumber: updated.phoneNumber,
+        email: updated.email,
+        role: updated.role,
+        isVerified: updated.isVerified,
+        organizerProfile: toOrganizerProfile(updated as any),
+      };
     });
-    
-    if (!user) {
-      throw new ApiError('User not found', 404);
-    }
-    
-    // Build update object
-    const updates: any = {};
-    
-    // Basic fields allowed for all users
-    if (updateData.name) updates.name = updateData.name;
-    if (updateData.email) updates.email = updateData.email;
-    
-    // If user is an organizer or admin, allow organizer-specific fields
-    if (user.role === 'organizer' || user.role === 'admin') {
-      if (updateData.organizerProfile) {
-        const profile = updateData.organizerProfile;
-        if (profile.companyName !== undefined) updates.companyName = profile.companyName;
-        if (profile.description !== undefined) updates.companyDescription = profile.description;
-        if (profile.website !== undefined) updates.website = profile.website;
-        
-        if (profile.socialMedia) {
-          if (profile.socialMedia.facebook !== undefined) updates.socialFacebook = profile.socialMedia.facebook;
-          if (profile.socialMedia.twitter !== undefined) updates.socialTwitter = profile.socialMedia.twitter;
-          if (profile.socialMedia.instagram !== undefined) updates.socialInstagram = profile.socialMedia.instagram;
-          if (profile.socialMedia.linkedin !== undefined) updates.socialLinkedin = profile.socialMedia.linkedin;
-        }
-        
-        if (profile.address) {
-          if (profile.address.street !== undefined) updates.addressStreet = profile.address.street;
-          if (profile.address.city !== undefined) updates.addressCity = profile.address.city;
-          if (profile.address.state !== undefined) updates.addressState = profile.address.state;
-          if (profile.address.zipCode !== undefined) updates.addressZipCode = profile.address.zipCode;
-          if (profile.address.country !== undefined) updates.addressCountry = profile.address.country;
-        }
-      }
-    }
-
-    // Update user
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: updates,
-    });
-
-    return {
-      id: updatedUser.id,
-      name: updatedUser.name,
-      phoneNumber: updatedUser.phoneNumber,
-      email: updatedUser.email,
-      role: updatedUser.role,
-      isVerified: updatedUser.isVerified,
-      organizerProfile: toOrganizerProfile(updatedUser as any),
-    };
-  } catch (error) {
-    console.error('Error in updateProfile service:', error);
+  } catch (error: any) {
+    if (error.code === "P2002")
+      throw new ApiError("That email address belongs to another account", 409);
     if (error instanceof ApiError) throw error;
-    throw new ApiError('Failed to update profile', 500);
+    console.error("Error in updateProfile service:", error);
+    throw new ApiError("Failed to update profile", 500);
   }
 };
 
@@ -312,27 +317,16 @@ export const changePassword = async (
   currentPassword: string,
   newPassword: string
 ): Promise<{ success: true }> => {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-
-  if (!user) {
-    throw new ApiError('User not found', 404);
-  }
-  if (!user.password) {
-    throw new ApiError('No password is set for this account', 400);
-  }
-
-  const isCurrentValid = await comparePassword(currentPassword, user.password);
-  if (!isCurrentValid) {
-    throw new ApiError('Current password is incorrect', 401);
-  }
-
-  const hashed = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: userId },
-    data: { password: hashed },
+  return withLockedUser({ id: userId }, async (tx, user) => {
+    if (!user) throw new ApiError('User not found', 404);
+    assertAccountActive(user);
+    if (!user.password) throw new ApiError('No password is set for this account', 400);
+    if (!(await comparePassword(currentPassword, user.password)))
+      throw new ApiError('Current password is incorrect', 401);
+    const hashed = await hashPassword(newPassword);
+    await tx.user.update({ where: { id: userId }, data: { password: hashed } });
+    return { success: true as const };
   });
-
-  return { success: true };
 };
 
 /**
@@ -374,15 +368,22 @@ export const requestPasswordReset = async (identifier: {
     return { message: GENERIC_RESET_REQUEST_MESSAGE };
   }
 
+  assertAccountActive(user);
   const resetCode = generateOTPCode();
   const resetCodeHash = await hashPassword(resetCode);
   const resetCodeExpiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
 
-  await prisma.user.update({
-    where: { id: user.id },
-    // Reset the attempt counter alongside the fresh code.
-    data: { resetCodeHash, resetCodeExpiresAt, resetCodeAttempts: 0 },
-  });
+  try {
+    await prisma.user.update({
+      where: { id: user.id, isActive: true },
+      // Reset the attempt counter alongside the fresh code.
+      data: { resetCodeHash, resetCodeExpiresAt, resetCodeAttempts: 0 },
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025")
+      throw new ApiError("Account access changed. Request a new reset after signing in.", 403);
+    throw error;
+  }
 
   // Deliver via YeboLink to the account's registered phone. A failure here
   // throws and surfaces to the caller — we never claim success on a failed send.
@@ -411,7 +412,7 @@ export const resetPassword = async (
   const account = await findResetAccount(identifier);
   if (!account) throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
   return withLockedUser({ id: account.id }, async (tx, user) => {
-    if (!user || !['organizer', 'admin'].includes(user.role) || !user.resetCodeHash || !user.resetCodeExpiresAt) {
+    if (!user || !user.isActive || !['organizer', 'admin'].includes(user.role) || !user.resetCodeHash || !user.resetCodeExpiresAt) {
       throw new ApiError(GENERIC_RESET_FAILURE_MESSAGE, 400);
     }
     if (new Date() >= user.resetCodeExpiresAt) {

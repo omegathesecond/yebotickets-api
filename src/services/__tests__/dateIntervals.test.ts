@@ -1,7 +1,8 @@
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
 
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 import prisma from '../../config/prisma';
 import { createEvent, updateEvent } from '../event.service';
 import { createTicketType, updateTicketType } from '../ticket.service';

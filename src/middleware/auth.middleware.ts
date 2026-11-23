@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
+import { verifyAccessToken } from '../services/token.service';
+import { assertCurrentSession } from '../services/auth-state';
 import { ApiError } from './error.middleware';
 import prisma from '../config/prisma';
 import { IUser, UserRole } from '../interfaces/user.interface';
@@ -27,7 +28,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
 
     try {
       // Verify token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
+      const decoded = verifyAccessToken(token);
 
       // Get user from database
       const user = await prisma.user.findUnique({
@@ -39,6 +40,8 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
           email: true,
           role: true,
           isVerified: true,
+          isActive: true,
+          authVersion: true,
           createdAt: true,
           updatedAt: true,
         },
@@ -48,12 +51,16 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
         return next(new ApiError('User not found', 404));
       }
 
+      assertCurrentSession(user, decoded);
+      // Session internals do not enter the public user response.
+      const { authVersion, ...publicUser } = user;
+
       // Attach user to request object
-      authReq.user = user as unknown as IUser;
+      authReq.user = publicUser as unknown as IUser;
 
       next();
     } catch (error) {
-      return next(new ApiError('Not authorized, invalid token', 401));
+      return next(error);
     }
   } catch (error) {
     next(error);

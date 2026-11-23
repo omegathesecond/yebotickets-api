@@ -1,6 +1,7 @@
 import { mockDeep, mockReset, DeepMockProxy } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../comms.service', () => ({ sendTextMessage: jest.fn(), sendEmailMessage: jest.fn() }));
 jest.mock('../qr.service', () => ({ buildTicketQrPayload: jest.fn(), generateTicketQrDataUrl: jest.fn() }));
 import prisma from '../../config/prisma';
@@ -12,11 +13,12 @@ const send = sendTextMessage as jest.Mock;
 let row: any;
 let tickets: any[];
 beforeEach(() => {
-  mockReset(db); send.mockReset(); send.mockResolvedValue({ messageId: 'msg', status: 'queued' });
+  mockReset(db); send.mockReset(); send.mockResolvedValue({ messageId: '550e8400-e29b-41d4-a716-446655440000', status: 'queued' });
+  db.ticketDeliveryMessage.findMany.mockResolvedValue([]);
   row = { id: 'paid:charge', status: 'pending', attempts: 0, attemptId: null, attemptedAt: null,
     channel: null, error: null, nextAttemptAt: new Date(0) };
   tickets = ['ONE', 'TWO'].map(uniqueCode => ({ id: uniqueCode, eventId: 'event', userId: 'buyer',
-    uniqueCode, deliveryOrderId: row.id, status: 'sold', paymentStatus: 'SUCCEEDED', paymentRef: 'charge',
+    uniqueCode, deliveryOrderId: row.id, status: 'sold', paymentStatus: 'SUCCEEDED', paymentRef: 'charge', amountPaid: 50,
     event: { title: 'Concert', startDate: new Date(), isCancelled: false }, ticketType: { name: 'Standard' },
     user: { phoneNumber: '+26878422613' } }));
   db.$transaction.mockImplementation(((fn: any) => fn(db)) as any);

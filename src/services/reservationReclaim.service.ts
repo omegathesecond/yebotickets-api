@@ -199,6 +199,16 @@ export const runReclaimSweep = async (): Promise<SweepResult> => {
   return totals;
 };
 
+/** Reuse one recovery orchestration for startup, periodic and authenticated manual runs. */
+export const runTicketRecoverySweep = async () => {
+  const summary = await runReclaimSweep();
+  const { recoverCorporateCancellations } = await import('../staffAdmin/cancellation');
+  await recoverCorporateCancellations();
+  const { recoverCorporatePurchases } = await import('../staffAdmin/purchaseRecovery');
+  await recoverCorporatePurchases();
+  return summary;
+};
+
 /**
  * Start the in-process periodic reclaim. Idempotent (returns the existing timer
  * if already started). Disabled when RESERVATION_RECLAIM_ENABLED=false — set
@@ -225,7 +235,7 @@ export const startReservationReclaimScheduler = (): NodeJS.Timeout | null => {
     DEFAULT_INTERVAL_MS;
 
   timer = setInterval(() => {
-    runReclaimSweep().catch((error) =>
+    runTicketRecoverySweep().catch((error) =>
       // A whole-sweep failure (e.g. the DB read failed): surface loudly, but
       // keep the interval alive so the next tick retries.
       console.error('[reclaim] scheduled sweep failed:', error)
@@ -236,7 +246,7 @@ export const startReservationReclaimScheduler = (): NodeJS.Timeout | null => {
   // Kick off one sweep shortly after boot so a fresh deploy clears any backlog
   // without waiting a full interval. Detached + logged; never blocks startup.
   setTimeout(() => {
-    runReclaimSweep().catch((error) =>
+    runTicketRecoverySweep().catch((error) =>
       console.error('[reclaim] startup sweep failed:', error)
     );
   }, 5_000).unref();

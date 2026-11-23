@@ -57,27 +57,31 @@ export interface IUser {
   updatedAt: Date;
 }
 
-// Helper to convert flat user to nested organizer profile
+// One mapping for source writes and profile reads; addresses/social links stand alone.
+export const organizerProfileMapping = {
+  companyName: "companyName",
+  description: "companyDescription",
+  website: "website",
+  "socialMedia.facebook": "socialFacebook",
+  "socialMedia.twitter": "socialTwitter",
+  "socialMedia.instagram": "socialInstagram",
+  "socialMedia.linkedin": "socialLinkedin",
+  "address.street": "addressStreet",
+  "address.city": "addressCity",
+  "address.state": "addressState",
+  "address.zipCode": "addressZipCode",
+  "address.country": "addressCountry",
+} as const;
 export function toOrganizerProfile(user: IUser): IOrganizerProfile | undefined {
-  if (!user.companyName && !user.companyDescription && !user.website) {
-    return undefined;
+  const result: Record<string, any> = {};
+  for (const [path, column] of Object.entries(organizerProfileMapping)) {
+    const value = user[column as keyof IUser];
+    if (value === null || value === undefined || value === "") continue;
+    const keys = path.split("."),
+      field = keys.pop()!;
+    let parent = result;
+    for (const key of keys) parent = parent[key] ?? (parent[key] = {});
+    parent[field] = value;
   }
-  return {
-    companyName: user.companyName || undefined,
-    description: user.companyDescription || undefined,
-    website: user.website || undefined,
-    socialMedia: {
-      facebook: user.socialFacebook || undefined,
-      twitter: user.socialTwitter || undefined,
-      instagram: user.socialInstagram || undefined,
-      linkedin: user.socialLinkedin || undefined,
-    },
-    address: {
-      street: user.addressStreet || undefined,
-      city: user.addressCity || undefined,
-      state: user.addressState || undefined,
-      zipCode: user.addressZipCode || undefined,
-      country: user.addressCountry || undefined,
-    },
-  };
+  return Object.keys(result).length ? result : undefined;
 }

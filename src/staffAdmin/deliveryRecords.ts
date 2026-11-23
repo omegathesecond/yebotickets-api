@@ -1,0 +1,106 @@
+import prisma from "../config/prisma";
+import { ApiError } from "../middleware/error.middleware";
+import { deliveryMessageView } from "../services/delivery-message.service";
+import {
+  deliveryDispatchPolicy,
+  deliveryReviewEvidence,
+  assertDeliveryReview,
+  deliveryGeneration,
+} from "../services/delivery-state.service";
+const ticketSelect = {
+  id: true,
+  uniqueCode: true,
+  status: true,
+  isCheckedIn: true,
+  event: { select: { id: true, title: true, isCancelled: true } },
+  user: { select: { id: true, name: true } },
+} as const;
+/** Existing delivery work, not a second communications dashboard or invented proof. */
+export async function listDeliveryRecords(p: Record<string, any>) {
+  const where = p.status ? { status: p.status } : {};
+  const [rows, total] = await Promise.all([
+    prisma.ticketOrderDelivery.findMany({
+      where,
+      include: { tickets: { select: ticketSelect } },
+      orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      skip: ((p.page ?? 1) - 1) * (p.limit ?? 20),
+      take: p.limit ?? 20,
+    }),
+    prisma.ticketOrderDelivery.count({ where }),
+  ]);
+  return {
+    records: rows.map(({ tickets, ...row }) => ({
+      ...row,
+      eventNames: [...new Set(tickets.map((ticket) => ticket.event.title))],
+      buyerNames: [
+        ...new Set(tickets.map((ticket) => ticket.user?.name).filter(Boolean)),
+      ],
+      ticketCount: tickets.length,
+    })),
+    total,
+  };
+}
+export async function deliveryRecord(id: string) {
+  const evidence = await deliveryReviewEvidence(id);
+  const policy = deliveryDispatchPolicy(evidence);
+  let retryAvailable = policy.canRetry,
+    retryReason = policy.reason;
+  if (retryAvailable) {
+    try {
+      assertDeliveryReview(evidence, true, deliveryGeneration(evidence.order));
+    } catch (error) {
+      if (
+        !(error instanceof ApiError) ||
+        ![409, 429].includes(error.statusCode)
+      )
+        throw error;
+      retryAvailable = false;
+      retryReason = error.message;
+    }
+  }
+  const row = { ...evidence.order, tickets: evidence.tickets };
+  return {
+    ...row,
+    generationId: deliveryGeneration(evidence.order),
+    retryAvailable,
+    duplicateRiskAcknowledgementRequired:
+      policy.canRetry && policy.duplicateRisk,
+    retryReason,
+    tickets: row.tickets.map((ticket) => ({
+      id: ticket.id,
+      ticketCode: ticket.uniqueCode,
+      status: ticket.status,
+      isCheckedIn: ticket.isCheckedIn,
+      event: ticket.event.title,
+      eventCancelled: ticket.event.isCancelled,
+      buyerName: ticket.user?.name ?? null,
+    })),
+    note: "Sent is the source's recorded message-acceptance state. It does not prove customer receipt. Unknown delivery may already have sent a message; it is never automatically resent.",
+  };
+}
+
+export async function listDeliveryMessages(
+  p: Record<string, any>,
+  kind: "order" | "cancellation" = "order",
+) {
+  const where =
+    kind === "order"
+      ? { deliveryOrderId: p.id }
+      : { cancellationNoticeId: p.id };
+  const [rows, total] = await Promise.all([
+    prisma.ticketDeliveryMessage.findMany({
+      where,
+      orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      skip: ((p.page ?? 1) - 1) * (p.limit ?? 20),
+      take: p.limit ?? 20,
+    }),
+    prisma.ticketDeliveryMessage.count({ where }),
+  ]);
+  return { records: rows.map(deliveryMessageView), total };
+}
+export async function deliveryMessageRecord(id: string) {
+  const row = await prisma.ticketDeliveryMessage.findUnique({ where: { id } });
+  if (!row)
+    throw new ApiError("Original ticket delivery attempt was not found", 404);
+  return deliveryMessageView(row);
+}

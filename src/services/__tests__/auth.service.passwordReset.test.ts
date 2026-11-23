@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 // auth.service imports `prisma` as the DEFAULT export of ../config/prisma.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 
@@ -33,6 +34,7 @@ const buildUser = async (over: Partial<any> = {}) => ({
   email: 'owner@example.com',
   password: await bcrypt.hash('OldPass1', 10),
   role: 'organizer',
+  isActive: true, authVersion: 0,
   isVerified: true,
   otpCode: null,
   otpExpiresAt: null,
@@ -65,7 +67,7 @@ describe('requestPasswordReset', () => {
     // A HASH (not the plaintext code) with a future expiry was written to the user row.
     expect(prismaMock.user.update).toHaveBeenCalledTimes(1);
     const updateArg = prismaMock.user.update.mock.calls[0][0] as any;
-    expect(updateArg.where).toEqual({ id: 'user-1' });
+    expect(updateArg.where).toEqual({ id: 'user-1', isActive: true });
     expect(updateArg.data.resetCodeHash).toEqual(expect.any(String));
     expect(updateArg.data.resetCodeHash).not.toMatch(/^\d{6}$/);
     expect(updateArg.data.resetCodeExpiresAt.getTime()).toBeGreaterThan(before);

@@ -1,4 +1,6 @@
 import prisma from '../config/prisma';
+import { CURRENCY } from '../config/platform';
+import { sumTicketRevenue } from './settlement.service';
 
 /**
  * Platform-wide metrics shared by the CEO dashboard (X-API-Key route) and the
@@ -13,7 +15,7 @@ export const getDashboardMetrics = async () => {
 
   // Active events (published, not yet ended)
   const activeEvents = await prisma.event.count({
-    where: { isPublished: true, endDate: { gte: now } },
+    where: { isPublished: true, isCancelled: false, endDate: { gte: now } },
   });
   const previousActiveEvents = await prisma.event.count({
     where: { isPublished: true, endDate: { gte: thirtyDaysAgo, lt: now } },
@@ -27,18 +29,18 @@ export const getDashboardMetrics = async () => {
     where: { status: 'sold', purchaseDate: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
   });
 
-  // Revenue = sum of ticketType.price for sold tickets in each window
+  // Recorded allocations, independent of later edits to a ticket tier's price.
   const revenueCurrentResult = await prisma.ticket.findMany({
     where: { status: 'sold', purchaseDate: { gte: thirtyDaysAgo } },
-    include: { ticketType: { select: { price: true } } },
+    select: { amountPaid: true },
   });
-  const revenueCurrent = revenueCurrentResult.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const revenueCurrent = sumTicketRevenue(revenueCurrentResult);
 
   const revenuePreviousResult = await prisma.ticket.findMany({
     where: { status: 'sold', purchaseDate: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
-    include: { ticketType: { select: { price: true } } },
+    select: { amountPaid: true },
   });
-  const revenuePrevious = revenuePreviousResult.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0);
+  const revenuePrevious = sumTicketRevenue(revenuePreviousResult);
 
   // Organizers (cumulative counts as of now vs 30 days ago)
   const organizersCurrent = await prisma.user.count({
@@ -73,7 +75,7 @@ export const getDashboardMetrics = async () => {
       value: revenueCurrent,
       trend: calculateTrend(revenueCurrent, revenuePrevious),
       changePercent: calculateChangePercent(revenueCurrent, revenuePrevious),
-      currency: 'KES',
+      currency: CURRENCY,
     },
     organizers: {
       value: organizersCurrent,

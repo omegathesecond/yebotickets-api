@@ -1,3 +1,4 @@
+import { profileValidator } from '../validators/profile.validator';
 /**
  * @swagger
  * tags:
@@ -88,7 +89,6 @@ import {
 import { createEventValidator } from '../validators/event.validator';
 import { validate } from '../middleware/validate.middleware';
 import {
-  organizerProfileValidator,
   organizerSignupValidator,
   organizerLoginValidator,
   organizerStatusValidator,
@@ -401,7 +401,7 @@ router.use(authorize(UserRole.ORGANIZER, UserRole.ADMIN));
  *         description: Profile updated successfully
  */
 router.get('/profile', getOrganizerProfileController);
-router.put('/profile', validate(organizerProfileValidator), updateOrganizerProfileController);
+router.put('/profile', validate(profileValidator), updateOrganizerProfileController);
 
 /**
  * @swagger

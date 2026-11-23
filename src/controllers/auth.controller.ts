@@ -4,12 +4,13 @@ import {
   verifyOTP,
   updateProfile,
   requestPasswordReset,
-  resetPassword
+  resetPassword,
+  withLockedUser
 } from '../services/auth.service';
 import { ApiError } from '../middleware/error.middleware';
 import { IUser } from '../interfaces/user.interface';
 import { AuthenticatedRequest } from '../types/auth';
-import prisma from '../config/prisma';
+import { assertCurrentSession } from '../services/auth-state';
 import { verifyRefreshToken, generateAuthTokens } from '../services/token.service';
 
 export const requestOTPController = async (req: Request, res: Response, next: NextFunction) => {
@@ -57,16 +58,11 @@ export const refreshTokenController = async (req: Request, res: Response, next: 
     // Throws a 401 ApiError if the token is invalid/expired or not a refresh token.
     const payload = verifyRefreshToken(refreshToken);
 
-    // Confirm the user still exists (token could outlive a deleted account).
-    const user = await prisma.user.findUnique({
-      where: { id: payload.id },
-      select: { id: true, role: true },
+    const tokens = await withLockedUser({ id: payload.id }, async (_tx, user) => {
+      if (!user) throw new ApiError('User no longer exists', 401);
+      assertCurrentSession(user, payload);
+      return generateAuthTokens(user.id, user.role, user.authVersion);
     });
-    if (!user) {
-      return next(new ApiError('User no longer exists', 401));
-    }
-
-    const tokens = generateAuthTokens(user.id, user.role);
 
     res.status(200).json({
       accessToken: tokens.token,
@@ -87,7 +83,7 @@ export const updateProfileController = async (req: Request, res: Response, next:
     const userId = authReq.user.id;
     const updateData = req.body;
     
-    const result = await updateProfile(userId, updateData);
+    const result = await updateProfile(userId, updateData, { id: authReq.user.id });
     
     res.status(200).json({
       success: true,

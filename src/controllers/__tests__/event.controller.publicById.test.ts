@@ -8,6 +8,7 @@ import type { PrismaClient } from '@prisma/client';
 // the service's isPublished/isCancelled/ownership gate.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
 

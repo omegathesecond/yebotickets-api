@@ -1,3 +1,4 @@
+import { recoverCancellationNotices } from './cancellation-notice.service';
 import { recoverOrderDeliveries } from './ticket.service';
 
 let timer: NodeJS.Timeout | null = null;
@@ -5,7 +6,7 @@ let running = false;
 const tick = async () => {
   if (running) return;
   running = true;
-  try { await recoverOrderDeliveries(); }
+  try { await recoverOrderDeliveries(); await recoverCancellationNotices(); }
   catch (error) { console.error('[delivery] recovery failed:', error); }
   finally { running = false; }
 };

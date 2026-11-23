@@ -98,12 +98,12 @@ steps:
       # api.yebopay.com is an unrelated third-party site, so this must never be
       # left to drift. Dev overrides it to https://dev-api.yebopay.app.
       #
-      # PLATFORM_FEE_PERCENT is the platform's commission on ticket sales, read
-      # by the organizer settlement calculation. Defaults to 0 (organizers are
-      # owed 100% of gross) until the business sets a rate; change it via the
-      # trigger substitution, never by hand, so a redeploy cannot reset it.
+      # Commission is source database configuration managed by CEO review.
+      # Import its reviewed deployed value before this first cutover. Remove only
+      # the obsolete setting; preserve every other runtime env/secret binding.
+      - '--remove-env-vars=PLATFORM_FEE_PERCENT'
       - '--update-env-vars'
-      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},PLATFORM_FEE_PERCENT=${_PLATFORM_FEE_PERCENT}'
+      - 'YEBOPAY_BASE_URL=${_YEBOPAY_BASE_URL},CEO_DASHBOARD_SERVICE_ACCOUNT=${_CEO_DASHBOARD_SERVICE_ACCOUNT},CEO_DASHBOARD_AUDIENCE=${_CEO_DASHBOARD_AUDIENCE}'
 
 images:
   - 'gcr.io/$PROJECT_ID/yebotickets-api:$COMMIT_SHA'
@@ -129,11 +129,10 @@ substitutions:
   _YEBOPAY_API_KEY_SECRET: 'YEBOTICKETS__YEBOPAY_API_KEY'
   _YEBOPAY_WEBHOOK_SECRET_SECRET: 'YEBOTICKETS__YEBOPAY_WEBHOOK_SECRET'
   _YEBOPAY_BASE_URL: 'https://api.yebopay.app'
-  # Platform commission on ticket sales, as a percentage of gross. 0 = the
-  # platform takes nothing, which is today's behaviour. Must be >= 0 and < 100;
-  # a non-numeric value makes the API fail loudly rather than quietly settle at
-  # 0% and give away the platform's revenue.
-  _PLATFORM_FEE_PERCENT: '0'
+  _CEO_DASHBOARD_SERVICE_ACCOUNT: 'ceodashboard-runtime@hiyebo.iam.gserviceaccount.com'
+  # Dev trigger MUST override this to https://dev-api.yebotickets.com.
+  # The runtime rejects an origin that does not match its actual K_SERVICE.
+  _CEO_DASHBOARD_AUDIENCE: 'https://api.yebotickets.com'
 
 options:
   logging: CLOUD_LOGGING_ONLY

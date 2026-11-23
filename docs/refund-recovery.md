@@ -1,6 +1,9 @@
 # Interrupted refund recovery
 
-Apply `prisma migrate deploy` before deploying this API revision.
+Draft implementation; not deployed. Apply migration
+`20261123140000_original_refund_proof` using the environment's Neon direct
+connection before dependent code serves traffic. Requires the coordinated durable
+YeboPay refund release (API PR #30), including the other active caller cutovers.
 
 Admin JWTs can call:
 
@@ -16,20 +19,27 @@ A caller still doing preflight cannot subsequently dispatch after that release.
 safe to release if the original cleanup was interrupted. `RETRYABLE` means the
 normal ticket refund or event cancellation can now be retried.
 
-`CONFIRMED` records a validated successful gateway response before the local
-accounting transaction. Recovery checks the authoritative charge total and
-atomically finalizes the recorded ticket with lock release. Concurrent recovery
-and cancellation cannot commit accounting twice or release a replacement token.
+Every dispatched attempt uses `yebotickets-refund-<attemptId>` as its required
+YeboPay operation key. Recovery calls the original gateway reconciliation endpoint,
+which reads provider proof and cannot dispatch another refund. It verifies the
+original key, request ID, charge, per-ticket amount, currency, mode, provider reference
+and that attempt's cumulative target. Current charge totals alone never prove which
+ticket was refunded.
 
-`DISPATCHING` means a processor request may have been sent. `REVIEW` is the
-initial state for locks predating dispatch evidence. Both remain blocked unless
-there is durable confirmation. A cumulative total alone cannot identify which
-refund succeeded, and an unchanged total does not rule out delayed settlement.
-The response returns `REVIEW_REQUIRED`, gateway evidence and instructions to
-inspect processor records with payment operations. There is deliberately no
-force-unlock or blind retry endpoint. A lost response, or a failed write of the
-confirmation itself, may need payment-operations investigation; the current
-YeboPay charge API provides no per-refund history for safe automatic attribution.
+A verified successful original receipt finalizes the ticket and stores
+`refundAttemptId`, `refundGatewayRequestId` and the provider reference in the same
+transaction that releases the charge lock. A row lock serializes finalizers; an
+original response arriving after recovery converges on the same stored receipt.
+The completion identity and payment state are immutable. Other tickets sharing the
+charge keep their own allocated amount and distinct attempt IDs.
+
+A documented `PENDING`/`UNKNOWN` receipt returns `REVIEW_REQUIRED` and preserves the
+ticket and charge hold. A proved `FAILED` original receipt can release its own hold
+and return `RETRYABLE`; recovery never sends the next payment. A missing original
+receipt, malformed response or mismatched proof fails through the normal API error
+channel and retains the hold. Historical attempts without an original gateway
+receipt require payment-operations investigation; no invented key history or
+compatibility success path is provided. There is no force-unlock endpoint.
 
 Gateway/DB failures propagate through normal API errors. No timer expires locks.
 Notifications from the original refund flow still report delivery failures;

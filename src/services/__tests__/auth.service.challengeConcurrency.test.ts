@@ -2,7 +2,8 @@ import { mockDeep, mockReset } from 'jest-mock-extended';
 import type { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
-jest.mock('../../config/prisma', () => ({ __esModule: true, default: mockDeep<PrismaClient>() }));
+jest.mock('../../config/prisma', () => ({ __esModule: true,
+  staffAdminScope: {actor: () => undefined}, default: mockDeep<PrismaClient>() }));
 jest.mock('../comms.service', () => ({ sendOTP: jest.fn(), sendTextMessage: jest.fn() }));
 jest.mock('../token.service', () => ({ generateAuthTokens: jest.fn(() => ({ token: 'access', refreshToken: 'refresh' })) }));
 import prisma from '../../config/prisma';
@@ -48,7 +49,7 @@ beforeEach(async () => {
     otpCode: '123456', otpExpiresAt: new Date(Date.now() + 60000), otpAttempts: 0,
     resetCodeHash: await bcrypt.hash('123456', 4),
     resetCodeExpiresAt: new Date(Date.now() + 60000), resetCodeAttempts: 0,
-    password: 'old-password', isVerified: false,
+    password: 'old-password', isVerified: false, isActive: true, authVersion: 0,
   };
   const read = async () => ({ ...row });
   db.user.findUnique.mockImplementation(read);

@@ -10,14 +10,14 @@
  * be surfaced-but-not-fatal (ticket delivery after a paid purchase).
  */
 
-const BASE_URL = process.env.YEBOLINK_BASE_URL ?? 'https://api.yebolink.com';
+const BASE_URL = process.env.YEBOLINK_BASE_URL ?? "https://api.yebolink.com";
 
-type Channel = 'sms' | 'whatsapp' | 'email';
+type Channel = "sms" | "whatsapp" | "email";
 
 const getApiKey = (): string => {
   const key = process.env.YEBOLINK_API_KEY;
   if (!key) {
-    throw new YeboLinkSendError('YEBOLINK_API_KEY env var is not set', false);
+    throw new YeboLinkSendError("YEBOLINK_API_KEY env var is not set", false);
   }
   return key;
 };
@@ -25,6 +25,54 @@ const getApiKey = (): string => {
 export interface YeboLinkMessageResult {
   messageId: string;
   status: string;
+}
+
+const messageIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const messageStatuses = [
+  "dispatching",
+  "dispatch_unknown",
+  "scheduled",
+  "queued",
+  "sent",
+  "delivered",
+  "read",
+  "failed",
+  "cancelled",
+];
+export function assertMessageAcceptance(result: YeboLinkMessageResult): void {
+  if (
+    !result ||
+    !messageIdPattern.test(result.messageId) ||
+    ![
+      "dispatching",
+      "dispatch_unknown",
+      "scheduled",
+      "queued",
+      "sent",
+      "delivered",
+      "read",
+    ].includes(result.status)
+  )
+    throw new YeboLinkSendError(
+      "YeboLink did not acknowledge message acceptance",
+      true,
+    );
+}
+
+export interface YeboLinkMessageReceipt {
+  id: string;
+  channel: string;
+  direction: string;
+  recipient: string;
+  status: string;
+  metadata: Record<string, unknown>;
+  provider_message_id?: string;
+  error_message?: string;
+  sent_at?: string;
+  delivered_at?: string;
+  read_at?: string;
+  failed_at?: string;
 }
 
 export interface SendSmsInput {
@@ -51,70 +99,118 @@ export interface SendEmailInput {
 }
 
 export class YeboLinkSendError extends Error {
-  constructor(message: string, public readonly ambiguous: boolean) { super(message); }
+  constructor(
+    message: string,
+    public readonly ambiguous: boolean,
+  ) {
+    super(message);
+  }
 }
 
 const send = async (
   channel: Channel,
   to: string,
   content: Record<string, unknown>,
-  metadata?: Record<string, string>
+  metadata?: Record<string, string>,
 ): Promise<YeboLinkMessageResult> => {
   const res = await fetch(`${BASE_URL}/api/v1/messages/send`, {
-    method: 'POST',
+    method: "POST",
     // Bound delivery so an event cancellation cannot wait on a hung comms call.
     signal: AbortSignal.timeout(10_000),
     headers: {
-      'x-api-key': getApiKey(),
-      'Content-Type': 'application/json',
+      "x-api-key": getApiKey(),
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({ to, channel, content, metadata }),
   });
 
   const body = (await res.json().catch(() => ({}))) as {
     success?: boolean;
-    data?: { id?: string; status?: string };
+    data?: { message_id?: string; status?: string };
     error?: string;
   };
 
-  if (!res.ok || !body.success) {
+  if (!res.ok || body.success !== true) {
     // A server error may occur after enqueueing. Only an explicit client
     // rejection proves no message was accepted.
-    throw new YeboLinkSendError(`YeboLink /messages/send ${res.status}: ${body.error ?? 'unknown error'}`,
-      res.status >= 500 || res.status === 408 || res.ok);
+    throw new YeboLinkSendError(
+      `YeboLink /messages/send ${res.status}: ${body.error ?? "unknown error"}`,
+      res.status >= 500 || res.status === 408 || res.ok,
+    );
   }
 
-  if (!body.data?.id || !body.data.status || ['failed', 'rejected', 'cancelled'].includes(body.data.status.toLowerCase())) {
-    throw new YeboLinkSendError('YeboLink did not acknowledge message acceptance', true);
-  }
-  return { messageId: body.data.id, status: body.data.status };
+  const result = {
+    messageId: body.data?.message_id!,
+    status: body.data?.status!,
+  };
+  assertMessageAcceptance(result);
+  return result;
 };
 
 export class YeboLinkClient {
+  /** Owning, workspace-scoped receipt read. It never sends or retries a message. */
+  static async getMessage(messageId: string): Promise<YeboLinkMessageReceipt> {
+    if (!messageIdPattern.test(messageId))
+      throw new Error("Invalid original YeboLink message identity");
+    const response = await fetch(
+      `${BASE_URL}/api/v1/messages/${encodeURIComponent(messageId)}`,
+      {
+        signal: AbortSignal.timeout(10_000),
+        headers: { "x-api-key": getApiKey() },
+      },
+    );
+    const body = (await response.json()) as {
+      success?: boolean;
+      data?: { message?: YeboLinkMessageReceipt };
+      error?: string;
+    };
+    if (!response.ok || body.success !== true)
+      throw new Error(
+        `YeboLink original message read ${response.status}: ${body.error ?? "Receipt unavailable"}`,
+      );
+    const message = body.data?.message;
+    if (
+      !message ||
+      message.id !== messageId ||
+      !messageStatuses.includes(message.status) ||
+      typeof message.recipient !== "string" ||
+      typeof message.channel !== "string" ||
+      message.direction !== "outbound" ||
+      !message.metadata ||
+      typeof message.metadata !== "object" ||
+      Array.isArray(message.metadata)
+    )
+      throw new Error(
+        "YeboLink original message receipt is incomplete or does not match",
+      );
+    return message;
+  }
   static sendSMS(input: SendSmsInput): Promise<YeboLinkMessageResult> {
-    return send('sms', input.to, { text: input.text }, input.metadata);
+    return send("sms", input.to, { text: input.text }, input.metadata);
   }
 
-  static sendWhatsApp(input: SendWhatsAppInput): Promise<YeboLinkMessageResult> {
+  static sendWhatsApp(
+    input: SendWhatsAppInput,
+  ): Promise<YeboLinkMessageResult> {
     return send(
-      'whatsapp',
+      "whatsapp",
       input.to,
       { text: input.text, media_urls: input.mediaUrls },
-      input.metadata
+      input.metadata,
     );
   }
 
   static sendEmail(input: SendEmailInput): Promise<YeboLinkMessageResult> {
     return send(
-      'email',
+      "email",
       input.to,
       {
         subject: input.subject,
         html: input.html,
         text: input.text,
-        from_name: input.fromName ?? 'YeboTickets',
+        from_name: input.fromName ?? "YeboTickets",
       },
-      input.metadata
+      input.metadata,
     );
   }
 }

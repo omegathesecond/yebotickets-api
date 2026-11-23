@@ -1,4 +1,5 @@
 import prisma from '../config/prisma';
+import { Prisma } from '@prisma/client';
 import { CURRENCY, getPlatformFeePercent, roundMoney } from '../config/platform';
 
 /**
@@ -16,7 +17,7 @@ import { CURRENCY, getPlatformFeePercent, roundMoney } from '../config/platform'
  *   grossSales      Σ what was actually charged for every SOLD ticket
  *   − refundedSales tickets refunded/cancelled — money already returned to the buyer
  *   = eligibleGross ... but only for events that have FINISHED (see below)
- *   − platformFee   eligibleGross × PLATFORM_FEE_PERCENT
+ *   − platformFee   eligibleGross × current commission
  *   = netEarned     what the organizer has actually earned
  *   − paidOut       payouts already settled
  *   − reserved      payouts requested or approved but not yet settled
@@ -41,15 +42,23 @@ const SETTLEABLE_TICKET_STATUSES = ['sold', 'cancelled'] as const;
 /** Payout statuses that have consumed balance but not yet settled. */
 export const RESERVED_PAYOUT_STATUSES = ['pending', 'approved'] as const;
 
-/** Money a single ticket actually moved: what YeboPay charged (`amountPaid`)
- *  when present, else the ticket type's list price for legacy rows written
- *  before charges were persisted. Mirrors organizer-event.service.ts's
- *  ticketRevenue so every money figure on the dashboard is derived the same
- *  way — never re-derived from list price when a real charge exists. */
+/** Recorded paid allocation only. Missing history must be reconciled, never priced from today's catalogue. */
 export const ticketRevenue = (t: {
-  amountPaid?: number | null;
-  ticketType?: { price: number } | null;
-}): number => t.amountPaid ?? t.ticketType?.price ?? 0;
+  amountPaid: number | null;
+}): number => {
+  if (typeof t.amountPaid !== 'number' || !Number.isFinite(t.amountPaid))
+    throw new Error('Recorded ticket payment amount is missing; reconcile the original payment before calculating money totals');
+  const amount = new Prisma.Decimal(t.amountPaid);
+  if (amount.isNegative() || amount.decimalPlaces() > 2 || amount.mul(100).gt(Number.MAX_SAFE_INTEGER))
+    throw new Error('Recorded ticket payment amount is invalid for the original currency');
+  return t.amountPaid;
+};
+
+export const sumTicketRevenue = (tickets: {amountPaid:number|null}[]): number => {
+  const total=tickets.reduce((sum,ticket)=>sum.add(ticketRevenue(ticket)),new Prisma.Decimal(0));
+  if(total.mul(100).gt(Number.MAX_SAFE_INTEGER))throw new Error('Recorded payment total exceeds the supported exact-money range');
+  return total.toNumber();
+};
 
 export interface EventSettlementLine {
   eventId: string;
@@ -111,11 +120,12 @@ const holdReasonFor = (event: { endDate: Date; isCancelled: boolean }, now: Date
  */
 export const getOrganizerStatement = async (
   organizerId: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  client: Prisma.TransactionClient = prisma
 ): Promise<OrganizerStatement> => {
-  const feePercent = getPlatformFeePercent();
+  const feePercent = await getPlatformFeePercent(client);
 
-  const events = await prisma.event.findMany({
+  const events = await client.event.findMany({
     where: { organizerId },
     select: { id: true, title: true, endDate: true, isCancelled: true },
     orderBy: { endDate: 'desc' },
@@ -125,7 +135,7 @@ export const getOrganizerStatement = async (
   // Pull sold AND cancelled rows together: the split between "earned" and
   // "refunded" is made below in code, not by the query.
   const tickets = eventIds.length
-    ? await prisma.ticket.findMany({
+    ? await client.ticket.findMany({
         where: { eventId: { in: eventIds }, status: { in: [...SETTLEABLE_TICKET_STATUSES] } },
         select: {
           eventId: true,
@@ -182,11 +192,11 @@ export const getOrganizerStatement = async (
     .reduce((sum, l) => sum + l.grossSales, 0);
 
   const [paidAgg, reservedAgg] = await Promise.all([
-    prisma.payoutRequest.aggregate({
+    client.payoutRequest.aggregate({
       where: { organizerId, status: 'paid' },
       _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
-    prisma.payoutRequest.aggregate({
+    client.payoutRequest.aggregate({
       where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
       _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
@@ -197,7 +207,7 @@ export const getOrganizerStatement = async (
 
   // Gross already consumed by payouts settled (or reserved) at their OWN
   // frozen rate — re-taxing it at today's rate would restate history the
-  // moment PLATFORM_FEE_PERCENT changes (see splitPayoutFee). Only the
+  // moment the platform commission changes (see splitPayoutFee). Only the
   // remaining, never-consumed gross is fee'd at the current rate.
   const consumedGross = roundMoney((paidAgg._sum?.grossAmount || 0) + (reservedAgg._sum?.grossAmount || 0));
   const consumedFee = roundMoney((paidAgg._sum?.feeAmount || 0) + (reservedAgg._sum?.feeAmount || 0));

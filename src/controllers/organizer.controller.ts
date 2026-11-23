@@ -1,13 +1,17 @@
+import { listOrganizers, setOrganizerVerification, deleteOrganizer } from '../services/organizer-admin.service';
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../middleware/error.middleware';
 import { AuthenticatedRequest } from '../types/auth';
 import prisma from '../config/prisma';
 import { UserRole, toOrganizerProfile } from '../interfaces/user.interface';
-import { updateProfile, changePassword } from '../services/auth.service';
+import { updateProfile, changePassword, withLockedUser } from '../services/auth.service';
 import { getEvents } from '../services/event.service';
 import { getTicketTypes } from '../services/ticket.service';
+import { assertAccountActive } from '../services/auth-state';
 import { generateAuthTokens } from '../services/token.service';
 import bcrypt from 'bcryptjs';
+import { CURRENCY } from '../config/platform';
+import { sumTicketRevenue } from '../services/settlement.service';
 
 /**
  * Upgrade a regular user to an organizer or create a new organizer
@@ -134,7 +138,7 @@ export const updateOrganizerProfileController = async (req: Request, res: Respon
     const updateData = req.body;
     
     // Allow additional fields for organizer profiles
-    const result = await updateProfile(userId, updateData);
+    const result = await updateProfile(userId, updateData, { id: authReq.user.id });
     
     res.status(200).json({
       success: true,
@@ -215,24 +219,21 @@ export const getOrganizerDashboardController = async (req: Request, res: Respons
     }
 
     // Count sold tickets and sum revenue across this organizer's events.
-    // Mirrors the canonical sold/revenue computation in dashboard.service
-    // (status 'sold', revenue = sum of ticketType.price) so the organizer's
-    // own numbers match the platform admin metrics (DRY). A single findMany
-    // with the price included yields both the count and the revenue sum.
+    // Same recorded-payment calculation as platform and settlement views.
     const soldTickets = eventIds.length
       ? await prisma.ticket.findMany({
           where: { eventId: { in: eventIds }, status: 'sold' },
-          include: { ticketType: { select: { price: true } } },
+          select: { amountPaid:true },
         })
       : [];
 
     const ticketStats = {
       totalTypes,
       totalSold: soldTickets.length,
-      totalRevenue: soldTickets.reduce((sum, t) => sum + (t.ticketType?.price || 0), 0),
+      totalRevenue: sumTicketRevenue(soldTickets),
       // Platform currency, matching dashboard.service's revenue metric, so any
       // client rendering totalRevenue labels it truthfully instead of guessing.
-      currency: 'KES',
+      currency: CURRENCY,
     };
     
     res.status(200).json({
@@ -267,27 +268,7 @@ export const getOrganizersController = async (req: Request, res: Response, next:
       return;
     }
     
-    const organizers = await prisma.user.findMany({
-      where: { role: 'organizer' },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        name: true,
-        phoneNumber: true,
-        email: true,
-        role: true,
-        isVerified: true,
-        payoutApprovalStatus: true,
-        payoutApprovalReviewedByAdminId: true,
-        payoutApprovalReviewedAt: true,
-        payoutApprovalReviewedBy: { select: { id: true, name: true } },
-        companyName: true,
-        companyDescription: true,
-        website: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    const {records:organizers}=await listOrganizers({});
 
     res.status(200).json({
       success: true,
@@ -322,47 +303,26 @@ export const loginOrganizerController = async (req: Request, res: Response, next
       return;
     }
 
-    // Check password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      next(new ApiError('Invalid credentials', 401));
-      return;
-    }
-
-    // Check if user is verified
-    if (!user.isVerified) {
-      // Generate new OTP for unverified users
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          otpCode: otp,
-          otpExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
-        },
-      });
-      
-      res.status(401).json({
-        success: false,
-        message: 'Account not verified. A new verification code has been sent to your phone.',
-        requiresVerification: true,
-        phoneNumber: user.phoneNumber
-      });
-      return;
-    }
-
-    // Generate access + refresh tokens
-    const { token, refreshToken } = generateAuthTokens(user.id, user.role);
+    const result = await withLockedUser({ id: user.id }, async (_tx, current) => {
+      if (!current || !['organizer', 'admin'].includes(current.role) || !current.password || !(await bcrypt.compare(password, current.password)))
+        throw new ApiError('Invalid credentials', 401);
+      assertAccountActive(current);
+      if (!current.isVerified)
+        throw new ApiError('Account not verified. Request a verification code to continue.', 403);
+      return { user: current, ...generateAuthTokens(current.id, current.role, current.authVersion) };
+    });
+    const { token, refreshToken, user: signedIn } = result;
 
     res.status(200).json({
       success: true,
       message: 'Login successful',
       data: {
-        id: user.id,
-        name: user.name,
-        phoneNumber: user.phoneNumber,
-        email: user.email,
-        role: user.role,
-        organizerProfile: toOrganizerProfile(user as any),
+        id: signedIn.id,
+        name: signedIn.name,
+        phoneNumber: signedIn.phoneNumber,
+        email: signedIn.email,
+        role: signedIn.role,
+        organizerProfile: toOrganizerProfile(signedIn as any),
         token,
         refreshToken
       }
@@ -434,24 +394,8 @@ export const updateOrganizerStatusController = async (req: Request, res: Respons
     const { id } = req.params;
     const { isVerified } = req.body;
 
-    const updates: any = {};
-    if (typeof isVerified === 'boolean') updates.isVerified = isVerified;
-
-    const organizer = await prisma.user.update({
-      where: { id, role: 'organizer' },
-      data: updates,
-      select: {
-        id: true,
-        name: true,
-        phoneNumber: true,
-        email: true,
-        role: true,
-        isVerified: true,
-        companyName: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    if(typeof isVerified!=='boolean')throw new ApiError('Choose a phone verification flag',400);
+    const organizer=await setOrganizerVerification(id,isVerified);
 
     res.status(200).json({
       success: true,
@@ -473,9 +417,7 @@ export const deleteOrganizerController = async (req: Request, res: Response, nex
   try {
     const { id } = req.params;
 
-    await prisma.user.delete({
-      where: { id, role: 'organizer' },
-    });
+    await deleteOrganizer(id, (req as AuthenticatedRequest).user);
 
     res.status(200).json({
       success: true,

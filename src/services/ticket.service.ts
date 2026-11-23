@@ -1,7 +1,18 @@
-import { assertEventVisible, EventViewer } from '../utils/eventVisibility';
+import { assertEventVisible, eventOwnershipFilter, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
-import prisma from '../config/prisma';
+import prisma, { staffAdminScope } from '../config/prisma';
+import type { StaffOperationContext } from '../staffAdmin/audit';
+import { prepareCorporateRefund, finishCorporateRefund, failCorporateRefund } from '../staffAdmin/refundReceipt';
+import { ticketRefundTerms } from './ticket-refund-terms';
+import { sumTicketRevenue } from './settlement.service';
+import { lockTransactionIdentity } from '../utils/transactionIdentity';
+import { sendDeliveryMessage } from './delivery-message.service';
+import { formatPhone } from '../utils/phone';
+import { enqueueCancellationNotice } from './cancellation-notice-state.service';
+import { dispatchCancellationNoticeForTicket } from './cancellation-notice.service';
+import { PURCHASE_INCLUDE } from './ticket-includes';
+import { deliveryDispatchState, deliveryDispatchPolicy, deliveryAttemptOutcome, lockOrderDelivery } from './delivery-state.service';
 import { 
   ITicket, 
   ITicketType, 
@@ -10,6 +21,7 @@ import {
 } from '../interfaces/ticket.interface';
 import { ApiError } from '../middleware/error.middleware';
 import crypto from 'crypto';
+import { CURRENCY as TICKET_CURRENCY } from '../config/platform';
 import { YeboLinkSendError } from './yebolink.client';
 import {
   buildTicketQrPayload,
@@ -21,12 +33,14 @@ import {
   getCharge,
   listPaymentOptions,
   refundCharge,
+  reconcileRefund,
   YeboPayHttpError,
+  type RefundResult,
+  type ChargeResult,
   type PaymentOptionsResponse,
 } from './yebopay.service';
 
-/** Currency + default country tickets are priced/charged in (Eswatini). */
-const TICKET_CURRENCY = 'SZL';
+/** Default country for the existing Eswatini ticket rails. */
 const DEFAULT_COUNTRY = 'SZ';
 
 /**
@@ -98,7 +112,7 @@ const mapTicketStatus = (status: string): TicketStatus => {
 export const createTicketType = async (
   ticketTypeData: Partial<ITicketType>, 
   eventId: string,
-  organizerId: string
+  organizerId: string | undefined
 ) => {
   assertDateInterval(ticketTypeData.saleStartDate, ticketTypeData.saleEndDate, 'Sale end date must be after sale start date');
   try {
@@ -106,7 +120,7 @@ export const createTicketType = async (
     const event = await prisma.event.findFirst({
       where: {
         id: eventId,
-        organizerId,
+        ...eventOwnershipFilter(organizerId),
       },
     });
 
@@ -223,7 +237,7 @@ const lockTicketTier = async (tx: Prisma.TransactionClient, ticketTypeId: string
 export const updateTicketType = async (
   ticketTypeId: string,
   updateData: Partial<ITicketType>,
-  organizerId: string
+  organizerId: string | undefined
 ) => {
   try {
     return await prisma.$transaction(async (tx) => {
@@ -241,7 +255,7 @@ export const updateTicketType = async (
       const event = await tx.event.findFirst({
         where: {
           id: ticketType.eventId,
-          organizerId,
+          ...eventOwnershipFilter(organizerId),
         },
       });
 
@@ -292,56 +306,65 @@ export const updateTicketType = async (
  */
 export const deleteTicketType = async (
   ticketTypeId: string,
-  organizerId: string
+  organizerId: string | undefined
 ): Promise<{ message: string }> => {
   try {
-    // Find ticket type
-    const ticketType = await prisma.ticketType.findUnique({
-      where: { id: ticketTypeId },
+    return await prisma.$transaction(async (tx) => {
+      await lockTicketTier(tx, ticketTypeId);
+      // Find ticket type
+      const ticketType = await tx.ticketType.findUnique({
+        where: { id: ticketTypeId },
+      });
+
+      if (!ticketType) {
+        throw new ApiError('Ticket type not found', 404);
+      }
+
+      // Verify the event belongs to this organizer
+      const event = await tx.event.findFirst({
+        where: {
+          id: ticketType.eventId,
+          ...eventOwnershipFilter(organizerId),
+        },
+      });
+
+      if (!event) {
+        throw new ApiError(
+          'You do not have permission to delete this ticket type',
+          403
+        );
+      }
+
+      // Preserve issued, held and cancelled records; deletion is only for unsold inventory.
+      const issuedTicketsCount = await tx.ticket.count({
+        where: {
+          ticketTypeId,
+          status: { not: 'available' },
+        },
+      });
+
+      if (issuedTicketsCount > 0) {
+        throw new ApiError(
+          'Cannot delete a ticket tier with issued, reserved or cancelled tickets; keep its original history',
+          400
+        );
+      }
+
+      // Delete all available tickets of this type first
+      await tx.ticket.deleteMany({
+        where: {
+          ticketTypeId,
+          status: 'available',
+        },
+      });
+
+      // Delete the ticket type
+      await tx.ticketType.delete({
+        where: { id: ticketTypeId },
+      });
+
+      return { message: 'Ticket type deleted successfully' };
     });
-    
-    if (!ticketType) {
-      throw new ApiError('Ticket type not found', 404);
-    }
-
-    // Verify the event belongs to this organizer
-    const event = await prisma.event.findFirst({
-      where: {
-        id: ticketType.eventId,
-        organizerId,
-      },
-    });
-
-    if (!event) {
-      throw new ApiError('You do not have permission to delete this ticket type', 403);
-    }
-
-    // Check if there are any tickets of this type that are already sold
-    const soldTicketsCount = await prisma.ticket.count({
-      where: {
-        ticketTypeId,
-        status: { in: ['sold', 'reserved'] },
-      },
-    });
-
-    if (soldTicketsCount > 0) {
-      throw new ApiError('Cannot delete ticket type that has sold tickets', 400);
-    }
-
-    // Delete all available tickets of this type first
-    await prisma.ticket.deleteMany({
-      where: {
-        ticketTypeId,
-        status: 'available',
-      },
-    });
-
-    // Delete the ticket type
-    await prisma.ticketType.delete({
-      where: { id: ticketTypeId },
-    });
-
-    return { message: 'Ticket type deleted successfully' };
   } catch (error) {
     console.error('Error in deleteTicketType service:', error);
     if (error instanceof ApiError) throw error;
@@ -359,7 +382,7 @@ export const deleteTicketType = async (
 export const generateTickets = async (
   ticketTypeId: string,
   quantity: number,
-  organizerId: string
+  organizerId: string | undefined
 ): Promise<{ message: string; count: number }> => {
   try {
     return await prisma.$transaction(async (tx) => {
@@ -377,7 +400,7 @@ export const generateTickets = async (
       const event = await tx.event.findFirst({
         where: {
           id: ticketType.eventId,
-          organizerId,
+          ...eventOwnershipFilter(organizerId),
         },
       });
 
@@ -421,41 +444,6 @@ export const generateTickets = async (
     throw new ApiError('Failed to generate tickets', 500);
   }
 };
-
-/**
- * Prisma include used when issuing a ticket on purchase so we have everything
- * needed to render the QR and the delivery message: the event (title, date,
- * venue), the ticket-type label, and the buyer's phone number.
- */
-const PURCHASE_INCLUDE = {
-  event: {
-    select: {
-      isCancelled: true,
-      id: true,
-      title: true,
-      startDate: true,
-      endDate: true,
-      locationAddress: true,
-      locationCity: true,
-      locationCountry: true,
-    },
-  },
-  ticketType: {
-    select: {
-      id: true,
-      name: true,
-      type: true,
-    },
-  },
-  user: {
-    select: {
-      id: true,
-      name: true,
-      phoneNumber: true,
-      email: true,
-    },
-  },
-} as const;
 
 /**
  * Outcome of attempting to deliver an issued ORDER to the buyer. `status:
@@ -584,8 +572,12 @@ const buildOrderEmailHtml = async (tickets: any[]): Promise<string> => {
  * paid purchase is never rolled back over a comms hiccup, but the failure is
  * surfaced, not swallowed.
  */
-const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult> => {
+const deliverOrderToBuyer = async (tickets: any[], dispatchAttemptId: string): Promise<TicketDeliveryResult> => {
   const first = tickets[0];
+  if (!first?.userId || !first.deliveryOrderId || tickets.some(ticket =>
+    ticket.userId !== first.userId || ticket.eventId !== first.eventId || ticket.deliveryOrderId !== first.deliveryOrderId))
+    throw new ApiError('The original delivery does not have one verified order, buyer and event', 409);
+  tickets.forEach(ticketRefundTerms);
   const phoneNumber = first.user?.phoneNumber;
   const email = first.user?.email;
   const text = buildOrderMessage(tickets);
@@ -594,7 +586,8 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
   // Primary channel: WhatsApp via YeboLink.
   if (phoneNumber) {
     try {
-      await sendTextMessage(phoneNumber, text);
+      await sendDeliveryMessage({ deliveryOrderId: first.deliveryOrderId }, dispatchAttemptId, 'whatsapp', formatPhone(phoneNumber),
+        metadata => sendTextMessage(phoneNumber, text, metadata));
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via WhatsApp:', error);
@@ -611,14 +604,15 @@ const deliverOrderToBuyer = async (tickets: any[]): Promise<TicketDeliveryResult
   if (email) {
     try {
       const html = await buildOrderEmailHtml(tickets);
-      await sendEmailMessage(
+      await sendDeliveryMessage({ deliveryOrderId: first.deliveryOrderId }, dispatchAttemptId, 'email', email, metadata => sendEmailMessage(
         email,
         tickets.length > 1
           ? `Your ${tickets.length} tickets for ${first.event?.title ?? 'your event'}`
           : `Your ticket for ${first.event?.title ?? 'your event'}`,
         html,
-        text
-      );
+        text,
+        metadata
+      ));
       return { channel: 'email', status: 'sent' };
     } catch (error) {
       console.error('Failed to deliver order via email:', error);
@@ -832,7 +826,7 @@ const commitSettlement = async (
 
 const refundCancelledSettlement = async (tickets: any[]) => {
   for (const ticket of tickets) {
-    const outcome = await refundAndCancelTicket(ticket, 'Event cancelled before payment settled');
+    const outcome = await refundAndCancelTicket(ticket, 'Event cancelled before payment settled', undefined, 'cancelled-settlement');
     if (outcome.result === 'refund_failed') throw new ApiError(outcome.error!, 502);
   }
 };
@@ -846,72 +840,212 @@ const enqueueOrderDelivery = async (tx: Prisma.TransactionClient, tickets: any[]
   tickets.forEach(t => { t.deliveryOrderId = id; });
 };
 
-const deliveryView = (row: { status: string; channel: string | null; error: string | null; attemptedAt: Date | null }) => ({
-  status: row.status as TicketDeliveryResult['status'], channel: row.channel,
-  error: row.error || undefined, attemptedAt: row.attemptedAt,
+const deliveryView = (row: {
+  status: string;
+  channel: string | null;
+  error: string | null;
+  attemptedAt: Date | null;
+}) => ({
+  status: row.status as TicketDeliveryResult["status"],
+  channel: row.channel,
+  error: row.error || undefined,
+  attemptedAt: row.attemptedAt,
 });
 
-/** A DB compare-and-set owns dispatch across workers and buyer retries.
- * Never reclaim sending automatically: after a crash the provider may have
- * accepted the message. Only an explicit buyer retry accepts that risk. */
-export const dispatchOrderDelivery = async (id: string, manual = false, acknowledgeDuplicateRisk = false): Promise<TicketDeliveryResult> => {
-  const row = await prisma.ticketOrderDelivery.findUnique({ where: { id } });
-  if (!row) throw new ApiError('Delivery record not found', 404);
-  if (row.status === 'sent' || row.status === 'suppressed') return deliveryView(row);
-  const stale = row.status === 'sending' && row.attemptedAt && Date.now() - row.attemptedAt.getTime() > 120_000;
-  if (row.status === 'sending' && !stale) return deliveryView(row);
-  if ((row.status === 'unknown' || stale) && (!manual || !acknowledgeDuplicateRisk)) {
-    if (manual) throw new ApiError('Delivery is unconfirmed. Confirm that retrying may send a duplicate message.', 409);
-    return { ...deliveryView(row), status: 'unknown' };
+/** One source-owned claim for workers, buyers and reviewed corporate retries. */
+export const claimOrderDelivery = async (
+  id: string,
+  manual = false,
+  acknowledgeDuplicateRisk = false,
+  attemptId: string = crypto.randomUUID(),
+) => {
+  const state = await deliveryDispatchState(id),
+    row = state.order;
+  const policy = deliveryDispatchPolicy(state);
+  if (!policy.canRetry)
+    return {
+      outcome: {
+        ...deliveryView(row),
+        status: policy.status as TicketDeliveryResult["status"],
+        error: policy.status === "sent" ? undefined : policy.reason,
+      },
+    };
+  if (policy.duplicateRisk && (!manual || !acknowledgeDuplicateRisk)) {
+    if (manual) throw new ApiError(policy.reason, 409);
+    if (row.status !== "unknown")
+      await prisma.ticketOrderDelivery.updateMany({
+        where: { id, status: row.status, attemptId: row.attemptId },
+        data: { status: "unknown", error: policy.reason },
+      });
+    return {
+      outcome: {
+        ...deliveryView(row),
+        status: "unknown" as const,
+        error: policy.reason,
+      },
+    };
   }
-  if (manual && row.attemptedAt && Date.now() - row.attemptedAt.getTime() < 60_000) {
-    throw new ApiError('Please wait one minute before retrying delivery.', 429);
-  }
-  const attemptId = crypto.randomUUID();
+  if (
+    manual &&
+    row.attemptedAt &&
+    Date.now() - row.attemptedAt.getTime() < 60_000
+  )
+    throw new ApiError("Please wait one minute before retrying delivery.", 429);
   const claim = await prisma.ticketOrderDelivery.updateMany({
-    where: { id, status: row.status, attemptId: row.attemptId,
-      ...(!manual ? { nextAttemptAt: { lte: new Date() } } : {}) },
-    data: { status: 'sending', attemptId, attemptedAt: new Date(), attempts: { increment: 1 }, error: null },
+    where: {
+      id,
+      status: row.status,
+      attemptId: row.attemptId,
+      ...(!manual ? { nextAttemptAt: { lte: new Date() } } : {}),
+    },
+    data: {
+      status: "sending",
+      attemptId,
+      attemptedAt: new Date(),
+      attempts: { increment: 1 },
+      error: null,
+    },
   });
-  if (!claim.count) return deliveryView((await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } })));
+  if (!claim.count)
+    return {
+      outcome: deliveryView(
+        await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }),
+      ),
+    };
+  return { attemptId };
+};
+
+/** Dispatch only the already committed original generation; never claim a replacement. */
+export const dispatchClaimedOrderDelivery = async (
+  id: string,
+  attemptId: string,
+  finalize?: () => Promise<unknown>,
+  beforeSend?: () => Promise<void>,
+): Promise<TicketDeliveryResult> => {
+  const row = await prisma.ticketOrderDelivery.findUniqueOrThrow({
+    where: { id },
+  });
+  if (row.status !== "sending" || row.attemptId !== attemptId)
+    return deliveryView(row);
   let outcome: TicketDeliveryResult;
   try {
-    // Lock Event then Ticket in the same order as cancellation. Re-read tickets
-    // under row locks so individual refunds cannot race an admission message.
-    outcome = await prisma.$transaction(async tx => {
-      await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${id} FOR UPDATE`;
-      const owner = await tx.ticketOrderDelivery.findUniqueOrThrow({ where: { id } });
-      if (owner.status !== 'sending' || owner.attemptId !== attemptId) return deliveryView(owner);
-      const members = await tx.ticket.findMany({ where: { deliveryOrderId: id }, select: { eventId: true } });
-      if (!members.length) return { status: 'suppressed', error: 'No tickets remain in this order.' };
-      const events = await tx.$queryRaw<{ isCancelled: boolean }[]>`
-        SELECT "isCancelled" FROM "Event" WHERE "id" = ${members[0].eventId} FOR SHARE
-      `;
-      await tx.$queryRaw`SELECT "id" FROM "Ticket" WHERE "deliveryOrderId" = ${id} ORDER BY "id" FOR UPDATE`;
-      const tickets = await tx.ticket.findMany({ where: { deliveryOrderId: id }, include: PURCHASE_INCLUDE });
-      const chargeId = tickets[0]?.paymentRef;
-      if (chargeId && await tx.ticketRefundLock.findUnique({ where: { chargeId } })) {
-        return { status: 'failed', error: 'A refund is in progress or awaiting reconciliation. Delivery will be checked again.' };
-      }
-      const eligible = tickets.filter(t => t.status === 'sold' && !t.refundedAt && !t.cancelledAt &&
-        (t.paymentStatus === 'SUCCEEDED' || t.paymentStatus === 'FREE'));
-      if (!events[0]) throw new ApiError('Event missing during order delivery', 500);
-      if (events[0].isCancelled || !eligible.length) {
-        return { status: 'suppressed', error: 'Order cancelled or refunded. No admission message sent.' };
-      }
-      return deliverOrderToBuyer(eligible);
-    }, { timeout: 60_000 });
+    outcome = await prisma.$transaction(
+      async (tx) => {
+        const events = await lockOrderDelivery(tx, id);
+        const owner = await tx.ticketOrderDelivery.findUniqueOrThrow({
+          where: { id },
+        });
+        if (owner.status !== "sending" || owner.attemptId !== attemptId)
+          return deliveryView(owner);
+        const state = await deliveryDispatchState(id, tx);
+        const original = deliveryAttemptOutcome(
+          state.messages.filter(
+            (message) => message.dispatchAttemptId === attemptId,
+          ),
+        );
+        if (original)
+          return {
+            status: original.status === "accepted" ? "sent" : original.status,
+            channel: original.channel,
+            error: original.error ?? undefined,
+          };
+        const policy = deliveryDispatchPolicy(state);
+        if (!policy.canRetry && policy.status === "sent")
+          return { status: "suppressed", error: policy.reason };
+
+        const tickets = await tx.ticket.findMany({
+          where: { deliveryOrderId: id },
+          include: PURCHASE_INCLUDE,
+        });
+        if (!tickets.length)
+          return {
+            status: "suppressed",
+            error: "No tickets remain in this order.",
+          };
+        const charges = [
+          ...new Set(
+            tickets
+              .map((ticket) => ticket.paymentRef)
+              .filter((ref): ref is string => !!ref),
+          ),
+        ];
+        for (const chargeId of charges)
+          if (await tx.ticketRefundLock.findUnique({ where: { chargeId } }))
+            return {
+              status: "failed",
+              error:
+                "A refund is in progress or awaiting reconciliation. Delivery will be checked again.",
+            };
+        const eligible = tickets.filter(
+          (t) =>
+            t.status === "sold" &&
+            !t.refundedAt &&
+            !t.cancelledAt &&
+            (t.paymentStatus === "SUCCEEDED" || t.paymentStatus === "FREE"),
+        );
+        if (!events.length)
+          throw new ApiError("Event missing during order delivery", 500);
+        if (events.some((event) => event.isCancelled) || !eligible.length)
+          return {
+            status: "suppressed",
+            error: "Order cancelled or refunded. No admission message sent.",
+          };
+        if (beforeSend) {
+          try {
+            await beforeSend();
+          } catch (error) {
+            if (!(error instanceof ApiError) || error.statusCode !== 409)
+              throw error;
+            return { status: "failed", error: error.message };
+          }
+        }
+        return deliverOrderToBuyer(eligible, attemptId);
+      },
+      { timeout: 60_000 },
+    );
   } catch (error) {
-    console.error('Order delivery outcome unconfirmed:', id, error);
-    outcome = { status: 'unknown', error: 'Delivery could not be confirmed. A message may already have been sent.' };
+    console.error("Order delivery outcome unconfirmed:", id, error);
+    outcome = {
+      status: "unknown",
+      error:
+        "Delivery could not be confirmed. A message may already have been sent.",
+    };
   }
-  const recorded = await prisma.ticketOrderDelivery.updateMany({ where: { id, attemptId, status: 'sending' }, data: {
-    status: outcome.status, channel: outcome.channel, error: outcome.error || null,
-    sentAt: outcome.status === 'sent' ? new Date() : null,
-    nextAttemptAt: new Date(Date.now() + Math.min(60, 2 ** Math.min(row.attempts, 6)) * 60_000),
-  } });
-  if (!recorded.count) return deliveryView(await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }));
-  return outcome;
+  const record = async () => {
+    const recorded = await prisma.ticketOrderDelivery.updateMany({
+      where: { id, attemptId, status: "sending" },
+      data: {
+        status: outcome.status,
+        channel: outcome.channel,
+        error: outcome.error || null,
+        sentAt: outcome.status === "sent" ? new Date() : null,
+        nextAttemptAt: new Date(
+          Date.now() +
+            Math.min(60, 2 ** Math.min(Math.max(0, row.attempts - 1), 6)) *
+              60_000,
+        ),
+      },
+    });
+    if (finalize) await finalize();
+    if (!recorded.count)
+      return deliveryView(
+        await prisma.ticketOrderDelivery.findUniqueOrThrow({ where: { id } }),
+      );
+    return outcome;
+  };
+  return finalize ? staffAdminScope.transaction(record) : record();
+};
+
+/** A source claim owns dispatch across workers and explicit retries. Unknown sends are never automatically replaced. */
+export const dispatchOrderDelivery = async (
+  id: string,
+  manual = false,
+  acknowledgeDuplicateRisk = false,
+): Promise<TicketDeliveryResult> => {
+  const claim = await claimOrderDelivery(id, manual, acknowledgeDuplicateRisk);
+  return claim.attemptId
+    ? dispatchClaimedOrderDelivery(id, claim.attemptId)
+    : claim.outcome!;
 };
 
 const deliverSettledOrder = async (tickets: any[]): Promise<TicketDeliveryResult> =>
@@ -1360,7 +1494,7 @@ export const purchaseTicket = async (
     const allocation = await prisma.$transaction(async tx => {
       // Global key ownership also rejects reuse by a different principal.
       // This lock ends before any gateway or delivery call.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+      await lockTransactionIdentity(tx, key);
       const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
       if (prior) {
         if (prior.userId !== userId || prior.fingerprint !== fingerprint) {
@@ -1480,56 +1614,83 @@ export const purchaseTicket = async (
   }
 };
 
+/** Validate the actual original payment before recovery can issue or refund tickets. */
+export const assertOriginalPurchaseCharge = (chargeId: string, charge: ChargeResult, tickets: { amountPaid: number | null }[]) => {
+  const amount = sumTicketRevenue(tickets);
+  const paid = Number(charge.amount);
+  if (charge.id !== chargeId || charge.currency !== TICKET_CURRENCY || !Number.isFinite(paid) || paid !== amount)
+    throw new ApiError('Original payment identity, currency or recorded purchase amount does not match; retain the purchase for reconciliation', 409);
+};
+const finalPurchaseOutcome = async (tickets: any[]) => {
+  if (tickets.every(ticket => ticket.status === 'cancelled'))
+    return { pending: false as const, failed: true as const, message: 'Order cancelled or refunded. No admission tickets remain.', tickets: [] };
+  if (tickets.every(ticket => ticket.status === 'sold')) {
+    tickets.forEach(ticketRefundTerms);
+    return finishIssuedOrder(tickets);
+  }
+  return null;
+};
+
 /** Recover only; never dispatch a second charge, including after a process crash. */
-export const recoverPurchaseAttempt = async (key: string, userId: string) => {
+export const recoverPurchaseAttempt = async (key: string, userId: string | undefined) => {
+  const corporate = staffAdminScope.actor();
+  if (!corporate && !userId) throw new ApiError('A verified buyer or corporate recovery actor is required', 401);
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new ApiError('Invalid purchase key', 400);
   const attempt = await prisma.$transaction(async tx => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    await lockTransactionIdentity(tx, key);
     const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
     if (prior) {
-      if (prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
+      if (!corporate && prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
       return prior;
     }
+    if (corporate) throw new ApiError('The saved purchase attempt was not found', 404);
     // Fence a request that never arrived (or was rejected before allocation).
     // A delayed POST with this key can no longer start a charge after recovery.
     return tx.ticketPurchaseAttempt.create({ data: {
-      key, userId, fingerprint: 'closed-before-allocation', ticketIds: [],
+      key, userId: userId!, fingerprint: 'closed-before-allocation', ticketIds: [],
       attemptRef: `attempt:${crypto.randomUUID()}`,
       failure: 'No purchase was dispatched. This attempt is closed.',
     } });
   });
+  const ownerId = attempt.userId;
   if (attempt.failure) {
     // A crash may occur after recording FAILED but before returning inventory.
     // Match the immutable reference too: the same buyer may now hold these
     // physical seats under a deliberate later attempt.
     if (attempt.ticketIds.length) await prisma.ticket.updateMany({
-      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved',
+      where: { id: { in: attempt.ticketIds }, userId: ownerId, status: 'reserved',
         paymentRef: { in: [attempt.attemptRef, ...(attempt.chargeId ? [attempt.chargeId] : [])] },
         paymentStatus: { not: 'SUCCEEDED' } },
       data: { status: 'available', userId: null, reservedAt: null, paymentRef: null, paymentStatus: null, amountPaid: null },
     });
     return { pending: false as const, failed: true as const, message: attempt.failure, tickets: [] };
   }
-  let tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
-  if (tickets.length !== attempt.ticketIds.length) throw new ApiError('Purchase requires reconciliation. Do not pay again.', 409);
-  if (tickets.every(t => t.status === 'cancelled')) return { pending: false as const, failed: true as const, message: 'Order cancelled or refunded. No admission tickets remain.', tickets: [] };
-  if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+  let tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId: ownerId }, include: PURCHASE_INCLUDE });
+  if (!attempt.ticketIds.length || tickets.length !== attempt.ticketIds.length) throw new ApiError('Purchase requires reconciliation. Do not pay again.', 409);
+  const initial = await finalPurchaseOutcome(tickets);
+  if (initial) return initial;
   const chargeId = attempt.chargeId || tickets.find(t => t.paymentRef && !t.paymentRef.startsWith('attempt:'))?.paymentRef;
   if (chargeId) {
+    const charge = await getCharge(chargeId);
+    assertOriginalPurchaseCharge(chargeId, charge, tickets);
+    const refundedCharge = ['PARTIAL_REFUNDED', 'REFUNDED'].includes(charge.status);
+    if (refundedCharge && tickets.some(ticket => ticket.status !== 'cancelled' &&
+      (!ticket.event?.isCancelled || ticket.paymentStatus !== 'SUCCEEDED')))
+      throw new ApiError('The original payment has refund history; reconcile the original tickets before issuance', 409);
     // Recover a crash between persisting the charge identity and attaching it
     // to the reservations. Never allocate or dispatch in this path.
     await prisma.ticket.updateMany({
-      where: { id: { in: attempt.ticketIds }, userId, status: 'reserved', paymentRef: attempt.attemptRef },
+      where: { id: { in: attempt.ticketIds }, userId: ownerId, status: 'reserved', paymentRef: attempt.attemptRef },
       data: { paymentRef: chargeId },
     });
-    const charge = await getCharge(chargeId);
-    if (charge.status === 'SUCCEEDED') await settleSucceededCharge(chargeId);
+    if (charge.status === 'SUCCEEDED' || refundedCharge) await settleSucceededCharge(chargeId);
     else if (charge.status === 'FAILED') {
       const outcome = await settleFailedCharge(chargeId);
       if (outcome.result === 'released') return recoverPurchaseAttempt(key, userId);
     }
-    tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId }, include: PURCHASE_INCLUDE });
-    if (tickets.every(t => t.status === 'sold')) return finishIssuedOrder(tickets);
+    tickets = await prisma.ticket.findMany({ where: { id: { in: attempt.ticketIds }, userId: ownerId }, include: PURCHASE_INCLUDE });
+    const final = await finalPurchaseOutcome(tickets);
+    if (final) return final;
   }
   return { ...buildPendingOrderResult(tickets, chargeId || attempt.attemptRef),
     unknown: !chargeId, message: chargeId ? 'Payment pending. Do not pay again.' : 'Payment outcome unconfirmed. Your seats remain held. Do not pay again.' };
@@ -1684,7 +1845,7 @@ type CheckInRequester = { id: string; role: string };
  */
 const assertEventAccess = async (
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester | undefined
 ): Promise<void> => {
   const event = await prisma.event.findUnique({
     where: { id: eventId },
@@ -1695,7 +1856,7 @@ const assertEventAccess = async (
     throw new ApiError('Event not found', 404);
   }
 
-  if (requester.role !== 'admin' && event.organizerId !== requester.id) {
+  if (!staffAdminScope.actor() && (!requester || requester.role !== 'admin' && event.organizerId !== requester.id)) {
     throw new ApiError('You do not have permission to check in tickets for this event', 403);
   }
 };
@@ -1839,7 +2000,7 @@ export const verifyTicket = async (
 export const getCheckInDetails = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester | undefined
 ): Promise<{ ticket: any; canCheckIn: boolean; message: string }> => {
   try {
     await assertEventAccess(eventId, requester);
@@ -1870,7 +2031,7 @@ export const getCheckInDetails = async (
 export const confirmCheckIn = async (
   ticketIdentifier: string,
   eventId: string,
-  requester: CheckInRequester,
+  requester: CheckInRequester | undefined,
   opId: string
 ): Promise<{ ticket: any; valid: boolean; message: string; opId: string; eventId: string; ticketId: string }> => {
   try {
@@ -1878,14 +2039,18 @@ export const confirmCheckIn = async (
     if (typeof opId !== 'string' || !opId.trim() || opId.length > 512) {
       throw new ApiError('Admission operation ID is required (maximum 512 characters)', 400);
     }
+    const corporateActor = staffAdminScope.actor();
+    const operatorId = corporateActor?.id ?? requester?.id;
+    if (!operatorId) throw new ApiError('A verified admission operator is required', 401);
+    const operatorKind = corporateActor ? 'CORPORATE' : 'PRODUCT';
     const ticket = await findTicketForCheckIn(ticketIdentifier, eventId);
     return await prisma.$transaction(async tx => {
       // Serialize the key globally, including attempts to reuse it on a different
       // event. The transaction lock is released only after the receipt commits.
-      await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended(${opId}, 0))`;
+      await lockTransactionIdentity(tx, opId);
       const receipt = await tx.ticketAdmissionReceipt.findUnique({ where: { opId } });
       if (receipt) {
-        if (receipt.operatorId !== requester.id || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {
+        if (receipt.operatorKind !== operatorKind || receipt.operatorId !== operatorId || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {
           throw new ApiError('Admission operation ID belongs to another admission', 409);
         }
         return receipt.response as any;
@@ -1906,7 +2071,7 @@ export const confirmCheckIn = async (
       // by both the initial response and every subsequent replay.
       const persistedResponse = JSON.parse(JSON.stringify(response));
       await tx.ticketAdmissionReceipt.create({ data: {
-        opId, operatorId: requester.id, eventId, ticketId: ticket!.id,
+        opId, operatorId, operatorKind, eventId, ticketId: ticket!.id,
         response: persistedResponse,
       } });
       return persistedResponse;
@@ -2000,42 +2165,17 @@ export interface TicketRefundOutcome {
   result: 'refunded' | 'cancelled_free' | 'already_handled' | 'refund_failed' | 'pending';
   amountRefunded?: number;
   refundRef?: string | null;
-  /** Whether the holder was notified (a notify failure does NOT undo a refund). */
+  /** Whether the notice command was accepted; this does not prove holder receipt. A notification failure cannot undo a refund. */
   notified: boolean;
   notifyError?: string;
   error?: string;
 }
 
-/** Compose the cancellation/refund notice sent to the ticket holder. */
-const buildCancellationMessage = (ticket: any, refunded: boolean, amount?: number): string => {
-  const eventTitle = ticket.event?.title ?? 'your event';
-  const lines = [`❌ Your ticket for ${eventTitle} has been cancelled.`];
-  if (refunded) {
-    const amt = typeof amount === 'number' ? ` of ${amount.toFixed(2)} ${TICKET_CURRENCY}` : '';
-    lines.push(`💸 A refund${amt} has been issued to your original payment method.`);
-  }
-  lines.push(`🔑 Ticket code: ${ticket.uniqueCode}`);
-  return lines.join('\n');
-};
-
-/**
- * Notify the holder that their ticket was cancelled/refunded. Best-effort:
- * returns the failure rather than throwing, because by this point the money has
- * ALREADY been returned and we must not roll a successful refund back over a
- * messaging hiccup — but the failure is surfaced (not swallowed) in the outcome.
- */
-const notifyHolderOfCancellation = async (
-  ticket: any,
-  refunded: boolean,
-  amount?: number
-): Promise<{ notified: boolean; notifyError?: string }> => {
-  const phone = ticket.user?.phoneNumber;
-  if (!phone) {
-    return { notified: false, notifyError: 'Holder has no phone number on file' };
-  }
+/** Money is already final; expose the independently durable notification outcome. */
+const notifyHolderOfCancellation = async (ticket: any) => {
   try {
-    await sendTextMessage(phone, buildCancellationMessage(ticket, refunded, amount));
-    return { notified: true };
+    const notice = await dispatchCancellationNoticeForTicket(ticket.id);
+    return { notified: notice.status === 'sent', notifyError: notice.error ?? undefined };
   } catch (error) {
     console.error('Failed to notify holder of cancellation:', ticket.id, error);
     return { notified: false, notifyError: errorMessage(error) };
@@ -2053,44 +2193,72 @@ const notifyHolderOfCancellation = async (
  * cancellation) picks the ticket up again.
  *
  * A durable charge-wide claim serializes all tickets sharing a paymentRef.
- * Ambiguous provider outcomes retain the claim for manual reconciliation; the
- * gateway has no refund idempotency support, so retrying could move money twice.
+ * Ambiguous provider outcomes retain the claim. The saved attempt key identifies
+ * the original immutable gateway refund; recovery reads that proof, never resends.
  *
  * FREE tickets (no paymentRef / paymentStatus FREE / amountPaid 0) carry no
  * money, so they are simply voided and the holder notified — no YeboPay call.
  */
 const refundAndCancelTicket = async (
   ticket: any,
-  reason: string
+  reason: string,
+  operation?: StaffOperationContext,
+  origin: 'organizer' | 'cancelled-settlement' = 'organizer'
 ): Promise<TicketRefundOutcome> => {
   const base = { ticketId: ticket.id, uniqueCode: ticket.uniqueCode };
+  const cancelledSettlement = origin === 'cancelled-settlement' && ticket.event?.isCancelled &&
+    ticket.paymentStatus === 'SUCCEEDED' && ['sold', 'reserved'].includes(ticket.status);
+  if (staffAdminScope.actor() && !operation && !cancelledSettlement) {
+    throw new ApiError('A saved corporate refund operation is required', 401);
+  }
 
   // --- Idempotent short-circuit: already cancelled/refunded. ---------------
   if (ticket.status === 'cancelled' || ticket.paymentStatus === 'REFUNDED') {
+    if (operation) {
+      await prepareCorporateRefund(operation, ticket, async () => {
+        throw new ApiError('The original ticket changed; inspect its saved refund receipt', 409);
+      });
+    }
     return { ...base, result: 'already_handled', notified: false };
   }
 
-  const paid =
-    !!ticket.paymentRef &&
-    ticket.paymentStatus !== 'FREE' &&
-    (ticket.amountPaid ?? 0) > 0;
-
+  let terms: { paid: boolean; amount: number };
+  try {
+    terms = ticketRefundTerms(ticket);
+  } catch (error) {
+    if (operation) {
+      await prepareCorporateRefund(operation, ticket, async () => { throw error; });
+    }
+    return { ...base, result: 'refund_failed', notified: false, error: errorMessage(error) };
+  }
+  const paid = terms.paid;
   // --- Free ticket: nothing to refund, just void + notify. -----------------
   if (!paid) {
-    const claimed = await prisma.ticket.updateMany({
-      where: { id: ticket.id, status: { not: 'cancelled' } },
-      data: {
-        status: 'cancelled',
-        cancelledAt: new Date(),
-        // Clear any pending buyer refund request — it's now handled.
-        refundRequestedAt: null,
-        refundRequestReason: null,
-      },
-    });
+    const cancel = async (client: Prisma.TransactionClient) => {
+      const claimed = await client.ticket.updateMany({
+        where: { id: ticket.id, status: { not: 'cancelled' } },
+        data: {
+          status: 'cancelled',
+          cancelledAt: new Date(),
+          // Clear any pending buyer refund request — it's now handled.
+          refundRequestedAt: null,
+          refundRequestReason: null,
+        },
+      });
+      if (claimed.count) await enqueueCancellationNotice(client, ticket.id);
+      if (operation) {
+        const saved = await client.ticket.findUniqueOrThrow({ where: { id: ticket.id } });
+        await finishCorporateRefund(client, operation.id, saved, 'CANCELLED_FREE');
+      }
+      return claimed;
+    };
+    const claimed = operation
+      ? await prepareCorporateRefund(operation, ticket, cancel)
+      : await prisma.$transaction(cancel);
     if (claimed.count === 0) {
       return { ...base, result: 'already_handled', notified: false };
     }
-    const notify = await notifyHolderOfCancellation(ticket, false);
+    const notify = await notifyHolderOfCancellation(ticket);
     return {
       ...base,
       result: 'cancelled_free',
@@ -2107,24 +2275,29 @@ const refundAndCancelTicket = async (
   });
   const amount = Number(ticket.amountPaid);
   const cents = (value: number) => Math.round(value * 100);
-  if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
+  if (!Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(cents(amount)) || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
     return failed('invalid stored ticket amount');
   }
 
   // A unique DB key, not a process-local mutex: protects concurrent workers and
   // different tickets on the same charge, including after a process restart.
-  const attemptId = crypto.randomUUID();
+  const attemptId = operation?.id ?? crypto.randomUUID();
   try {
-    await prisma.$transaction(async tx => {
+    const claim = async (tx: Prisma.TransactionClient) => {
       // Serialize refund dispatch admission with delivery. Once this durable
       // refund claim exists, delivery defers until it has been reconciled.
       if (ticket.deliveryOrderId) {
         await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${ticket.deliveryOrderId} FOR UPDATE`;
       }
       await tx.ticketRefundLock.create({
-        data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED' },
+        data: {
+          chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED',
+          ...(operation ? { corporateOperationId: operation.id } : {}),
+        },
       });
-    });
+    };
+    if (operation) await prepareCorporateRefund(operation, ticket, claim);
+    else await prisma.$transaction(claim);
   } catch (error) {
     if ((error as { code?: string }).code === 'P2002') {
       return failed('another refund is in progress or requires reconciliation for this charge');
@@ -2151,12 +2324,13 @@ const refundAndCancelTicket = async (
     const before = Number(charge.refunded_amount);
     const total = Number(charge.amount);
     if (charge.id !== ticket.paymentRef ||
+        charge.currency !== TICKET_CURRENCY || typeof charge.livemode !== 'boolean' ||
         !['SUCCEEDED', 'PARTIAL_REFUNDED'].includes(charge.status) ||
         !Number.isFinite(before) || before < 0 || !Number.isFinite(total) ||
         cents(before) + cents(amount) > cents(total)) {
       throw new Error('gateway charge is not refundable for this ticket amount');
     }
-    await prisma.ticketRefundLock.update({
+    const intent = await prisma.ticketRefundLock.update({
       where: { chargeId: ticket.paymentRef, attemptId }, data: { refundedBefore: before },
     });
     const claimed = await prisma.ticketRefundLock.updateMany({
@@ -2165,41 +2339,36 @@ const refundAndCancelTicket = async (
     });
     if (claimed.count !== 1) throw new Error('refund attempt was recovered before dispatch');
     dispatched = true;
-    const res = await refundCharge({ chargeId: ticket.paymentRef, amount, reason });
-    // refunded_amount is CUMULATIVE, not the amount returned for this ticket.
-    if (res.charge_id !== ticket.paymentRef || res.processor_status !== 'SUCCEEDED' ||
-        !['PARTIAL_REFUNDED', 'REFUNDED'].includes(res.status) ||
-        !Number.isFinite(Number(res.refunded_amount)) ||
-        cents(Number(res.refunded_amount)) !== cents(before) + cents(amount)) {
+    const res = await refundCharge({ operationKey: refundOperationKey(attemptId), chargeId: ticket.paymentRef, amount, reason });
+    if (verifiedRefundProof(intent, res, charge) !== 'SUCCEEDED') {
       throw new Error('gateway did not confirm the exact refund; reconciliation required');
     }
-    refund = { refundRef: res.processor_ref ?? res.charge_id, amount };
-
-    await prisma.ticketRefundLock.update({
-      where: { chargeId: ticket.paymentRef, attemptId },
-      data: { phase: 'CONFIRMED', confirmedRef: refund.refundRef },
-    });
+    refund = { refundRef: res.processor_ref!, amount };
 
     // Keep the claim if this transaction fails after the provider moved money.
     // Ticket finalization and releasing the claim must commit together.
-    await finalizeRefundAttempt(ticket.paymentRef, attemptId, refund.refundRef);
+    await finalizeRefundAttempt(ticket.paymentRef, attemptId, res, charge);
   } catch (error) {
     // These gateway responses reject BEFORE processor dispatch. A 409 is a
     // rejection, never evidence that THIS ticket's refund succeeded.
-    const rejected = error instanceof YeboPayHttpError &&
-      [400, 401, 403, 404, 409, 501].includes(error.status);
-    if (dispatched && rejected) {
-      await prisma.ticketRefundLock.update({ where: { chargeId: ticket.paymentRef, attemptId },
-        data: { phase: 'REJECTED', detail: errorMessage(error) } });
-    }
+    const rejected = error instanceof YeboPayHttpError && error.rejectedBeforeDispatch;
     if (!dispatched || rejected) {
-      await prisma.ticketRefundLock.deleteMany({ where: { chargeId: ticket.paymentRef, attemptId } });
+      await prisma.$transaction(async tx => {
+        const lock = await tx.ticketRefundLock.findUnique({ where: { chargeId: ticket.paymentRef } });
+        if (lock?.attemptId !== attemptId) return;
+        const removed = await tx.ticketRefundLock.deleteMany({
+          where: { chargeId: ticket.paymentRef, attemptId, phase: { not: 'CONFIRMED' } },
+        });
+        if (removed.count === 1 && lock.corporateOperationId) {
+          await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId, errorMessage(error));
+        }
+      });
     }
     console.error('YeboPay refund failed for ticket', ticket.id, error);
     return failed(`${errorMessage(error)}${dispatched && !rejected ? '; charge blocked pending reconciliation' : ''}`);
   }
 
-  const notify = await notifyHolderOfCancellation(ticket, true, refund.amount);
+  const notify = await notifyHolderOfCancellation(ticket);
   return {
     ...base,
     result: 'refunded',
@@ -2225,8 +2394,9 @@ const refundAndCancelTicket = async (
  */
 export const refundTicket = async (
   ticketId: string,
-  requester: CheckInRequester,
-  reason?: string
+  requester: CheckInRequester | undefined,
+  reason?: string,
+  operation?: StaffOperationContext
 ): Promise<TicketRefundOutcome> => {
   try {
     const ticket = await prisma.ticket.findUnique({
@@ -2243,7 +2413,8 @@ export const refundTicket = async (
 
     const outcome = await refundAndCancelTicket(
       ticket,
-      reason || `Ticket ${ticket.uniqueCode} refunded by organizer`
+      reason || `Ticket ${ticket.uniqueCode} refunded by organizer`,
+      operation
     );
 
     if (outcome.result === 'refund_failed') {
@@ -2394,6 +2565,24 @@ export interface EventCancellationSummary {
   outcomes: TicketRefundOutcome[];
 }
 
+/** Shared owning transition: stop sales and select the existing cancellation set. */
+export const beginEventCancellation = async (
+  eventId: string,
+  requester: CheckInRequester | undefined,
+) => {
+  await assertEventAccess(eventId, requester);
+  const event = await prisma.event.update({
+    where: { id: eventId },
+    data: { isCancelled: true, cancelledAt: new Date() },
+  });
+  const tickets = await prisma.ticket.findMany({
+    where: { eventId, status: { in: ['sold', 'reserved'] } },
+    include: REFUND_INCLUDE,
+    orderBy: { id: 'asc' },
+  });
+  return { event, tickets };
+};
+
 /**
  * Cancel an EVENT: refund every sold ticket via YeboPay and mark each CANCELLED,
  * notifying each holder.
@@ -2412,25 +2601,10 @@ export interface EventCancellationSummary {
  */
 export const cancelEvent = async (
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester,
 ): Promise<EventCancellationSummary> => {
   try {
-    await assertEventAccess(eventId, requester);
-
-    // Flag the event cancelled (idempotent). This is the flag purchaseTicket
-    // rejects on and getEvents filters out, so sales + public listing stop here
-    // even if some refunds below need a retry.
-    const event = await prisma.event.update({
-      where: { id: eventId },
-      data: { isCancelled: true, cancelledAt: new Date() },
-    });
-
-    // Paid sales and settled cancelled holds are refunded. Unsettled holds
-    // stay owned and referenced until their authoritative payment result arrives.
-    const tickets = await prisma.ticket.findMany({
-      where: { eventId, status: { in: ['sold', 'reserved'] } },
-      include: REFUND_INCLUDE,
-    });
+    const { event, tickets } = await beginEventCancellation(eventId, requester);
 
     const reason = `Event "${event.title}" cancelled by organizer`;
 
@@ -2438,11 +2612,18 @@ export const cancelEvent = async (
     // reconciliation and avoids hammering the YeboPay gateway in a burst.
     const outcomes: TicketRefundOutcome[] = [];
     for (const ticket of tickets) {
-      if (ticket.status === 'reserved' && ticket.paymentStatus !== 'SUCCEEDED') {
+      if (
+        ticket.status === 'reserved' &&
+        ticket.paymentStatus !== 'SUCCEEDED'
+      ) {
         // Keep ownership and the charge reference, including an in-flight
         // createCharge with a durable attempt reference. Its webhook owns settlement.
-        outcomes.push({ ticketId: ticket.id, uniqueCode: ticket.uniqueCode,
-          result: 'pending', notified: false });
+        outcomes.push({
+          ticketId: ticket.id,
+          uniqueCode: ticket.uniqueCode,
+          result: 'pending',
+          notified: false,
+        });
       } else {
         outcomes.push(await refundAndCancelTicket(ticket, reason));
       }
@@ -2452,19 +2633,21 @@ export const cancelEvent = async (
       eventId,
       cancelled: true,
       totalProcessed: outcomes.length,
-      refunded: outcomes.filter(o => o.result === 'refunded').length,
-      cancelledFree: outcomes.filter(o => o.result === 'cancelled_free').length,
-      alreadyHandled: outcomes.filter(o => o.result === 'already_handled').length,
-      failed: outcomes.filter(o => o.result === 'refund_failed').length,
-      notifyFailures: outcomes.filter(o => o.notifyError).length,
-      pending: outcomes.filter(o => o.result === 'pending').length,
+      refunded: outcomes.filter((o) => o.result === 'refunded').length,
+      cancelledFree: outcomes.filter((o) => o.result === 'cancelled_free')
+        .length,
+      alreadyHandled: outcomes.filter((o) => o.result === 'already_handled')
+        .length,
+      failed: outcomes.filter((o) => o.result === 'refund_failed').length,
+      notifyFailures: outcomes.filter((o) => o.notifyError).length,
+      pending: outcomes.filter((o) => o.result === 'pending').length,
       outcomes,
     };
 
     if (summary.failed > 0) {
       console.error(
         `cancelEvent ${eventId}: ${summary.failed}/${summary.totalProcessed} ticket refunds FAILED`,
-        outcomes.filter(o => o.result === 'refund_failed')
+        outcomes.filter((o) => o.result === 'refund_failed'),
       );
     }
 
@@ -2476,55 +2659,259 @@ export const cancelEvent = async (
   }
 };
 
-
 // Claim deletion and ticket accounting commit together. The attempt token fences
 // stale owners: a replacement attempt can never be released by this one.
-const finalizeRefundAttempt = async (chargeId: string, attemptId: string, refundRef: string | null) => {
-  return prisma.$transaction(async tx => {
+const finalizeRefundAttempt = async (
+  chargeId: string,
+  attemptId: string,
+  proof: RefundResult,
+  charge: ChargeResult,
+) => {
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "chargeId" FROM "TicketRefundLock" WHERE "chargeId"=${chargeId} FOR UPDATE`;
     const lock = await tx.ticketRefundLock.findUnique({ where: { chargeId } });
-    if (!lock || lock.attemptId !== attemptId || lock.phase !== 'CONFIRMED') {
+    if (!lock) {
+      const settled = await tx.ticket.findUnique({
+        where: { refundAttemptId: attemptId },
+      });
+      if (
+        settled &&
+        settled.paymentRef === chargeId &&
+        settled.paymentStatus === 'REFUNDED' &&
+        settled.status === 'cancelled' &&
+        settled.refundGatewayRequestId === proof.refund_request_id &&
+        settled.refundRef === proof.processor_ref &&
+        refundMinor(String(settled.amountPaid)) === refundMinor(proof.amount)
+      )
+        return;
       throw new ApiError('Refund attempt changed; reload recovery status', 409);
     }
-    const released = await tx.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: 'CONFIRMED' } });
-    if (released.count !== 1) throw new ApiError('Refund recovery already in progress', 409);
-    await tx.ticket.update({ where: { id: lock.ticketId }, data: {
-      status: 'cancelled', paymentStatus: 'REFUNDED', refundRef,
-      refundedAt: new Date(), cancelledAt: new Date(),
-      refundRequestedAt: null, refundRequestReason: null,
-    } });
+    if (
+      lock.attemptId !== attemptId ||
+      !['DISPATCHING', 'CONFIRMED'].includes(lock.phase) ||
+      verifiedRefundProof(lock, proof, charge) !== 'SUCCEEDED'
+    ) {
+      throw new ApiError('Refund attempt changed; reload recovery status', 409);
+    }
+    const ticket = await tx.ticket.findUnique({ where: { id: lock.ticketId } });
+    if (
+      !ticket ||
+      ticket.paymentRef !== chargeId ||
+      ticket.amountPaid !== lock.amount ||
+      ticket.paymentStatus !== 'SUCCEEDED' ||
+      !['sold', 'reserved'].includes(ticket.status)
+    )
+      throw new ApiError(
+        'Original paid ticket changed; retain the refund for investigation',
+        409,
+      );
+    await tx.ticketRefundLock.update({
+      where: { chargeId, attemptId },
+      data: {
+        phase: 'CONFIRMED',
+        confirmedRef: proof.processor_ref,
+        gatewayRequestId: proof.refund_request_id,
+      },
+    });
+    const released = await tx.ticketRefundLock.deleteMany({
+      where: { chargeId, attemptId, phase: 'CONFIRMED' },
+    });
+    if (released.count !== 1)
+      throw new ApiError('Refund recovery already in progress', 409);
+    const finalized = await tx.ticket.update({
+      where: { id: lock.ticketId },
+      data: {
+        status: 'cancelled',
+        paymentStatus: 'REFUNDED',
+        refundRef: proof.processor_ref,
+        refundAttemptId: attemptId,
+        refundGatewayRequestId: proof.refund_request_id,
+        refundedAt: new Date(),
+        cancelledAt: new Date(),
+        refundRequestedAt: null,
+        refundRequestReason: null,
+      },
+    });
+    await enqueueCancellationNotice(tx, lock.ticketId);
+    if (lock.corporateOperationId) {
+      await finishCorporateRefund(tx, lock.corporateOperationId, finalized, 'REFUNDED');
+    }
   });
 };
 
 export const listRefundRecovery = async () => {
-  const locks = await prisma.ticketRefundLock.findMany({ orderBy: { createdAt: 'asc' } });
-  return locks.map(lock => ({ ...lock,
-    recoveryStatus: ['PREPARED', 'REJECTED'].includes(lock.phase) ? 'RETRYABLE_AFTER_RECONCILIATION'
-      : lock.phase === 'CONFIRMED' ? 'READY_TO_RECONCILE' : 'REVIEW_REQUIRED',
-    action: 'POST /api/tickets/refund-recovery/' + encodeURIComponent(lock.chargeId) + '/reconcile with attemptId',
+  const locks = await prisma.ticketRefundLock.findMany({
+    orderBy: { createdAt: 'asc' },
+  });
+  return locks.map((lock) => ({
+    ...lock,
+    gatewayOperationKey: refundOperationKey(lock.attemptId),
+    recoveryStatus: ['PREPARED', 'REJECTED'].includes(lock.phase)
+      ? 'RETRYABLE_AFTER_RECONCILIATION'
+      : lock.phase === 'CONFIRMED'
+        ? 'READY_TO_RECONCILE'
+        : 'REVIEW_REQUIRED',
+    action:
+      'POST /api/tickets/refund-recovery/' +
+      encodeURIComponent(lock.chargeId) +
+      '/reconcile with attemptId',
   }));
 };
 
 /** Never dispatch money from recovery. An unchanged cumulative total cannot
  * prove that an in-flight processor request will not settle later. */
-export const reconcileRefundAttempt = async (chargeId: string, attemptId: string) => {
-  const lock = await prisma.ticketRefundLock.findUnique({ where: { chargeId } });
-  if (!lock || lock.attemptId !== attemptId) throw new ApiError('Refund attempt changed; reload recovery status', 409);
+export const reconcileRefundAttempt = async (
+  chargeId: string,
+  attemptId: string,
+) => {
+  const lock = await prisma.ticketRefundLock.findUnique({
+    where: { chargeId },
+  });
+  if (!lock || lock.attemptId !== attemptId)
+    throw new ApiError('Refund attempt changed; reload recovery status', 409);
   if (['PREPARED', 'REJECTED'].includes(lock.phase)) {
-    const released = await prisma.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: lock.phase } });
-    if (released.count !== 1) throw new ApiError('Refund dispatch started; reload recovery status', 409);
+    await prisma.$transaction(async tx => {
+      const released = await tx.ticketRefundLock.deleteMany({
+        where: { chargeId, attemptId, phase: lock.phase },
+      });
+      if (released.count !== 1) throw new ApiError('Refund dispatch started; reload recovery status', 409);
+      if (lock.corporateOperationId) {
+        await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId,
+          'The original refund was not dispatched. The paid ticket is unchanged.');
+      }
+    });
     return { status: 'RETRYABLE', ticketId: lock.ticketId };
   }
   const charge = await getCharge(chargeId);
-  const expected = Number(lock.refundedBefore) + lock.amount;
-  if (lock.phase === 'CONFIRMED' && lock.refundedBefore !== null &&
-      charge.id === chargeId && charge.currency === TICKET_CURRENCY &&
-      ['REFUNDED', 'PARTIAL_REFUNDED'].includes(charge.status) &&
-      Number.isFinite(Number(charge.refunded_amount)) &&
-      Math.round(Number(charge.refunded_amount) * 100) === Math.round(expected * 100)) {
-    await finalizeRefundAttempt(chargeId, attemptId, lock.confirmedRef);
+  let proof: RefundResult;
+  try {
+    proof = await reconcileRefund(refundOperationKey(attemptId));
+  } catch (error) {
+    const body =
+      error instanceof YeboPayHttpError
+        ? (error.body as { success?: unknown; data?: RefundResult } | null)
+        : null;
+    // A documented nonterminal receipt is an explicit business state, never
+    // replacement data for a failed read or missing original operation.
+    if (
+      !body ||
+      body.success !== false ||
+      !body.data ||
+      !['DISPATCHING', 'PENDING', 'UNKNOWN', 'FAILED'].includes(
+        body.data.refund_state,
+      )
+    )
+      throw error;
+    proof = body.data;
+  }
+  const state = verifiedRefundProof(lock, proof, charge);
+  if (state === 'SUCCEEDED') {
+    await finalizeRefundAttempt(chargeId, attemptId, proof, charge);
     return { status: 'FINALIZED', ticketId: lock.ticketId };
   }
-  const detail = 'Gateway cumulative totals cannot attribute this attempt. Inspect processor refund records for this charge; do not retry money movement. Escalate to payment operations for authoritative attempt evidence.';
-  await prisma.ticketRefundLock.updateMany({ where: { chargeId, attemptId }, data: { detail } });
-  return { status: 'REVIEW_REQUIRED', ticketId: lock.ticketId, detail, charge };
+  if (state === 'FAILED') {
+    await prisma.$transaction(async tx => {
+      const released = await tx.ticketRefundLock.deleteMany({
+        where: { chargeId, attemptId, phase: { not: 'CONFIRMED' } },
+      });
+      if (released.count !== 1) throw new ApiError('Refund confirmation changed; reload recovery status', 409);
+      if (lock.corporateOperationId) {
+        await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId,
+          'The original provider refund failed; the paid ticket was not cancelled.');
+      }
+    });
+    return {
+      status: 'RETRYABLE',
+      ticketId: lock.ticketId,
+      refundState: state,
+      detail:
+        'The original provider refund failed; the ticket was not cancelled.',
+    };
+  }
+  const detail =
+    'The original refund remains unconfirmed. The charge stays blocked; checking its receipt sends no new payment.';
+  await prisma.ticketRefundLock.updateMany({
+    where: { chargeId, attemptId },
+    data: { detail, gatewayRequestId: proof.refund_request_id, lastCheckedAt: new Date() },
+  });
+  return {
+    status: 'REVIEW_REQUIRED',
+    ticketId: lock.ticketId,
+    refundState: state,
+    detail,
+  };
+};
+
+const refundOperationKey = (attemptId: string) =>
+  'yebotickets-refund-' + attemptId;
+/** Original-currency cents, without floating point comparisons or FX guesses. */
+const refundMinor = (value: unknown): bigint => {
+  if (typeof value !== 'string' || !/^\d+(\.\d{1,4})?$/.test(value))
+    throw new ApiError('Invalid original-currency refund amount', 502);
+  const [whole, fraction = ''] = value.split('.');
+  if (/[1-9]/.test(fraction.slice(2)))
+    throw new ApiError('Refund amount has fractional minor units', 502);
+  return (
+    BigInt(whole) * BigInt(100) + BigInt(fraction.slice(0, 2).padEnd(2, '0'))
+  );
+};
+const verifiedRefundProof = (
+  lock: {
+    chargeId: string;
+    attemptId: string;
+    amount: number;
+    refundedBefore: number | null;
+    gatewayRequestId?: string | null;
+    confirmedRef?: string | null;
+  },
+  proof: RefundResult,
+  charge: ChargeResult,
+) => {
+  if (
+    !proof ||
+    proof.operation_key !== refundOperationKey(lock.attemptId) ||
+    proof.charge_id !== lock.chargeId ||
+    charge.id !== lock.chargeId ||
+    proof.currency !== TICKET_CURRENCY ||
+    charge.currency !== proof.currency ||
+    typeof proof.livemode !== 'boolean' ||
+    charge.livemode !== proof.livemode ||
+    !proof.refund_request_id ||
+    typeof proof.refund_request_id !== 'string' ||
+    lock.refundedBefore === null ||
+    refundMinor(proof.amount) !== refundMinor(String(lock.amount)) ||
+    refundMinor(proof.cumulative_refunded_amount) !==
+      refundMinor(String(lock.refundedBefore)) +
+        refundMinor(String(lock.amount)) ||
+    !['DISPATCHING', 'PENDING', 'UNKNOWN', 'SUCCEEDED', 'FAILED'].includes(
+      proof.refund_state,
+    ) ||
+    (lock.gatewayRequestId &&
+      lock.gatewayRequestId !== proof.refund_request_id) ||
+    (lock.confirmedRef && lock.confirmedRef !== proof.processor_ref)
+  )
+    throw new ApiError(
+      'Gateway proof does not match this original ticket refund',
+      502,
+    );
+  if (
+    proof.refund_state === 'SUCCEEDED' &&
+    (proof.processor_status !== 'SUCCEEDED' ||
+      typeof proof.processor_ref !== 'string' ||
+      !proof.processor_ref ||
+      !['REFUNDED', 'PARTIAL_REFUNDED'].includes(proof.status) ||
+      refundMinor(proof.refunded_amount) <
+        refundMinor(proof.cumulative_refunded_amount) ||
+      refundMinor(proof.refunded_amount) > refundMinor(charge.amount))
+  )
+    throw new ApiError(
+      'Gateway did not prove completion of this exact ticket refund',
+      502,
+    );
+  if (proof.refund_state === 'FAILED' && proof.processor_status !== 'FAILED')
+    throw new ApiError(
+      'Gateway did not prove failure of the original refund',
+      502,
+    );
+  return proof.refund_state;
 };

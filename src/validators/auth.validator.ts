@@ -89,17 +89,3 @@ export const resetPasswordValidator = [
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
     .withMessage('New password must contain at least one uppercase letter, one lowercase letter, and one number'),
 ];
-
-export const updateProfileValidator = [
-  body('name')
-    .optional()
-    .isString()
-    .withMessage('Name must be a string')
-    .isLength({ min: 2, max: 100 })
-    .withMessage('Name must be between 2 and 100 characters'),
-  
-  body('email')
-    .optional()
-    .isEmail()
-    .withMessage('Please provide a valid email address'),
-]; 

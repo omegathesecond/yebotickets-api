@@ -9,8 +9,14 @@ import type { PrismaClient } from '@prisma/client';
 // typed jest.fn we can stub per-test — no database is touched.
 jest.mock('../../config/prisma', () => ({
   __esModule: true,
+  staffAdminScope: {actor: () => undefined},
   default: mockDeep<PrismaClient>(),
 }));
+
+// Financial unit scenarios isolate the durable notification collaborator.
+// Its real transaction/transport behavior is exercised by the PostgreSQL/HTTP fixture.
+jest.mock('../cancellation-notice-state.service', () => ({ enqueueCancellationNotice: jest.fn() }));
+jest.mock('../cancellation-notice.service', () => ({ dispatchCancellationNoticeForTicket: jest.fn() }));
 
 // --- Mock the side-effecting collaborators ---------------------------------
 // purchaseTicket generates a QR and delivers the ticket over YeboLink (WhatsApp,
@@ -27,8 +33,8 @@ jest.mock('../qr.service', () => ({
 }));
 
 jest.mock('../comms.service', () => ({
-  sendTextMessage: jest.fn(async () => ({ ok: true })),
-  sendEmailMessage: jest.fn(async () => ({ ok: true })),
+  sendTextMessage: jest.fn(async () => ({ messageId: crypto.randomUUID(), status: 'queued' })),
+  sendEmailMessage: jest.fn(async () => ({ messageId: crypto.randomUUID(), status: 'queued' })),
 }));
 
 // Mock the YeboPay client so the purchase flow never hits the gateway. The
@@ -38,16 +44,8 @@ jest.mock('../yebopay.service', () => ({
   getCharge: jest.fn(),
   listPaymentOptions: jest.fn(),
   refundCharge: jest.fn(),
-  YeboPayHttpError: class YeboPayHttpError extends Error {
-    constructor(
-      public readonly status: number,
-      public readonly body: unknown,
-      public readonly path: string
-    ) {
-      super(`YeboPay ${path} failed: ${status}`);
-      this.name = 'YeboPayHttpError';
-    }
-  },
+  reconcileRefund: jest.fn(),
+  YeboPayHttpError: jest.requireActual('../yebopay.service').YeboPayHttpError,
 }));
 
 // Imports must come AFTER the jest.mock calls so the mocked modules are wired in.
@@ -70,8 +68,10 @@ import {
   getTicketTypes,
   getUserTickets,
 } from '../ticket.service';
+import { dispatchCancellationNoticeForTicket } from '../cancellation-notice.service';
+import { enqueueCancellationNotice } from '../cancellation-notice-state.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
-import { createCharge, getCharge, refundCharge, YeboPayHttpError } from '../yebopay.service';
+import { createCharge, getCharge, refundCharge, reconcileRefund, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
 
 // Existing purchase scenarios now supply the mandatory durable identity.
@@ -87,12 +87,16 @@ const sendEmailMessageMock = sendEmailMessage as jest.MockedFunction<typeof send
 const createChargeMock = createCharge as jest.MockedFunction<typeof createCharge>;
 const getChargeMock = getCharge as jest.MockedFunction<typeof getCharge>;
 const refundChargeMock = refundCharge as jest.MockedFunction<typeof refundCharge>;
+const reconcileRefundMock = reconcileRefund as jest.MockedFunction<typeof reconcileRefund>;
 
 let recoveryLock: any;
 beforeEach(() => {
   // Reset return-value stubs between tests (clearMocks in jest.config only
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
+  prismaMock.ticketDeliveryMessage.findMany.mockResolvedValue([]);
+  (enqueueCancellationNotice as jest.Mock).mockReset();
+  (dispatchCancellationNoticeForTicket as jest.Mock).mockReset().mockResolvedValue({ status: 'sent', error: null });
   recoveryLock = null;
   prismaMock.ticketPurchaseAttempt.findUnique.mockResolvedValue(null);
   prismaMock.ticketPurchaseAttempt.create.mockImplementation(async ({data}: any) => ({...data}));
@@ -126,11 +130,11 @@ beforeEach(() => {
     Object.assign(recoveryLock, data); return recoveryLock;
   });
   prismaMock.ticketRefundLock.updateMany.mockImplementation(async ({where, data}: any) => {
-    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && recoveryLock.phase !== where.phase)) return {count: 0};
+    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && (typeof where.phase==='string' ? recoveryLock.phase !== where.phase : recoveryLock.phase===where.phase.not))) return {count: 0};
     Object.assign(recoveryLock, data); return {count: 1};
   });
   prismaMock.ticketRefundLock.deleteMany.mockImplementation(async ({where}: any) => {
-    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && recoveryLock.phase !== where.phase)) return {count: 0};
+    if (!recoveryLock || recoveryLock.attemptId !== where.attemptId || (where.phase && (typeof where.phase==='string' ? recoveryLock.phase !== where.phase : recoveryLock.phase===where.phase.not))) return {count: 0};
     recoveryLock = null;
     await prismaMock.ticketRefundLock.delete({where: {chargeId: where.chargeId}});
     return {count: 1};
@@ -163,13 +167,15 @@ beforeEach(() => {
   // override this.
   prismaMock.ticket.count.mockResolvedValue(0 as any);
   sendTextMessageMock.mockReset();
-  sendTextMessageMock.mockResolvedValue({ ok: true } as any);
+  sendTextMessageMock.mockImplementation(async () => ({ messageId: crypto.randomUUID(), status: 'queued' }));
   sendEmailMessageMock.mockReset();
-  sendEmailMessageMock.mockResolvedValue({ ok: true } as any);
+  sendEmailMessageMock.mockImplementation(async () => ({ messageId: crypto.randomUUID(), status: 'queued' }));
   createChargeMock.mockReset();
   getChargeMock.mockReset();
   getChargeMock.mockResolvedValue(buildCharge());
   refundChargeMock.mockReset();
+  reconcileRefundMock.mockReset();
+  reconcileRefundMock.mockRejectedValue(new YeboPayHttpError(404,{success:false,error:'Original refund proof is unavailable'},'/v1/refunds/original/reconcile'));
 });
 
 // --- Fixtures ---------------------------------------------------------------
@@ -212,7 +218,7 @@ const buildAvailableTicket = (over: Partial<any> = {}) => ({
 // A ticket as returned by prisma.ticket.findUnique with PURCHASE_INCLUDE
 // relations (after a claim/reserve/finalize).
 const buildTicketWithRelations = (over: Partial<any> = {}) => ({
-  ...buildAvailableTicket({ userId: 'user-1', status: 'sold', purchaseDate: new Date() }),
+  ...buildAvailableTicket({ userId: 'user-1', status: 'sold', purchaseDate: new Date(), amountPaid: 100 }),
   event: {
     id: 'event-1',
     title: 'Test Fest',
@@ -259,6 +265,7 @@ const buildCharge = (over: Partial<any> = {}) => ({
   refunded_amount: '0',
   description: null,
   created_at: '2026-06-06T00:00:00Z',
+  livemode: true,
   ...over,
 });
 
@@ -1031,14 +1038,26 @@ const buildSoldPaidTicket = (over: Partial<any> = {}) => ({
 });
 
 // A YeboPay refund result (full refund).
-const buildRefundResult = (over: Partial<any> = {}) => ({
+const buildRefundResult = (over: Partial<any> = {}) => {
+  const proof = {
+  refund_request_id: 'gateway-refund-1',
+  refund_state: 'SUCCEEDED',
+  amount: '100',
+  currency: 'SZL',
+  livemode: true,
+  cumulative_refunded_amount: over.refunded_amount??'100',
   charge_id: 'chg_1',
   refunded_amount: '100',
   status: 'REFUNDED' as const,
   processor_ref: 'rfnd_1',
   processor_status: 'SUCCEEDED',
   ...over,
-});
+  };
+  // Existing scenarios construct their response before the attempt is created.
+  // Resolve the simulated gateway's key when the handler reads its response.
+  Object.defineProperty(proof,'operation_key',{enumerable:true,get:()=>over.operation_key??'yebotickets-refund-'+recoveryLock?.attemptId});
+  return proof;
+};
 
 describe('refundTicket (single-ticket refund + cancel)', () => {
   it('refunds a paid sold ticket via YeboPay, marks it CANCELLED+REFUNDED, and notifies the holder', async () => {
@@ -1069,7 +1088,7 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
       refundRef: 'rfnd_1',
       notified: true,
     });
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(1);
   });
 
   it('is idempotent: an already-cancelled ticket is a no-op (no YeboPay refund, no write)', async () => {
@@ -1100,7 +1119,7 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
   it.each([409, 400, 501])('surfaces gateway rejection %s without cancelling the ticket', async (status) => {
     prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
     prismaMock.event.findUnique.mockResolvedValue({ id: 'event-1', organizerId: 'org-1' } as any);
-    refundChargeMock.mockRejectedValue(new YeboPayHttpError(status, { error: 'rejected' }, '/v1/refunds'));
+    refundChargeMock.mockRejectedValue(new YeboPayHttpError(status, { success:false, error: 'rejected' }, '/v1/refunds'));
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({ statusCode: 502 });
     expect(prismaMock.ticket.update).not.toHaveBeenCalled();
     expect(prismaMock.ticketRefundLock.delete).toHaveBeenCalledTimes(1);
@@ -1121,7 +1140,7 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
     const writeArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(writeArg.data).toMatchObject({ status: 'cancelled' });
     expect(writeArg.data.paymentStatus).toBeUndefined(); // free: no REFUNDED marker
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a refund for an event the organizer does not own (403) — no refund, no write', async () => {
@@ -1315,8 +1334,8 @@ describe('cancelEvent (refund all sold tickets + cancel)', () => {
       cancelledFree: 1,
       failed: 0,
     });
-    // Both holders notified.
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(2);
+    // Both durable notices dispatched after financial completion.
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(2);
   });
 
   it('enforces ownership: a non-owner organizer cannot cancel (403) and the event is NOT flagged', async () => {
@@ -1739,7 +1758,8 @@ describe('shared-charge refund accounting', () => {
       .mockRejectedValueOnce(new Error('commit failed')); // post-provider finalization
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode:502});
     expect(refunded).toBe(100);
-    expect(recoveryLock.phase).toBe('CONFIRMED');
+    expect(recoveryLock.phase).toBe('DISPATCHING');
+    reconcileRefundMock.mockResolvedValue(buildRefundResult({status:'PARTIAL_REFUNDED'}));
     expect(await reconcileRefundAttempt('chg_1', recoveryLock.attemptId)).toMatchObject({status:'FINALIZED'});
     expect((await cancelEvent('event-1', ORGANIZER)).refunded).toBe(2);
     expect(refunded).toBe(300);
@@ -1820,7 +1840,7 @@ describe('shared-charge refund accounting', () => {
   });
 
   it('allows retry after a definite 409 rejection but never records it as refunded', async () => {
-    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, { error: 'conflict' }, '/v1/refunds'));
+    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, { success:false, error: 'conflict' }, '/v1/refunds'));
     const summary = await cancelEvent('event-1', ORGANIZER);
     expect(summary).toMatchObject({ refunded: 2, failed: 1 });
     expect(tickets[0].status).toBe('sold');
@@ -2053,7 +2073,7 @@ describe('cancelled-event payment lifecycle', () => {
     const purchase = purchaseTicket('tt-1', 'user-1', PAYMENT);
     await charging;
     await cancelEvent(event.id, ORGANIZER);
-    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, {}, '/v1/refunds'));
+    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, {success:false,error:'Rejected before dispatch'}, '/v1/refunds'));
     const description = createChargeMock.mock.calls[0][0].description;
     await expect(handleChargeWebhookEvent('charge.succeeded', { id: 'chg_1', description }))
       .rejects.toMatchObject({ statusCode: 502 });
@@ -2066,7 +2086,7 @@ describe('cancelled-event payment lifecycle', () => {
 
   it('a definite refund rejection remains reserved, visible and retryable through cancellation', async () => {
     await cancelEvent(event.id, ORGANIZER);
-    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, {}, '/v1/refunds'));
+    refundChargeMock.mockRejectedValueOnce(new YeboPayHttpError(409, {success:false,error:'Rejected before dispatch'}, '/v1/refunds'));
     await expect(settleSucceededCharge('chg_1')).rejects.toMatchObject({ statusCode: 502 });
     expect(row).toMatchObject({ status: 'reserved', paymentStatus: 'SUCCEEDED', paymentRef: 'chg_1' });
     expect(await verifyTicket(row.uniqueCode, event.id, ORGANIZER)).toMatchObject({ valid: false });
@@ -2133,8 +2153,8 @@ describe('durable refund recovery', () => {
   it.each(['0', '100', '150'])('retains an ambiguous lost response with cumulative total %s', async total => {
     recoveryLock = attempt();
     getChargeMock.mockResolvedValue(buildCharge({refunded_amount: total, status: 'PARTIAL_REFUNDED'}));
-    expect(await reconcileRefundAttempt('chg_1', 'attempt-1')).toMatchObject({status: 'REVIEW_REQUIRED'});
-    expect(recoveryLock.detail).toContain('Inspect processor');
+    await expect(reconcileRefundAttempt('chg_1', 'attempt-1')).rejects.toMatchObject({status:404});
+    expect(recoveryLock.phase).toBe('DISPATCHING');
     expect(prismaMock.ticket.update).not.toHaveBeenCalled();
     expect(refundChargeMock).not.toHaveBeenCalled();
   });
@@ -2149,7 +2169,7 @@ describe('durable refund recovery', () => {
     });
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode:502});
     getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
-    expect(await reconcileRefundAttempt('chg_1', recoveryLock.attemptId)).toMatchObject({status:'REVIEW_REQUIRED'});
+    await expect(reconcileRefundAttempt('chg_1', recoveryLock.attemptId)).rejects.toMatchObject({status:404});
     expect(prismaMock.ticket.update).not.toHaveBeenCalled();
     expect(refundChargeMock).toHaveBeenCalledTimes(1);
   });
@@ -2162,8 +2182,9 @@ describe('durable refund recovery', () => {
       .mockImplementationOnce(((fn: any) => fn(prismaMock)) as any) // refund claim admission
       .mockRejectedValueOnce(new Error('database unavailable')); // post-provider finalization
     await expect(refundTicket('ticket-1', ORGANIZER)).rejects.toMatchObject({statusCode: 502});
-    expect(recoveryLock.phase).toBe('CONFIRMED');
+    expect(recoveryLock.phase).toBe('DISPATCHING');
     const token = recoveryLock.attemptId;
+    reconcileRefundMock.mockResolvedValue(buildRefundResult());
     getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
     expect(await reconcileRefundAttempt('chg_1', token)).toMatchObject({status:'FINALIZED'});
     expect(prismaMock.ticket.update).toHaveBeenCalledTimes(1);
@@ -2172,7 +2193,9 @@ describe('durable refund recovery', () => {
   });
 
   it('concurrent reconcilers finalize only once', async () => {
-    recoveryLock = attempt({phase:'CONFIRMED', confirmedRef:'refund-1'});
+    recoveryLock = attempt({phase:'CONFIRMED', confirmedRef:'rfnd_1',gatewayRequestId:'gateway-refund-1'});
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
+    reconcileRefundMock.mockResolvedValue(buildRefundResult());
     getChargeMock.mockResolvedValue(buildCharge({refunded_amount:'100', status:'REFUNDED'}));
     const outcomes = await Promise.allSettled([reconcileRefundAttempt('chg_1','attempt-1'), reconcileRefundAttempt('chg_1','attempt-1')]);
     expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(1);
@@ -2196,6 +2219,45 @@ describe('durable refund recovery', () => {
   it('lists actionable unresolved status', async () => {
     prismaMock.ticketRefundLock.findMany.mockResolvedValue([attempt()] as any);
     expect(await listRefundRecovery()).toEqual([expect.objectContaining({recoveryStatus:'REVIEW_REQUIRED', attemptId:'attempt-1'})]);
+  });
+
+  it.each([
+    {operation_key:'another-approved-refund'},
+    {refund_request_id:'another-gateway-request'},
+    {amount:'99'},
+    {currency:'ZAR'},
+    {livemode:false},
+    {cumulative_refunded_amount:'101'},
+    {processor_ref:null},
+    {amount:'100.001'},
+  ])('retains the hold when original proof mismatches its immutable intent: %j',async change=>{
+    recoveryLock=attempt({gatewayRequestId:'gateway-refund-1'});
+    reconcileRefundMock.mockResolvedValue(buildRefundResult(change));
+    await expect(reconcileRefundAttempt('chg_1','attempt-1')).rejects.toMatchObject({statusCode:502});
+    expect(recoveryLock).not.toBeNull();expect(prismaMock.ticket.update).not.toHaveBeenCalled();expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves a documented pending original receipt without marking its ticket refunded',async()=>{
+    recoveryLock=attempt();
+    const proof=buildRefundResult({refund_state:'PENDING',processor_status:'PENDING',refunded_amount:'0',cumulative_refunded_amount:'100',status:'SUCCEEDED'});
+    reconcileRefundMock.mockRejectedValue(new YeboPayHttpError(502,{success:false,error:'Original refund is pending',data:proof},'/v1/refunds/original/reconcile'));
+    expect(await reconcileRefundAttempt('chg_1','attempt-1')).toMatchObject({status:'REVIEW_REQUIRED',refundState:'PENDING'});
+    expect(recoveryLock.gatewayRequestId).toBe('gateway-refund-1');expect(prismaMock.ticket.update).not.toHaveBeenCalled();expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('a proved failed original attempt releases only its own hold without cancelling the ticket',async()=>{
+    recoveryLock=attempt();
+    reconcileRefundMock.mockResolvedValue(buildRefundResult({refund_state:'FAILED',processor_status:'FAILED',refunded_amount:'0',cumulative_refunded_amount:'100',status:'SUCCEEDED'}));
+    expect(await reconcileRefundAttempt('chg_1','attempt-1')).toMatchObject({status:'RETRYABLE',refundState:'FAILED'});
+    expect(recoveryLock).toBeNull();expect(prismaMock.ticket.update).not.toHaveBeenCalled();expect(refundChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('does not treat an unstructured 4xx as proof that dispatch was rejected',async()=>{
+    prismaMock.ticket.findUnique.mockResolvedValue(buildSoldPaidTicket() as any);
+    prismaMock.event.findUnique.mockResolvedValue({id:'event-1',organizerId:'org-1'} as any);
+    refundChargeMock.mockRejectedValue(new YeboPayHttpError(409,'Unstructured proxy response','/v1/refunds'));
+    await expect(refundTicket('ticket-1',ORGANIZER)).rejects.toMatchObject({statusCode:502});
+    expect(recoveryLock.phase).toBe('DISPATCHING');expect(prismaMock.ticket.update).not.toHaveBeenCalled();
   });
 });
 
@@ -2320,7 +2382,7 @@ describe('admission serializes against event cancellation', () => {
       const tx = new Proxy(prismaMock, { get(target, key) {
         if (key !== '$queryRaw') return target[key as keyof typeof target];
         return async (sql: TemplateStringsArray, ...values: unknown[]) => {
-          if (sql.join('?').includes('pg_advisory_xact_lock')) return [];
+          if (sql.join('?').includes('pg_advisory_xact_lock') || sql.join('?').includes('TicketRefundLock')) return [];
           expect(sql.join('?')).toMatch(/SELECT "isCancelled" FROM "Event".*FOR UPDATE/);
           expect(values).toEqual([event.id]);
           release = await lock();
