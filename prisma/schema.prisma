@@ -315,6 +315,8 @@ model Ticket {
   // records when the money was returned; cancelledAt records when the ticket
   // was voided (set for free tickets too, which are cancelled without a refund).
   refundRef     String?
+  refundAttemptId String? @unique
+  refundGatewayRequestId String? @unique
   refundedAt    DateTime?
   cancelledAt   DateTime?
 
@@ -347,6 +349,7 @@ model TicketRefundLock {
   attemptId      String   @default(uuid())
   phase          String   @default("REVIEW")
   confirmedRef   String?
+  gatewayRequestId String?
   detail         String?
   createdAt      DateTime @default(now())
 }

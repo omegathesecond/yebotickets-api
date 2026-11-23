@@ -50,6 +50,10 @@ export class YeboPayHttpError extends Error {
     super(`YeboPay ${path} failed: ${status}`);
     this.name = 'YeboPayHttpError';
   }
+  get rejectedBeforeDispatch(): boolean {
+    const body = this.body as {success?:unknown;error?:unknown} | null;
+    return [400,401,403,404,409,501].includes(this.status) && body?.success === false && typeof body.error === 'string';
+  }
 }
 
 interface DispatchOpts {
@@ -85,6 +89,7 @@ const dispatch = async <T = unknown>(opts: DispatchOpts): Promise<T> => {
     method: opts.method,
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    signal: AbortSignal.timeout(15000),
   });
 
   const raw = await res.text();
@@ -95,14 +100,14 @@ const dispatch = async <T = unknown>(opts: DispatchOpts): Promise<T> => {
     parsed = raw;
   }
 
-  if (!res.ok) {
+  if (!res.ok || !parsed || typeof parsed !== 'object' || (parsed as any).success !== true || !(parsed as any).data || typeof (parsed as any).data !== 'object') {
     console.error('YeboPay dispatch failed', {
       method: opts.method,
       path: opts.path,
       status: res.status,
       bodyPreview: raw.slice(0, 300),
     });
-    throw new YeboPayHttpError(res.status, parsed, opts.path);
+    throw new YeboPayHttpError(res.ok ? 502 : res.status, parsed, opts.path);
   }
   return parsed as T;
 };
@@ -198,6 +203,7 @@ export interface ChargeResult {
   refunded_amount: string;
   description: string | null;
   created_at: string;
+  livemode: boolean;
 }
 
 /**
@@ -252,6 +258,8 @@ export const getCharge = async (chargeId: string): Promise<ChargeResult> => {
 };
 
 export interface RefundChargeArgs {
+  /** The durable TicketRefundLock.attemptId, never regenerated for a retry. */
+  operationKey: string;
   /** YeboPay charge id stored on the ticket as `paymentRef`. */
   chargeId: string;
   /** Amount to refund. Omit for a full refund of the remaining balance. */
@@ -261,11 +269,19 @@ export interface RefundChargeArgs {
 }
 
 export interface RefundResult {
+  refund_request_id: string;
+  operation_key: string;
+  refund_state: 'DISPATCHING' | 'PENDING' | 'UNKNOWN' | 'SUCCEEDED' | 'FAILED';
   charge_id: string;
+  amount: string;
+  currency: string;
+  livemode: boolean;
+  cumulative_refunded_amount: string;
+  failure_reason?: string | null;
   refunded_amount: string; // Cumulative charge total, NOT this refund amount
-  status: 'PARTIAL_REFUNDED' | 'REFUNDED';
+  status: YeboPayChargeStatus;
   processor_ref: string | null;
-  processor_status: 'SUCCEEDED' | 'PENDING' | 'FAILED';
+  processor_status: 'SUCCEEDED' | 'PENDING' | 'FAILED' | 'UNKNOWN';
 }
 
 /**
@@ -275,7 +291,8 @@ export interface RefundResult {
  * yebopay.ts). YeboPay validates that the charge belongs to this merchant and
  * that its status allows refunding (SUCCEEDED or PARTIAL_REFUNDED) — a charge
  * already fully REFUNDED yields a 409 (YeboPayHttpError). This is NOT proof
- * that any particular ticket was refunded. Refunds have no idempotency support.
+ * that any particular ticket was refunded. The saved attempt key identifies
+ * one immutable gateway refund; an ambiguous response is reconciled by that key.
  * A 501 means the charge was paid via
  * a path with no refund adapter yet; surface that to the organizer so they know
  * to refund the holder manually rather than us pretending it worked.
@@ -284,15 +301,40 @@ export interface RefundResult {
  * refund flow in ticket.service) MUST NOT mark a ticket refunded unless this
  * resolves successfully.
  */
-export const refundCharge = async (args: RefundChargeArgs): Promise<RefundResult> => {
+export const refundCharge = async (
+  args: RefundChargeArgs,
+): Promise<RefundResult> => {
+  if (
+    typeof args.operationKey !== 'string' ||
+    !/^[A-Za-z0-9._:-]{1,200}$/.test(args.operationKey)
+  )
+    throw new Error('A durable refund operation key is required');
   const resp = await dispatch<{ success: true; data: RefundResult }>({
     method: 'POST',
     path: '/v1/refunds',
+    idempotencyKey: args.operationKey,
     body: {
       charge_id: args.chargeId,
       amount: args.amount,
       reason: args.reason,
     },
+  });
+  return resp.data;
+};
+
+/** Read the original provider proof; this endpoint cannot dispatch a new refund. */
+export const reconcileRefund = async (
+  operationKey: string,
+): Promise<RefundResult> => {
+  if (
+    typeof operationKey !== 'string' ||
+    !/^[A-Za-z0-9._:-]{1,200}$/.test(operationKey)
+  )
+    throw new Error('A durable refund operation key is required');
+  const resp = await dispatch<{ success: true; data: RefundResult }>({
+    method: 'POST',
+    path: '/v1/refunds/' + encodeURIComponent(operationKey) + '/reconcile',
+    body: {},
   });
   return resp.data;
 };

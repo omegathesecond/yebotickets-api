@@ -1,22 +1,29 @@
 # Ticket refund accounting
 
-Apply migration `20261019120000_add_ticket_refund_lock` before deploying this API revision. Use the environment's Neon direct connection for `prisma migrate deploy`.
+Apply the full migration history through `20261123140000_original_refund_proof` before deploying this API revision. The coordinated durable YeboPay API #30 release must be available first. Use the environment's Neon direct connection for `prisma migrate deploy`.
 
-Each ticket's `amountPaid` is its refundable allocation of the shared `paymentRef`. Refund requests always send that allocation. YeboPay's `refunded_amount` is cumulative: the service compares it with the pre-request total plus the ticket allocation, and requires `processor_status: SUCCEEDED`. A 409 is a failed refund, never proof of success.
+Each ticket's `amountPaid` is its refundable allocation of the shared `paymentRef`. Refund requests always send that allocation. YeboPay's `refunded_amount` is cumulative. The service requires the exact immutable original refund receipt: its saved attempt key, charge, amount, currency, mode, cumulative target, gateway request ID and successful provider proof. A 409 is a failed refund, never proof of success.
 
 `TicketRefundLock.chargeId` is a database-wide unique claim shared by all tickets on that charge. The service re-reads the ticket after claiming, so a stale concurrent request cannot refund a ticket already finalized by another worker. Cancellation and claim release commit in one transaction. A concurrent cancellation reports the blocked ticket as failed; retry once the active refund completes.
 
 ## Uncertain outcomes
 
-YeboPay's current refund route does **not** deduplicate refund requests. Never expire or automatically delete these locks. A timeout, process crash, pending/failed processor response, inconsistent response, or local commit failure can leave a claim behind. All further refunds on that charge fail visibly until an operator reconciles it. The ticket stays sold until confirmed refunded.
+Every attempt sends the saved `TicketRefundLock.attemptId` as a stable,
+product-prefixed gateway key. Timeouts, process crashes, pending/unknown processor
+responses and local commit failures retain the charge claim. Tickets stay valid
+until exact refund completion is proved. Neither current cumulative totals nor an
+HTTP status alone can attribute a refund to one ticket.
 
-For reconciliation, inspect the lock (`ticketId`, `amount`, `refundedBefore`, `createdAt`), the ticket, YeboPay charge history, and the actual processor refund record. A cumulative charge total alone cannot identify which ticket was refunded.
+The existing recovery endpoint now checks the original gateway receipt. Successful
+proof atomically stores the attempt/gateway/provider identity on the ticket,
+cancels its paid allocation and releases the claim. A pending/unknown original
+stays blocked. A proven failed original can release its own hold for an explicitly
+requested new attempt. Recovery cannot dispatch another refund. Missing or
+conflicting proof fails visibly; see [refund recovery](refund-recovery.md).
 
-- If the processor conclusively confirms the exact ticket refund succeeded, finalize that ticket (`status=cancelled`, `paymentStatus=REFUNDED`, refund reference and timestamps, clear the buyer refund request) and delete the claim in a **single database transaction**.
-- If the processor conclusively confirms no refund occurred and none remains pending, delete the claim and retry through the normal refund endpoint.
-- Otherwise retain the claim and resolve with the payment provider. Never resend an uncertain refund.
-
-Known pre-dispatch YeboPay rejections (400/401/403/404/409/501) release the claim without changing ticket state, allowing a corrected request to retry. Notifications occur only after confirmed refund and local commit.
+Only structured canonical pre-dispatch rejections release an initial claim.
+Unstructured proxy errors and ambiguous responses retain it. Notification failure
+is still reported separately after money and local accounting have completed.
 
 ## Cancellation while payment is pending
 
@@ -26,4 +33,4 @@ Settlement takes an Event row share lock in the same transaction as the ticket t
 
 A cancelled-event paid hold stays `reserved/SUCCEEDED` until the existing refund helper confirms its exact allocation was returned. Cancellation, webhook retries and reclaim can retry definite rejections using the same charge-wide refund claim. Ambiguous outcomes retain that claim for the reconciliation procedure above. Check-in rejects cancelled events even when a pre-cancellation sold ticket's refund has failed, and offline sync excludes those events. Previously downloaded offline caches require a fresh sync to see cancellation.
 
-No new migration is needed for this lifecycle; the refund-lock migration above must already be installed.
+The original-refund proof migration above must be installed before this revision serves traffic.

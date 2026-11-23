@@ -61,6 +61,7 @@ const CHARGE = {
   refunded_amount: '0',
   description: null,
   created_at: '2026-08-06T00:00:00.000Z',
+  livemode: false,
 };
 
 describe('yebopay.service — gateway host', () => {
@@ -94,6 +95,31 @@ describe('yebopay.service — gateway host', () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       'https://dev-api.yebopay.app/v1/payment-options?country=SZ&customer=user_1'
     );
+  });
+});
+
+describe('durable original refunds',()=>{
+  const proof={refund_request_id:'refund-1',operation_key:'yebotickets-refund-attempt-1',refund_state:'SUCCEEDED',charge_id:'chg_1',amount:'50',currency:'SZL',livemode:false,cumulative_refunded_amount:'50',refunded_amount:'50',status:'PARTIAL_REFUNDED',processor_ref:'re_1',processor_status:'SUCCEEDED'};
+  it('requires the saved attempt key and sends the canonical refund request',async()=>{
+    const fetchMock=jest.fn(async()=>OK_JSON({success:true,data:proof}));
+    const client=loadClient({YEBOPAY_API_KEY:'fixture-key'},fetchMock);
+    await expect(client.refundCharge({chargeId:'chg_1'} as any)).rejects.toThrow(/durable/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await client.refundCharge({operationKey:proof.operation_key,chargeId:'chg_1',amount:50,reason:'Explicit ticket refund'})).toEqual(proof);
+    expect(fetchMock.mock.calls[0]).toMatchObject(['https://api.yebopay.app/v1/refunds',{method:'POST',headers:{'x-api-key':'fixture-key','idempotency-key':proof.operation_key},body:JSON.stringify({charge_id:'chg_1',amount:50,reason:'Explicit ticket refund'})}]);
+  });
+  it('checks only the original saved refund endpoint and preserves nonterminal proof',async()=>{
+    const pending={...proof,refund_state:'PENDING',processor_status:'PENDING'};
+    const fetchMock=jest.fn(async()=>OK_JSON({success:false,error:'Original refund is pending',data:pending},502));
+    const client=loadClient({YEBOPAY_API_KEY:'fixture-key'},fetchMock);
+    const error=await client.reconcileRefund(proof.operation_key).catch(error=>error);
+    expect(error).toBeInstanceOf(client.YeboPayHttpError);expect(error.body.data).toEqual(pending);
+    expect(String(fetchMock.mock.calls[0][0])).toBe('https://api.yebopay.app/v1/refunds/'+proof.operation_key+'/reconcile');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it.each([{success:false,error:'gateway failure'}, {success:true}, {success:true,data:null}, '<html>upstream failure</html>'])('rejects a malformed 2xx envelope instead of returning successful data: %j',async body=>{
+    const client=loadClient({YEBOPAY_API_KEY:'fixture-key'},jest.fn(async()=>OK_JSON(body)));
+    await expect(client.getCharge('chg_1')).rejects.toMatchObject({status:502});
   });
 });
 

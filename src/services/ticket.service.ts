@@ -10,6 +10,7 @@ import {
 } from '../interfaces/ticket.interface';
 import { ApiError } from '../middleware/error.middleware';
 import crypto from 'crypto';
+import { CURRENCY as TICKET_CURRENCY } from '../config/platform';
 import { YeboLinkSendError } from './yebolink.client';
 import {
   buildTicketQrPayload,
@@ -21,12 +22,14 @@ import {
   getCharge,
   listPaymentOptions,
   refundCharge,
+  reconcileRefund,
   YeboPayHttpError,
+  type RefundResult,
+  type ChargeResult,
   type PaymentOptionsResponse,
 } from './yebopay.service';
 
-/** Currency + default country tickets are priced/charged in (Eswatini). */
-const TICKET_CURRENCY = 'SZL';
+/** Default country for the existing Eswatini ticket rails. */
 const DEFAULT_COUNTRY = 'SZ';
 
 /**
@@ -2053,8 +2056,8 @@ const notifyHolderOfCancellation = async (
  * cancellation) picks the ticket up again.
  *
  * A durable charge-wide claim serializes all tickets sharing a paymentRef.
- * Ambiguous provider outcomes retain the claim for manual reconciliation; the
- * gateway has no refund idempotency support, so retrying could move money twice.
+ * Ambiguous provider outcomes retain the claim. The saved attempt key identifies
+ * the original immutable gateway refund; recovery reads that proof, never resends.
  *
  * FREE tickets (no paymentRef / paymentStatus FREE / amountPaid 0) carry no
  * money, so they are simply voided and the holder notified — no YeboPay call.
@@ -2107,7 +2110,7 @@ const refundAndCancelTicket = async (
   });
   const amount = Number(ticket.amountPaid);
   const cents = (value: number) => Math.round(value * 100);
-  if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
+  if (!Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(cents(amount)) || Math.abs(amount * 100 - cents(amount)) > 0.000001) {
     return failed('invalid stored ticket amount');
   }
 
@@ -2151,12 +2154,13 @@ const refundAndCancelTicket = async (
     const before = Number(charge.refunded_amount);
     const total = Number(charge.amount);
     if (charge.id !== ticket.paymentRef ||
+        charge.currency !== TICKET_CURRENCY || typeof charge.livemode !== 'boolean' ||
         !['SUCCEEDED', 'PARTIAL_REFUNDED'].includes(charge.status) ||
         !Number.isFinite(before) || before < 0 || !Number.isFinite(total) ||
         cents(before) + cents(amount) > cents(total)) {
       throw new Error('gateway charge is not refundable for this ticket amount');
     }
-    await prisma.ticketRefundLock.update({
+    const intent = await prisma.ticketRefundLock.update({
       where: { chargeId: ticket.paymentRef, attemptId }, data: { refundedBefore: before },
     });
     const claimed = await prisma.ticketRefundLock.updateMany({
@@ -2165,29 +2169,19 @@ const refundAndCancelTicket = async (
     });
     if (claimed.count !== 1) throw new Error('refund attempt was recovered before dispatch');
     dispatched = true;
-    const res = await refundCharge({ chargeId: ticket.paymentRef, amount, reason });
-    // refunded_amount is CUMULATIVE, not the amount returned for this ticket.
-    if (res.charge_id !== ticket.paymentRef || res.processor_status !== 'SUCCEEDED' ||
-        !['PARTIAL_REFUNDED', 'REFUNDED'].includes(res.status) ||
-        !Number.isFinite(Number(res.refunded_amount)) ||
-        cents(Number(res.refunded_amount)) !== cents(before) + cents(amount)) {
+    const res = await refundCharge({ operationKey: refundOperationKey(attemptId), chargeId: ticket.paymentRef, amount, reason });
+    if (verifiedRefundProof(intent, res, charge) !== 'SUCCEEDED') {
       throw new Error('gateway did not confirm the exact refund; reconciliation required');
     }
-    refund = { refundRef: res.processor_ref ?? res.charge_id, amount };
-
-    await prisma.ticketRefundLock.update({
-      where: { chargeId: ticket.paymentRef, attemptId },
-      data: { phase: 'CONFIRMED', confirmedRef: refund.refundRef },
-    });
+    refund = { refundRef: res.processor_ref!, amount };
 
     // Keep the claim if this transaction fails after the provider moved money.
     // Ticket finalization and releasing the claim must commit together.
-    await finalizeRefundAttempt(ticket.paymentRef, attemptId, refund.refundRef);
+    await finalizeRefundAttempt(ticket.paymentRef, attemptId, res, charge);
   } catch (error) {
     // These gateway responses reject BEFORE processor dispatch. A 409 is a
     // rejection, never evidence that THIS ticket's refund succeeded.
-    const rejected = error instanceof YeboPayHttpError &&
-      [400, 401, 403, 404, 409, 501].includes(error.status);
+    const rejected = error instanceof YeboPayHttpError && error.rejectedBeforeDispatch;
     if (dispatched && rejected) {
       await prisma.ticketRefundLock.update({ where: { chargeId: ticket.paymentRef, attemptId },
         data: { phase: 'REJECTED', detail: errorMessage(error) } });
@@ -2412,7 +2406,7 @@ export interface EventCancellationSummary {
  */
 export const cancelEvent = async (
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester,
 ): Promise<EventCancellationSummary> => {
   try {
     await assertEventAccess(eventId, requester);
@@ -2438,11 +2432,18 @@ export const cancelEvent = async (
     // reconciliation and avoids hammering the YeboPay gateway in a burst.
     const outcomes: TicketRefundOutcome[] = [];
     for (const ticket of tickets) {
-      if (ticket.status === 'reserved' && ticket.paymentStatus !== 'SUCCEEDED') {
+      if (
+        ticket.status === 'reserved' &&
+        ticket.paymentStatus !== 'SUCCEEDED'
+      ) {
         // Keep ownership and the charge reference, including an in-flight
         // createCharge with a durable attempt reference. Its webhook owns settlement.
-        outcomes.push({ ticketId: ticket.id, uniqueCode: ticket.uniqueCode,
-          result: 'pending', notified: false });
+        outcomes.push({
+          ticketId: ticket.id,
+          uniqueCode: ticket.uniqueCode,
+          result: 'pending',
+          notified: false,
+        });
       } else {
         outcomes.push(await refundAndCancelTicket(ticket, reason));
       }
@@ -2452,19 +2453,21 @@ export const cancelEvent = async (
       eventId,
       cancelled: true,
       totalProcessed: outcomes.length,
-      refunded: outcomes.filter(o => o.result === 'refunded').length,
-      cancelledFree: outcomes.filter(o => o.result === 'cancelled_free').length,
-      alreadyHandled: outcomes.filter(o => o.result === 'already_handled').length,
-      failed: outcomes.filter(o => o.result === 'refund_failed').length,
-      notifyFailures: outcomes.filter(o => o.notifyError).length,
-      pending: outcomes.filter(o => o.result === 'pending').length,
+      refunded: outcomes.filter((o) => o.result === 'refunded').length,
+      cancelledFree: outcomes.filter((o) => o.result === 'cancelled_free')
+        .length,
+      alreadyHandled: outcomes.filter((o) => o.result === 'already_handled')
+        .length,
+      failed: outcomes.filter((o) => o.result === 'refund_failed').length,
+      notifyFailures: outcomes.filter((o) => o.notifyError).length,
+      pending: outcomes.filter((o) => o.result === 'pending').length,
       outcomes,
     };
 
     if (summary.failed > 0) {
       console.error(
         `cancelEvent ${eventId}: ${summary.failed}/${summary.totalProcessed} ticket refunds FAILED`,
-        outcomes.filter(o => o.result === 'refund_failed')
+        outcomes.filter((o) => o.result === 'refund_failed'),
       );
     }
 
@@ -2476,55 +2479,251 @@ export const cancelEvent = async (
   }
 };
 
-
 // Claim deletion and ticket accounting commit together. The attempt token fences
 // stale owners: a replacement attempt can never be released by this one.
-const finalizeRefundAttempt = async (chargeId: string, attemptId: string, refundRef: string | null) => {
-  return prisma.$transaction(async tx => {
+const finalizeRefundAttempt = async (
+  chargeId: string,
+  attemptId: string,
+  proof: RefundResult,
+  charge: ChargeResult,
+) => {
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "chargeId" FROM "TicketRefundLock" WHERE "chargeId"=${chargeId} FOR UPDATE`;
     const lock = await tx.ticketRefundLock.findUnique({ where: { chargeId } });
-    if (!lock || lock.attemptId !== attemptId || lock.phase !== 'CONFIRMED') {
+    if (!lock) {
+      const settled = await tx.ticket.findUnique({
+        where: { refundAttemptId: attemptId },
+      });
+      if (
+        settled &&
+        settled.paymentRef === chargeId &&
+        settled.paymentStatus === 'REFUNDED' &&
+        settled.status === 'cancelled' &&
+        settled.refundGatewayRequestId === proof.refund_request_id &&
+        settled.refundRef === proof.processor_ref &&
+        refundMinor(String(settled.amountPaid)) === refundMinor(proof.amount)
+      )
+        return;
       throw new ApiError('Refund attempt changed; reload recovery status', 409);
     }
-    const released = await tx.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: 'CONFIRMED' } });
-    if (released.count !== 1) throw new ApiError('Refund recovery already in progress', 409);
-    await tx.ticket.update({ where: { id: lock.ticketId }, data: {
-      status: 'cancelled', paymentStatus: 'REFUNDED', refundRef,
-      refundedAt: new Date(), cancelledAt: new Date(),
-      refundRequestedAt: null, refundRequestReason: null,
-    } });
+    if (
+      lock.attemptId !== attemptId ||
+      !['DISPATCHING', 'CONFIRMED'].includes(lock.phase) ||
+      verifiedRefundProof(lock, proof, charge) !== 'SUCCEEDED'
+    ) {
+      throw new ApiError('Refund attempt changed; reload recovery status', 409);
+    }
+    const ticket = await tx.ticket.findUnique({ where: { id: lock.ticketId } });
+    if (
+      !ticket ||
+      ticket.paymentRef !== chargeId ||
+      ticket.amountPaid !== lock.amount ||
+      ticket.paymentStatus !== 'SUCCEEDED' ||
+      !['sold', 'reserved'].includes(ticket.status)
+    )
+      throw new ApiError(
+        'Original paid ticket changed; retain the refund for investigation',
+        409,
+      );
+    await tx.ticketRefundLock.update({
+      where: { chargeId, attemptId },
+      data: {
+        phase: 'CONFIRMED',
+        confirmedRef: proof.processor_ref,
+        gatewayRequestId: proof.refund_request_id,
+      },
+    });
+    const released = await tx.ticketRefundLock.deleteMany({
+      where: { chargeId, attemptId, phase: 'CONFIRMED' },
+    });
+    if (released.count !== 1)
+      throw new ApiError('Refund recovery already in progress', 409);
+    await tx.ticket.update({
+      where: { id: lock.ticketId },
+      data: {
+        status: 'cancelled',
+        paymentStatus: 'REFUNDED',
+        refundRef: proof.processor_ref,
+        refundAttemptId: attemptId,
+        refundGatewayRequestId: proof.refund_request_id,
+        refundedAt: new Date(),
+        cancelledAt: new Date(),
+        refundRequestedAt: null,
+        refundRequestReason: null,
+      },
+    });
   });
 };
 
 export const listRefundRecovery = async () => {
-  const locks = await prisma.ticketRefundLock.findMany({ orderBy: { createdAt: 'asc' } });
-  return locks.map(lock => ({ ...lock,
-    recoveryStatus: ['PREPARED', 'REJECTED'].includes(lock.phase) ? 'RETRYABLE_AFTER_RECONCILIATION'
-      : lock.phase === 'CONFIRMED' ? 'READY_TO_RECONCILE' : 'REVIEW_REQUIRED',
-    action: 'POST /api/tickets/refund-recovery/' + encodeURIComponent(lock.chargeId) + '/reconcile with attemptId',
+  const locks = await prisma.ticketRefundLock.findMany({
+    orderBy: { createdAt: 'asc' },
+  });
+  return locks.map((lock) => ({
+    ...lock,
+    gatewayOperationKey: refundOperationKey(lock.attemptId),
+    recoveryStatus: ['PREPARED', 'REJECTED'].includes(lock.phase)
+      ? 'RETRYABLE_AFTER_RECONCILIATION'
+      : lock.phase === 'CONFIRMED'
+        ? 'READY_TO_RECONCILE'
+        : 'REVIEW_REQUIRED',
+    action:
+      'POST /api/tickets/refund-recovery/' +
+      encodeURIComponent(lock.chargeId) +
+      '/reconcile with attemptId',
   }));
 };
 
 /** Never dispatch money from recovery. An unchanged cumulative total cannot
  * prove that an in-flight processor request will not settle later. */
-export const reconcileRefundAttempt = async (chargeId: string, attemptId: string) => {
-  const lock = await prisma.ticketRefundLock.findUnique({ where: { chargeId } });
-  if (!lock || lock.attemptId !== attemptId) throw new ApiError('Refund attempt changed; reload recovery status', 409);
+export const reconcileRefundAttempt = async (
+  chargeId: string,
+  attemptId: string,
+) => {
+  const lock = await prisma.ticketRefundLock.findUnique({
+    where: { chargeId },
+  });
+  if (!lock || lock.attemptId !== attemptId)
+    throw new ApiError('Refund attempt changed; reload recovery status', 409);
   if (['PREPARED', 'REJECTED'].includes(lock.phase)) {
-    const released = await prisma.ticketRefundLock.deleteMany({ where: { chargeId, attemptId, phase: lock.phase } });
-    if (released.count !== 1) throw new ApiError('Refund dispatch started; reload recovery status', 409);
+    const released = await prisma.ticketRefundLock.deleteMany({
+      where: { chargeId, attemptId, phase: lock.phase },
+    });
+    if (released.count !== 1)
+      throw new ApiError(
+        'Refund dispatch started; reload recovery status',
+        409,
+      );
     return { status: 'RETRYABLE', ticketId: lock.ticketId };
   }
   const charge = await getCharge(chargeId);
-  const expected = Number(lock.refundedBefore) + lock.amount;
-  if (lock.phase === 'CONFIRMED' && lock.refundedBefore !== null &&
-      charge.id === chargeId && charge.currency === TICKET_CURRENCY &&
-      ['REFUNDED', 'PARTIAL_REFUNDED'].includes(charge.status) &&
-      Number.isFinite(Number(charge.refunded_amount)) &&
-      Math.round(Number(charge.refunded_amount) * 100) === Math.round(expected * 100)) {
-    await finalizeRefundAttempt(chargeId, attemptId, lock.confirmedRef);
+  let proof: RefundResult;
+  try {
+    proof = await reconcileRefund(refundOperationKey(attemptId));
+  } catch (error) {
+    const body =
+      error instanceof YeboPayHttpError
+        ? (error.body as { success?: unknown; data?: RefundResult } | null)
+        : null;
+    // A documented nonterminal receipt is an explicit business state, never
+    // replacement data for a failed read or missing original operation.
+    if (
+      !body ||
+      body.success !== false ||
+      !body.data ||
+      !['DISPATCHING', 'PENDING', 'UNKNOWN', 'FAILED'].includes(
+        body.data.refund_state,
+      )
+    )
+      throw error;
+    proof = body.data;
+  }
+  const state = verifiedRefundProof(lock, proof, charge);
+  if (state === 'SUCCEEDED') {
+    await finalizeRefundAttempt(chargeId, attemptId, proof, charge);
     return { status: 'FINALIZED', ticketId: lock.ticketId };
   }
-  const detail = 'Gateway cumulative totals cannot attribute this attempt. Inspect processor refund records for this charge; do not retry money movement. Escalate to payment operations for authoritative attempt evidence.';
-  await prisma.ticketRefundLock.updateMany({ where: { chargeId, attemptId }, data: { detail } });
-  return { status: 'REVIEW_REQUIRED', ticketId: lock.ticketId, detail, charge };
+  if (state === 'FAILED') {
+    const released = await prisma.ticketRefundLock.deleteMany({
+      where: { chargeId, attemptId, phase: { not: 'CONFIRMED' } },
+    });
+    if (released.count !== 1)
+      throw new ApiError(
+        'Refund confirmation changed; reload recovery status',
+        409,
+      );
+    return {
+      status: 'RETRYABLE',
+      ticketId: lock.ticketId,
+      refundState: state,
+      detail:
+        'The original provider refund failed; the ticket was not cancelled.',
+    };
+  }
+  const detail =
+    'The original refund remains unconfirmed. The charge stays blocked; checking its receipt sends no new payment.';
+  await prisma.ticketRefundLock.updateMany({
+    where: { chargeId, attemptId },
+    data: { detail, gatewayRequestId: proof.refund_request_id },
+  });
+  return {
+    status: 'REVIEW_REQUIRED',
+    ticketId: lock.ticketId,
+    refundState: state,
+    detail,
+  };
+};
+
+const refundOperationKey = (attemptId: string) =>
+  'yebotickets-refund-' + attemptId;
+/** Original-currency cents, without floating point comparisons or FX guesses. */
+const refundMinor = (value: unknown): bigint => {
+  if (typeof value !== 'string' || !/^\d+(\.\d{1,4})?$/.test(value))
+    throw new ApiError('Invalid original-currency refund amount', 502);
+  const [whole, fraction = ''] = value.split('.');
+  if (/[1-9]/.test(fraction.slice(2)))
+    throw new ApiError('Refund amount has fractional minor units', 502);
+  return (
+    BigInt(whole) * BigInt(100) + BigInt(fraction.slice(0, 2).padEnd(2, '0'))
+  );
+};
+const verifiedRefundProof = (
+  lock: {
+    chargeId: string;
+    attemptId: string;
+    amount: number;
+    refundedBefore: number | null;
+    gatewayRequestId?: string | null;
+    confirmedRef?: string | null;
+  },
+  proof: RefundResult,
+  charge: ChargeResult,
+) => {
+  if (
+    !proof ||
+    proof.operation_key !== refundOperationKey(lock.attemptId) ||
+    proof.charge_id !== lock.chargeId ||
+    charge.id !== lock.chargeId ||
+    proof.currency !== TICKET_CURRENCY ||
+    charge.currency !== proof.currency ||
+    typeof proof.livemode !== 'boolean' ||
+    charge.livemode !== proof.livemode ||
+    !proof.refund_request_id ||
+    typeof proof.refund_request_id !== 'string' ||
+    lock.refundedBefore === null ||
+    refundMinor(proof.amount) !== refundMinor(String(lock.amount)) ||
+    refundMinor(proof.cumulative_refunded_amount) !==
+      refundMinor(String(lock.refundedBefore)) +
+        refundMinor(String(lock.amount)) ||
+    !['DISPATCHING', 'PENDING', 'UNKNOWN', 'SUCCEEDED', 'FAILED'].includes(
+      proof.refund_state,
+    ) ||
+    (lock.gatewayRequestId &&
+      lock.gatewayRequestId !== proof.refund_request_id) ||
+    (lock.confirmedRef && lock.confirmedRef !== proof.processor_ref)
+  )
+    throw new ApiError(
+      'Gateway proof does not match this original ticket refund',
+      502,
+    );
+  if (
+    proof.refund_state === 'SUCCEEDED' &&
+    (proof.processor_status !== 'SUCCEEDED' ||
+      typeof proof.processor_ref !== 'string' ||
+      !proof.processor_ref ||
+      !['REFUNDED', 'PARTIAL_REFUNDED'].includes(proof.status) ||
+      refundMinor(proof.refunded_amount) <
+        refundMinor(proof.cumulative_refunded_amount) ||
+      refundMinor(proof.refunded_amount) > refundMinor(charge.amount))
+  )
+    throw new ApiError(
+      'Gateway did not prove completion of this exact ticket refund',
+      502,
+    );
+  if (proof.refund_state === 'FAILED' && proof.processor_status !== 'FAILED')
+    throw new ApiError(
+      'Gateway did not prove failure of the original refund',
+      502,
+    );
+  return proof.refund_state;
 };
