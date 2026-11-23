@@ -89,7 +89,7 @@ export async function review(
       lock,
     );
     return {
-      version: hashIntent({ name, parameters, settings }),
+      version: hashIntent({ operation: op, name, parameters, settings }),
       workspace: {
         id: settings.id,
         name: "Platform commission",
@@ -109,7 +109,7 @@ export async function review(
       parameters.generationId,
     );
     return {
-      version: hashIntent({ name, parameters, evidence }),
+      version: hashIntent({ operation: op, name, parameters, evidence }),
       workspace: {
         id: evidence.order.id,
         name: evidence.order.eventTitle,
@@ -131,7 +131,7 @@ export async function review(
       parameters.generationId,
     );
     return {
-      version: hashIntent({ name, parameters, evidence }),
+      version: hashIntent({ operation: op, name, parameters, evidence }),
       workspace: {
         id: evidence.order.id,
         name: evidence.tickets[0].event.title,
@@ -153,6 +153,7 @@ export async function review(
     ).view(parameters.id);
     return {
       version: hashIntent({
+        operation: op,
         name,
         parameters,
         id: original.id,
@@ -189,7 +190,7 @@ export async function review(
         409,
       );
     return {
-      version: hashIntent({ name, parameters, message }),
+      version: hashIntent({ operation: op, name, parameters, message }),
       workspace: {
         name: "Original ticket message",
         ...deliveryMessageView(message),
@@ -203,6 +204,7 @@ export async function review(
     const source = purchaseView(evidence);
     return {
       version: hashIntent({
+        operation: op,
         name,
         parameters,
         snapshot: purchaseSnapshot(evidence),
@@ -230,7 +232,7 @@ export async function review(
   ) {
     const record = await purchaseRecoveryReceipt(parameters.id);
     return {
-      version: hashIntent({ name, parameters, id: record.id }),
+      version: hashIntent({ operation: op, name, parameters, id: record.id }),
       workspace: {
         id: record.id,
         name: record.source.buyerName ?? record.source.id,
@@ -248,7 +250,7 @@ export async function review(
   ) {
     const manifest = await cancellationManifest(parameters.id);
     return {
-      version: hashIntent({ name, parameters, manifest }),
+      version: hashIntent({ operation: op, name, parameters, manifest }),
       workspace: {
         id: manifest.operationId,
         name: manifest.eventTitle,
@@ -289,7 +291,7 @@ export async function review(
       currency: CURRENCY,
     };
     return {
-      version: hashIntent({ name, parameters, intent }),
+      version: hashIntent({ operation: op, name, parameters, intent }),
       workspace: {
         ...intent,
         name: ticket.uniqueCode,
@@ -308,7 +310,7 @@ export async function review(
         400,
       );
     return {
-      version: hashIntent({ name, parameters, evidence }),
+      version: hashIntent({ operation: op, name, parameters, evidence }),
       workspace: {
         id: evidence.account.id,
         name: evidence.account.name,
@@ -458,6 +460,7 @@ export async function review(
       : undefined;
   return {
     version: hashIntent({
+      operation: op,
       name,
       parameters,
       rows,
