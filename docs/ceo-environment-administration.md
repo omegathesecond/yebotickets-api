@@ -2,7 +2,7 @@
 
 The existing owning handlers, source receipts and CEO approval queue remain the
 administration flow. The source boundary now derives `yebotickets:prod` or
-`yebotickets:dev` from its actual Cloud Run `K_SERVICE` using canonical SDK 0.4.0.
+`yebotickets:dev` from its actual Cloud Run `K_SERVICE` using canonical SDK 0.5.0.
 Missing, legacy and other-product service names fail. Old unscoped assertions
 are rejected, with no compatibility endpoint or guessed production default.
 
