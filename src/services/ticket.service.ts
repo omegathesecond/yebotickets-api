@@ -857,7 +857,7 @@ export const claimOrderDelivery = async (
   id: string,
   manual = false,
   acknowledgeDuplicateRisk = false,
-  attemptId = crypto.randomUUID(),
+  attemptId: string = crypto.randomUUID(),
 ) => {
   const state = await deliveryDispatchState(id),
     row = state.order;

@@ -1,13 +1,45 @@
 import { randomUUID } from "crypto";
-import prisma from "../config/prisma";
+import prisma, { staffAdminScope } from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
 import { YeboLinkSendError } from "./yebolink.client";
 import { sendTextMessage } from "./comms.service";
 import { sendDeliveryMessage } from "./delivery-message.service";
-import { deliveryAttemptOutcome } from "./delivery-state.service";
-import { lockCancellationNotice } from "./cancellation-notice-state.service";
+import {
+  deliveryAttemptOutcome,
+  deliveryDispatchPolicy,
+  deliveryGeneration,
+} from "./delivery-state.service";
+import {
+  lockCancellationNotice,
+  noticeReviewEvidence,
+  assertNoticeReview,
+} from "./cancellation-notice-state.service";
 
-/** Only the original never-started notice is dispatched by financial completion/recovery. */
+/** One source-owned claim for automatic initial work and exact reviewed retries. */
+export async function claimCancellationNotice(
+  id: string,
+  manual = false,
+  acknowledge = false,
+  attemptId: string = randomUUID(),
+) {
+  const evidence = await noticeReviewEvidence(id),
+    row = evidence.order;
+  if (manual)
+    assertNoticeReview(evidence, acknowledge, deliveryGeneration(row));
+  // The worker only starts the original queued intent. It never reclaims a send.
+  else if (row.status !== "pending" || row.attemptId !== null) return {};
+  const claim = await prisma.ticketCancellationNotice.updateMany({
+    where: { id, status: row.status, attemptId: row.attemptId },
+    data: {
+      status: "sending",
+      attemptId,
+      attemptedAt: new Date(),
+      error: null,
+    },
+  });
+  return claim.count ? { attemptId } : {};
+}
+
 export async function dispatchCancellationNoticeForTicket(ticketId: string) {
   const notice = await prisma.ticketCancellationNotice.findUnique({
     where: { ticketId },
@@ -20,77 +52,98 @@ export async function dispatchCancellationNoticeForTicket(ticketId: string) {
   return dispatchCancellationNotice(notice.id);
 }
 
-export async function dispatchCancellationNotice(id: string) {
-  const attemptId = randomUUID();
-  const claimed = await prisma.ticketCancellationNotice.updateMany({
-    where: { id, status: "pending", attemptId: null },
-    data: {
-      status: "sending",
-      attemptId,
-      attemptedAt: new Date(),
-      error: null,
-    },
-  });
-  if (!claimed.count)
-    return prisma.ticketCancellationNotice.findUniqueOrThrow({ where: { id } });
-  // The claim commits before the tracked send. A crash is unknown, never a replacement.
-  const original = await prisma.ticketCancellationNotice.findUniqueOrThrow({
-    where: { id },
-  });
-  let status = "failed",
-    error: string | null = null;
-  try {
-    if (!original.recipient)
-      error =
-        "The original holder has no phone number recorded; no notice was sent.";
-    else {
-      const history = await prisma.ticketDeliveryMessage.findMany({
-        where: { cancellationNoticeId: id, dispatchAttemptId: attemptId },
-      });
-      if (history.length)
-        throw new ApiError(
-          "The original notice generation already has send history; inspect its proof",
-          409,
-        );
-      await sendDeliveryMessage(
-        { cancellationNoticeId: id },
-        attemptId,
-        "whatsapp",
-        original.recipient,
-        (metadata) =>
-          sendTextMessage(original.recipient!, original.content, metadata),
+/** Only the already committed generation may dispatch; immutable send intent survives work rollback. */
+export async function dispatchClaimedCancellationNotice(
+  id: string,
+  attemptId: string,
+  finalize?: () => Promise<unknown>,
+  beforeSend?: () => Promise<void>,
+) {
+  const outcome = await prisma.$transaction(
+    async (tx) => {
+      await lockCancellationNotice(tx, id);
+      const evidence = await noticeReviewEvidence(id),
+        row = evidence.order;
+      if (row.status !== "sending" || row.attemptId !== attemptId)
+        return { status: row.status, error: row.error };
+      const original = deliveryAttemptOutcome(
+        evidence.messages.filter(
+          (message) => message.dispatchAttemptId === attemptId,
+        ),
       );
-      status = "sent";
-    }
-  } catch (failure) {
-    const history = await prisma.ticketDeliveryMessage.findMany({
-      where: { cancellationNoticeId: id, dispatchAttemptId: attemptId },
-    });
-    const outcome = deliveryAttemptOutcome(history);
-    // Even an intent-write failure is explicit. Only an actual rejected intent proves failed.
-    status = outcome?.status === "failed" ? "failed" : "unknown";
-    console.error(
-      "Original cancellation notice outcome unconfirmed:",
-      id,
-      failure,
-    );
-    error =
-      failure instanceof YeboLinkSendError
-        ? failure.message
-        : "The original notice outcome could not be confirmed. Inspect its saved message proof; it will not automatically be sent again.";
-  }
-  await prisma.$transaction(async (tx) => {
-    await lockCancellationNotice(tx, id);
-    await tx.ticketCancellationNotice.updateMany({
+      if (original)
+        return {
+          status: original.status === "accepted" ? "sent" : original.status,
+          error: original.error,
+        };
+      const policy = deliveryDispatchPolicy(evidence);
+      if (!policy.canRetry && policy.status === "sent")
+        return { status: "suppressed", error: policy.reason };
+      if (!row.recipient)
+        return {
+          status: "failed",
+          error:
+            "The original holder has no phone number recorded; no notice was sent.",
+        };
+      if (beforeSend)
+        try {
+          await beforeSend();
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.statusCode !== 409)
+            throw error;
+          return { status: "failed", error: error.message };
+        }
+      try {
+        await sendDeliveryMessage(
+          { cancellationNoticeId: id },
+          attemptId,
+          "whatsapp",
+          row.recipient,
+          (metadata) => sendTextMessage(row.recipient!, row.content, metadata),
+        );
+        return { status: "sent", error: null };
+      } catch (failure) {
+        const history = await tx.ticketDeliveryMessage.findMany({
+          where: { cancellationNoticeId: id, dispatchAttemptId: attemptId },
+        });
+        const attempt = deliveryAttemptOutcome(history);
+        console.error(
+          "Original cancellation notice outcome unconfirmed:",
+          id,
+          failure,
+        );
+        return {
+          status: attempt?.status === "failed" ? "failed" : "unknown",
+          error:
+            failure instanceof YeboLinkSendError
+              ? failure.message
+              : "The original notice outcome could not be confirmed. Inspect its saved message proof; it will not automatically be sent again.",
+        };
+      }
+    },
+    { timeout: 60000 },
+  );
+  const record = async () => {
+    await lockCancellationNotice(prisma, id);
+    await prisma.ticketCancellationNotice.updateMany({
       where: { id, attemptId, status: "sending" },
       data: {
-        status,
-        error,
-        ...(status === "sent" ? { sentAt: new Date() } : {}),
+        ...outcome,
+        ...(outcome.status === "sent" ? { sentAt: new Date() } : {}),
       },
     });
-  });
-  return prisma.ticketCancellationNotice.findUniqueOrThrow({ where: { id } });
+    if (finalize) await finalize();
+    return prisma.ticketCancellationNotice.findUniqueOrThrow({ where: { id } });
+  };
+  return staffAdminScope.transaction(record);
+}
+
+/** Financial completion/recovery dispatches only never-started work. */
+export async function dispatchCancellationNotice(id: string) {
+  const claim = await claimCancellationNotice(id);
+  return claim.attemptId
+    ? dispatchClaimedCancellationNotice(id, claim.attemptId)
+    : prisma.ticketCancellationNotice.findUniqueOrThrow({ where: { id } });
 }
 
 export async function recoverCancellationNotices() {

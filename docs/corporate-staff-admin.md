@@ -141,8 +141,24 @@ The native Cancellation notices section reuses the shared workspace and central
 proof actions. Original recipient and free-form message content are omitted from
 read models; ticket-only access cannot bypass financial redaction through message
 text. Useful interruption errors are visible without exposing database internals.
-Explicit CEO-reviewed retry/reconciliation of failed or unknown notices remains
-a separate unfinished workflow.
+Explicit CEO-reviewed notice retries now reuse the same reviewed-message protocol
+as admission delivery. Each owning service retains its own evidence, claim and
+transport rules. Shared code owns exact initial audit/claim, immutable original
+intent, final audit/work/receipt, sealed command history and proof reconciliation.
+The selected notice binds its actual generation. Unknown prior sends require
+explicit acknowledgement of duplicate risk, including older unresolved history.
+Accepted/queued or delivered/read evidence prevents another send; late stronger
+proof suppresses an already-claimed retry. Source generation guards remain intact.
+The original saved recipient/content never change and a missing contact cannot be
+silently redirected. No financial operation or new ticket can occur. The existing
+message proof action can close the original notice retry and central CEO decision
+with one gateway read. Failed/unknown commands retain their original outcome when
+newer generations finish. Ticket deletion does not erase the notice intent.
+
+The source metadata supplies selected generation bindings and original notice
+retry history to the existing shared forms/decision queue. No separate product
+renderer, staff-as-product-user identity, compatibility alias or weaker lease was
+introduced.
 
 Retry requests bind the exact current work generation as well as the reviewed
 order. A genuinely unattempted order has no fabricated attempt record. The
@@ -269,7 +285,7 @@ invented gateway history. See [recovery](refund-recovery.md) and
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- One hundred and one actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- 124 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -300,12 +316,18 @@ invented gateway history. See [recovery](refund-recovery.md) and
   grants, post-claim cancellation/contact/proof changes, historical outcomes and
   concurrent retained-history reads. An actual blocked-User/NOWAIT Event/Ticket
   probe verifies the contact-lock order.
+  Notice cases cover immutable paid/free intent, financial/notice rollback,
+  initial recovery and preserved history after deletion. Reviewed notice cases
+  additionally verify no money/ticket effects, CEO-only execution, unknown-risk
+  and exact-generation binding, older uncertainty, critical initial/final writes,
+  original receipt recovery/synchronization, concurrent approvals and late
+  delivered proof suppressing dispatch.
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
-- CEO guarded build and focused native permission tests passed; 326 frontend
-  tests and the guarded frontend build passed. Existing Jobs (38) and Learn (23)
-  actual HTTP/PostgreSQL suites passed against the changed shared adapter.
+- CEO guarded build passed. Earlier focused native permission, 326 frontend
+  tests/build and Jobs (38)/Learn (23) actual HTTP/PostgreSQL regressions remain
+  applicable: this batch changes no shared CEO adapter or frontend logic.
 - Disposable local desktop/mobile browser review verified a finance request,
   named organiser selection, CEO-only execution, saved corporate attribution and
   related ticket records. A second browser journey verified ticket-only named
@@ -344,6 +366,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
   saved completed result with separate queued and delivered evidence. Mobile
   status filtering fit the 390px viewport; original recipients/message text were
   absent from the ticket-staff read view. No message was sent by the proof read.
+  The notice-retry walkthrough verified known-failure and unknown-send staff
+  requests, explicit duplicate-risk acknowledgement, CEO execution and retained
+  original retry/message history. The older unknown attempt remains beside the
+  new accepted/queued message. Desktop and 390px layouts passed; temporary
+  viewport changes were reset. All sends stayed in the local Link fixture.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -360,6 +387,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   `yebotickets_retry_schema_fixture_20261123`.
   The complete final history through cancellation-notice work replayed on fresh
   `yebotickets_notice_schema_fixture_20261123`.
+  The complete history through reviewed notice retries replayed on fresh
+  `yebotickets_notice_retry_schema_fixture_20261123`.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -384,10 +413,13 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining source inventory and native workflows: explicit CEO-reviewed
-failed/unknown cancellation-notice retries, account workflows and configuration
-where the owning product supports it. Initial durable notice tracking, never-started
-recovery and original proof checks are implemented; this does not claim whole-product acceptance.
+Complete the remaining source account workflows and configuration where supported.
+The existing organiser deletion route and role-based profile field projection
+remain to be integrated with exact corporate targets and retained financial history.
+Currency/commission currently live in environment configuration; the inspected
+source has no runtime settings API. Do not present fictional working settings.
+Notice tracking, initial recovery, explicit reviewed retries and original proof
+checks are implemented; this does not claim whole-product acceptance.
 Add explicit environment selection, environment-scoped grants and
 environment-bound approvals before claiming both environments are manageable.
 Current connection registration targets production only.

@@ -112,7 +112,16 @@ export function deliveryAttemptOutcome(messages: DispatchState["messages"]) {
   );
 }
 /** Accepted is not delivered. Both prevent automatic replacement; uncertainty requires explicit risk review. */
-export function deliveryDispatchPolicy({ order, messages }: DispatchState) {
+export function deliveryDispatchPolicy({
+  order,
+  messages,
+}: {
+  order: Pick<
+    DispatchState["order"],
+    "status" | "attemptId" | "attemptedAt" | "error"
+  >;
+  messages: DispatchState["messages"];
+}) {
   if (
     !["pending", "sending", "sent", "failed", "unknown", "suppressed"].includes(
       order.status,
@@ -186,7 +195,7 @@ export function deliveryDispatchPolicy({ order, messages }: DispatchState) {
   if (order.status === "sent" && !uncertain && !provenFailed)
     return no(
       "sent",
-      "The original order records message acceptance. No unaccepted delivery is available to retry.",
+      "The original delivery records message acceptance. No unaccepted delivery is available to retry.",
     );
   return {
     canRetry: true,
@@ -194,7 +203,7 @@ export function deliveryDispatchPolicy({ order, messages }: DispatchState) {
     status: uncertain ? "unknown" : order.status,
     reason: uncertain
       ? "A message may already have been sent. Retrying requires explicit acknowledgement of duplicate risk."
-      : "Only this original order can be retried; no charge or new ticket is created.",
+      : "Only this original delivery can be retried; no charge or new ticket is created.",
   };
 }
 

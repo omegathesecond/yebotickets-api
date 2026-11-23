@@ -99,6 +99,19 @@ const create = (
   required: [field, "reason", ...required],
   target: { model, field },
 });
+const messageRetryFields = {
+  generationId: {
+    type: "string",
+    title: "Original message generation",
+    pattern:
+      "^(unattempted|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+  },
+  acknowledgeDuplicateRisk: {
+    type: "boolean",
+    title: "I understand this retry may send a duplicate message",
+    default: false,
+  },
+};
 const paged = { collection: "records", total: "total" };
 export const operations: Record<string, any> = {
   admin_stats: read(
@@ -573,7 +586,7 @@ export const operations: Record<string, any> = {
       ...pagination,
       status: {
         type: "string",
-        enum: ["pending", "sending", "sent", "failed", "unknown"],
+        enum: ["pending", "sending", "sent", "failed", "unknown", "suppressed"],
       },
     },
     paged,
@@ -617,22 +630,49 @@ export const operations: Record<string, any> = {
       "deliveryOrder",
       {
         id: { type: "string", minLength: 1, maxLength: 512 },
-        generationId: {
-          type: "string",
-          title: "Original delivery generation",
-          pattern:
-            "^(unattempted|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-        },
-        acknowledgeDuplicateRisk: {
-          type: "boolean",
-          title: "I understand this retry may send a duplicate message",
-          default: false,
-        },
+        ...messageRetryFields,
       },
       ["generationId"],
     ),
     method: "POST",
     external: true,
+  },
+  admin_retry_cancellation_notice: {
+    ...change(
+      "Retry original cancellation notice",
+      "/cancellation-notices/:id/retry",
+      "tickets",
+      "cancellationNotice",
+      messageRetryFields,
+      ["generationId"],
+    ),
+    method: "POST",
+    external: true,
+  },
+  admin_notice_retries: read(
+    "Corporate cancellation notice retries",
+    "/cancellation-notice-retries",
+    "tickets",
+    { ...pagination },
+    paged,
+  ),
+  admin_notice_retry: read(
+    "Original cancellation notice retry",
+    "/cancellation-notice-retries/:id",
+    "tickets",
+    { id },
+  ),
+  admin_check_notice_retry: {
+    ...change(
+      "Check original cancellation notice retry",
+      "/cancellation-notice-retries/:id/check",
+      "tickets",
+      "noticeRetry",
+      {},
+      [],
+    ),
+    method: "POST",
+    reconcilesOriginalReceipt: true,
   },
   admin_delivery_retries: read(
     "Corporate delivery retries",

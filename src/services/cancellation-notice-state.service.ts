@@ -2,6 +2,11 @@ import type { Prisma, TicketCancellationNotice } from "@prisma/client";
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
 import { CURRENCY } from "../config/platform";
+import { hashIntent } from "@omevision/product-admin-boundary";
+import {
+  deliveryDispatchPolicy,
+  deliveryGeneration,
+} from "./delivery-state.service";
 import { formatPhone } from "../utils/phone";
 
 /** Save with the actual financial finalization, never inferred from an old cancellation. */
@@ -88,15 +93,90 @@ export async function lockCancellationNotice(
 }
 
 export async function cancellationNoticeRecord(id: string) {
-  const notice = await prisma.ticketCancellationNotice.findUnique({
-    where: { id },
-  });
-  if (!notice)
-    throw new ApiError("Original cancellation notice was not found", 404);
+  const evidence = await noticeReviewEvidence(id),
+    notice = evidence.order;
+  const policy = deliveryDispatchPolicy(evidence);
+  let retryAvailable = policy.canRetry,
+    retryReason = policy.reason;
+  if (retryAvailable)
+    try {
+      assertNoticeReview(evidence, true, deliveryGeneration(notice));
+    } catch (error) {
+      if (
+        !(error instanceof ApiError) ||
+        ![409, 429].includes(error.statusCode)
+      )
+        throw error;
+      retryAvailable = false;
+      retryReason = error.message;
+    }
   return {
     ...cancellationNoticeView(notice),
+    generationId: deliveryGeneration(notice),
+    retryAvailable,
+    duplicateRiskAcknowledgementRequired:
+      policy.canRetry && policy.duplicateRisk,
+    retryReason,
     note: "Financial completion and message delivery are separate. Sent records acceptance only. Unknown notices may already have been sent and are never automatically retried. The original recipient and content cannot change.",
   };
+}
+
+export async function noticeReviewEvidence(id: string, lock = false) {
+  if (lock) await lockCancellationNotice(prisma, id);
+  const order = await prisma.ticketCancellationNotice.findUnique({
+    where: { id },
+  });
+  if (!order)
+    throw new ApiError("Original cancellation notice was not found", 404);
+  const messages = await prisma.ticketDeliveryMessage.findMany({
+    where: { cancellationNoticeId: id },
+    orderBy: { id: "asc" },
+  });
+  return { order, messages };
+}
+/** The immutable notice intent and prior proof are fixed; claiming changes only work fields. */
+export function noticeContentVersion({
+  order,
+  messages,
+}: Awaited<ReturnType<typeof noticeReviewEvidence>>) {
+  const {
+    status,
+    attemptId,
+    attemptedAt,
+    sentAt,
+    error,
+    updatedAt,
+    ...intent
+  } = order;
+  return hashIntent({ intent, messages });
+}
+export function assertNoticeReview(
+  evidence: Awaited<ReturnType<typeof noticeReviewEvidence>>,
+  acknowledge: boolean,
+  generation: string,
+) {
+  if (generation !== deliveryGeneration(evidence.order))
+    throw new ApiError(
+      "The original notice generation changed; prepare a fresh exact review",
+      409,
+    );
+  const policy = deliveryDispatchPolicy(evidence);
+  if (!policy.canRetry || (policy.duplicateRisk && !acknowledge))
+    throw new ApiError(policy.reason, 409);
+  if (!evidence.order.recipient)
+    throw new ApiError(
+      "The original notice has no recorded phone number. It cannot be redirected by a retry.",
+      409,
+    );
+  if (
+    evidence.order.attemptedAt &&
+    Date.now() - evidence.order.attemptedAt.getTime() < 60000
+  )
+    throw new ApiError(
+      "Please wait one minute before retrying the notice.",
+      429,
+    );
+  return policy;
 }
 
 /** One read projection for list/detail; free-form content cannot bypass money grants. */

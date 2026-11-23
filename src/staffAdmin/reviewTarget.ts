@@ -20,8 +20,12 @@ import {
   assertDeliveryReview,
   lockOrderDelivery,
 } from "../services/delivery-state.service";
-import { lockCancellationNotice } from "../services/cancellation-notice-state.service";
-import { deliveryRetryView } from "./deliveryRetries";
+import {
+  lockCancellationNotice,
+  noticeReviewEvidence,
+  assertNoticeReview,
+} from "../services/cancellation-notice-state.service";
+import { deliveryRetries, noticeRetries } from "./deliveryRetries";
 const tables: Record<string, string> = {
   user: "User",
   event: "Event",
@@ -56,7 +60,9 @@ export const targetKey = (name: string, parameters: Record<string, any>) => {
     op.target.model +
     ":" +
     parameters[op.target.field] +
-    (name === "admin_retry_delivery" ? ":" + parameters.generationId : "")
+    (["admin_retry_delivery", "admin_retry_cancellation_notice"].includes(name)
+      ? ":" + parameters.generationId
+      : "")
   );
 };
 export async function review(
@@ -65,6 +71,28 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (name === "admin_retry_cancellation_notice") {
+    const evidence = await noticeReviewEvidence(parameters.id, lock);
+    const policy = assertNoticeReview(
+      evidence,
+      parameters.acknowledgeDuplicateRisk === true,
+      parameters.generationId,
+    );
+    return {
+      version: hashIntent({ name, parameters, evidence }),
+      workspace: {
+        id: evidence.order.id,
+        name: evidence.order.eventTitle,
+        ticketCode: evidence.order.ticketCode,
+        previousAttemptId: evidence.order.attemptId,
+        previousDeliveryStatus: evidence.order.status,
+        acknowledgeDuplicateRisk: parameters.acknowledgeDuplicateRisk === true,
+        duplicateRisk: policy.duplicateRisk,
+        policy: policy.reason,
+        note: "Retry only this immutable cancellation notice and original recipient. No money or new tickets. Message acceptance is not customer receipt.",
+      },
+    };
+  }
   if (name === "admin_retry_delivery") {
     const evidence = await deliveryReviewEvidence(parameters.id, lock);
     const policy = assertDeliveryReview(
@@ -87,8 +115,12 @@ export async function review(
       },
     };
   }
-  if (name === "admin_check_delivery_retry") {
-    const original = await deliveryRetryView(parameters.id);
+  if (
+    ["admin_check_delivery_retry", "admin_check_notice_retry"].includes(name)
+  ) {
+    const original = await (
+      name === "admin_check_delivery_retry" ? deliveryRetries : noticeRetries
+    ).view(parameters.id);
     return {
       version: hashIntent({
         name,
@@ -98,7 +130,7 @@ export async function review(
       }),
       workspace: {
         id: original.id,
-        name: "Original approved delivery retry",
+        name: "Original approved message retry",
         dispatchAttemptId: original.dispatchAttemptId,
         status: original.status,
         policy: original.note,

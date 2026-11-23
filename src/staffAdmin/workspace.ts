@@ -279,6 +279,8 @@ export default {
       total: "total",
       detail: "admin_cancellation_notice",
       bind: { id: "id" },
+      actionBind: { id: "id", generationId: "generationId" },
+      actions: ["admin_retry_cancellation_notice"],
       columns: [
         "eventTitle",
         "ticketCode",
@@ -310,6 +312,22 @@ export default {
             "createdAt",
           ],
         },
+      ],
+    },
+    {
+      id: "noticeRetries",
+      label: "Cancellation notice retry requests",
+      operation: "admin_notice_retries",
+      collection: "records",
+      total: "total",
+      detail: "admin_notice_retry",
+      bind: { id: "id" },
+      actions: ["admin_check_notice_retry"],
+      columns: [
+        "cancellationNoticeId",
+        "operationState",
+        "staffName",
+        "createdAt",
       ],
     },
     {
