@@ -84,6 +84,24 @@ function reviewedRuntimeBaseline(
   };
 }
 
+/** Connection identity is host/database, not the runtime versus migration role. */
+function validateImportConnections(direct, pooled) {
+  const a = new URL(direct),
+    b = new URL(pooled);
+  if (
+    ![a, b].every((url) =>
+      ["postgresql:", "postgres:"].includes(url.protocol),
+    ) ||
+    a.hostname.includes("-pooler") ||
+    a.hostname !== b.hostname.replace("-pooler", "") ||
+    a.pathname !== b.pathname ||
+    a.pathname === "/"
+  )
+    throw new Error(
+      "Direct migration connection does not match the selected runtime database",
+    );
+}
+
 /** Stable bootstrap replay cannot overwrite a subsequent CEO decision. */
 async function importSettings(client, baseline) {
   if (baseline.id !== PLATFORM_SETTINGS_ID || !baseline.initializedFromRevision)
@@ -109,4 +127,9 @@ async function importSettings(client, baseline) {
     return tx.platformSettings.create({ data: baseline });
   });
 }
-module.exports = { runtimeTarget, reviewedRuntimeBaseline, importSettings };
+module.exports = {
+  runtimeTarget,
+  reviewedRuntimeBaseline,
+  importSettings,
+  validateImportConnections,
+};

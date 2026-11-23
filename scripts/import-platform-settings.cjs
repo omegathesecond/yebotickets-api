@@ -5,6 +5,7 @@ const {
   runtimeTarget,
   reviewedRuntimeBaseline,
   importSettings,
+  validateImportConnections,
 } = require("./lib/platform-settings-import.cjs");
 
 async function main() {
@@ -90,18 +91,7 @@ async function main() {
     ]).trim();
   const direct = secret(target.direct),
     pooled = secret(target.database);
-  const a = new URL(direct),
-    b = new URL(pooled);
-  if (
-    !["postgresql:", "postgres:"].includes(a.protocol) ||
-    a.hostname.includes("-pooler") ||
-    a.hostname !== b.hostname.replace("-pooler", "") ||
-    a.pathname !== b.pathname ||
-    a.username !== b.username
-  )
-    throw new Error(
-      "Direct migration connection does not match the selected runtime database",
-    );
+  validateImportConnections(direct, pooled);
   // Revalidate immediately before the local transaction. Hold deployment/config
   // changes during the reviewed import; no distributed GCP/SQL lock is claimed.
   reviewedRuntimeBaseline(
