@@ -1,11 +1,7 @@
 import { Router, Request } from "express";
 import {
   createStaffAdminBoundary,
-  createPostgresOperationStore,
   matchOperation,
-  validateParams,
-  hashIntent,
-  redact,
 } from "@omevision/product-admin-boundary";
 import prisma, { staffAdminScope } from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
@@ -36,113 +32,18 @@ import {
   updateTicketType,
   deleteTicketType,
   generateTickets,
+  refundTicket,
+  reconcileRefundAttempt,
 } from "../services/ticket.service";
 import { verifyCorporateWorkload } from "./workloadIdentity";
 import { operations } from "./operations";
 import workspace from "./workspace";
 import { operationInput, validateOperationInput } from "./inputs";
 
-const store = createPostgresOperationStore(async (query, values) => ({
-  rows: await prisma.$queryRawUnsafe<any[]>(query, ...values),
-}));
-const tables: Record<string, string> = {
-  user: "User",
-  event: "Event",
-  payoutRequest: "PayoutRequest",
-  ticketType: "TicketType",
-};
+import { staffOperationStore as store } from "./receipts";
+import { checked, targetKey, review } from "./reviewTarget";
+import { recordStaffOperation, verifiedStaffOperation } from "./audit";
 const fail = (message: string, status = 400) => new ApiError(message, status);
-function checked(name: string, parameters: Record<string, any>) {
-  const op = Object.prototype.hasOwnProperty.call(operations, name)
-    ? operations[name]
-    : null;
-  if (!op) throw fail("Unknown Tickets administration operation", 404);
-  const result = validateParams(
-    {
-      type: "object",
-      properties: op.properties,
-      required: op.required,
-      additionalProperties: false,
-    },
-    parameters,
-  );
-  if (!result.ok)
-    throw fail("Invalid operation fields: " + result.errors.join(", "));
-  return op;
-}
-const targetKey = (name: string, parameters: Record<string, any>) => {
-  const op = checked(name, parameters);
-  if (!op.target) throw fail("Choose an operation that changes a record");
-  return "yebotickets:" + op.target.model + ":" + parameters[op.target.field];
-};
-async function review(
-  name: string,
-  parameters: Record<string, any>,
-  lock = false,
-) {
-  const op = checked(name, parameters),
-    table = op.target && tables[op.target.model];
-  if (!table) throw fail("This operation has no editable target");
-  await validateOperationInput(name, parameters);
-  const rows = await prisma.$queryRawUnsafe<any[]>(
-    `SELECT * FROM "${table}" WHERE id=$1${lock ? " FOR UPDATE" : ""}`,
-    parameters[op.target.field],
-  );
-  if (!rows.length) throw fail("The product record was not found", 404);
-  if (op.target.model === "user" && rows[0].role !== "organizer")
-    throw fail("Choose an organiser account", 404);
-  const inventory =
-    op.target.model === "ticketType" || name === "admin_delete_event"
-      ? await prisma.$queryRawUnsafe<any[]>(
-          `SELECT id,status,"userId","updatedAt" FROM "Ticket" WHERE "${op.target.model === "ticketType" ? "ticketTypeId" : "eventId"}"=$1 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
-          parameters[op.target.field],
-        )
-      : undefined;
-  const tiers =
-    name === "admin_delete_event"
-      ? await prisma.$queryRawUnsafe<any[]>(
-          `SELECT * FROM "TicketType" WHERE "eventId"=$1 ORDER BY id${lock ? " FOR UPDATE" : ""}`,
-          parameters[op.target.field],
-        )
-      : undefined;
-  return {
-    version: hashIntent({ name, parameters, rows, inventory, tiers }),
-    workspace: {
-      id: rows[0].id,
-      name: rows[0].name ?? rows[0].title ?? op.title,
-      ...(name === "admin_delete_event"
-        ? {
-            ticketRecords: inventory!.length,
-            tierDefinitions: tiers!.length,
-            policy:
-              "Delete only an empty event. Its reviewed empty tier definitions will also be removed. Issued inventory and payment history must be kept.",
-          }
-        : {}),
-      ...(op.target.model === "ticketType"
-        ? {
-            eventId: rows[0].eventId,
-            price: rows[0].price,
-            capacity: rows[0].quantity,
-            inventoryRecords: inventory!.length,
-            policy:
-              "Capacity includes sold, reserved and cancelled records. Generation adds available tickets; it does not sell, charge or send them. Deletion retains issued ticket and payment history.",
-          }
-        : {}),
-      ...(op.target.model === "payoutRequest"
-        ? {
-            amount: rows[0].amount,
-            currency: rows[0].currency,
-            status: rows[0].status,
-            destinationMethod: rows[0].destinationMethod,
-            destinationAccountName: rows[0].destinationAccountName,
-            destinationAccountNumber: rows[0].destinationAccountNumber,
-            policy:
-              "Approving reserves the existing payout request. Recording paid stores an already completed external transfer; it sends no payment.",
-          }
-        : {}),
-    },
-  };
-}
 const page = (parameters: Record<string, any>) => ({
   page: parameters.page ?? 1,
   limit: parameters.limit ?? 20,
@@ -184,12 +85,16 @@ export function createCorporateAdminRouter(
           req.res!.locals.native.name,
           req.res!.locals.native.parameters,
         ),
-      reviewTarget: (req, lock) =>
-        review(
+      reviewTarget: async (req, lock) => {
+        const target = await review(
           req.res!.locals.native.name,
           req.res!.locals.native.parameters,
           lock,
-        ),
+        );
+        req.res!.locals.nativeTargetVersion = target.version;
+        return target;
+      },
+      external: (req) => req.res!.locals.native?.operation.external === true,
       async onVerified(req) {
         const matched = matchOperation(operations, req.method, req.path);
         if (!matched && !["/capabilities", "/review-target"].includes(req.path))
@@ -430,11 +335,156 @@ export function createCorporateAdminRouter(
             { adminNote: p.reason, reference: p.reference },
           );
           break;
+        case "admin_ticket_record":
+          data = await prisma.ticket.findUniqueOrThrow({
+            where: { id: p.id },
+            select: {
+              id: true,
+              uniqueCode: true,
+              status: true,
+              isCheckedIn: true,
+              eventId: true,
+              event: { select: { title: true, isCancelled: true } },
+              ticketType: { select: { name: true } },
+              user: { select: { name: true } },
+              amountPaid: true,
+              paymentRef: true,
+              paymentStatus: true,
+              refundAttemptId: true,
+              refundGatewayRequestId: true,
+              refundRef: true,
+              refundedAt: true,
+              refundRequestedAt: true,
+              refundRequestReason: true,
+            },
+          });
+          break;
+        case "admin_refund_ticket": {
+          const context = verifiedStaffOperation(req);
+          const outcome = await refundTicket(
+            p.id,
+            undefined,
+            p.reason,
+            context,
+          );
+          const receipt = await store.get(context.id);
+          if (
+            !receipt ||
+            !["completed", "failed"].includes(receipt.state ?? "") ||
+            typeof receipt.responseStatus !== "number" ||
+            !receipt.responseBody
+          )
+            throw fail(
+              "The original refund is unresolved; check its original proof before another request",
+              502,
+            );
+          return res
+            .status(receipt.responseStatus)
+            .json({
+              ...receipt.responseBody,
+              data: {
+                ...receipt.responseBody.data,
+                holderNotification: {
+                  notified: outcome.notified,
+                  error: outcome.notifyError ?? null,
+                },
+              },
+            });
+        }
+        case "admin_check_refund": {
+          const claim = await prisma.ticketRefundLock.findUnique({
+            where: { attemptId: p.attemptId },
+          });
+          if (claim) {
+            if (claim.ticketId !== p.id)
+              throw fail(
+                "Original refund does not belong to the selected ticket",
+                409,
+              );
+            data = await reconcileRefundAttempt(
+              claim.chargeId,
+              claim.attemptId,
+            );
+          } else {
+            const ticket = await prisma.ticket.findUniqueOrThrow({
+              where: { id: p.id },
+            });
+            if (
+              ticket.refundAttemptId !== p.attemptId ||
+              ticket.paymentStatus !== "REFUNDED" ||
+              ticket.status !== "cancelled"
+            )
+              throw fail("Original refund proof was not found", 409);
+            data = {
+              status: "FINALIZED",
+              ticketId: ticket.id,
+              refundAttemptId: p.attemptId,
+              refundRef: ticket.refundRef,
+              note: "The original verified completion is already stored. No new refund was sent.",
+            };
+          }
+          const originals = await prisma.$queryRawUnsafe<any[]>(
+            `SELECT a.id,o.state FROM staff_admin_audit a JOIN staff_admin_operations o ON o.id=a.id WHERE a.id=$1::uuid AND a.operation='admin_refund_ticket' AND a.parameters->>'id'=$2`,
+            p.attemptId,
+            p.id,
+          );
+          if (claim?.corporateOperationId && !originals.length)
+            throw fail(
+              "The original corporate refund receipt was not found",
+              409,
+            );
+          data = {
+            ...data,
+            originalOperationId: originals[0]?.id ?? null,
+            originalOperationState: originals[0]?.state ?? null,
+            notificationNote:
+              "Checking original refund proof does not send a holder notification.",
+          };
+          break;
+        }
+        case "admin_refunds": {
+          const { page: pg, limit } = page(p);
+          const [records, count] = await Promise.all([
+            prisma.$queryRawUnsafe<any[]>(
+              `SELECT a.id,a."staffName",a.parameters->>'id' AS "ticketId",a.parameters->'reviewedEffect'->>'uniqueCode' AS "ticketCode",a.parameters->'reviewedEffect'->>'amount' AS amount,a.parameters->'reviewedEffect'->>'currency' AS currency,a.parameters->>'reason' AS reason,o.state AS "operationState",o."responseBody"->'data'->>'status' AS "refundStatus",o."responseBody"->>'error' AS error,a."createdAt" FROM staff_admin_audit a JOIN staff_admin_operations o ON o.id=a.id WHERE a.operation='admin_refund_ticket' ORDER BY a."createdAt" DESC,a.id LIMIT $1 OFFSET $2`,
+              limit,
+              (pg - 1) * limit,
+            ),
+            prisma.$queryRawUnsafe<any[]>(
+              `SELECT COUNT(*)::integer AS total FROM staff_admin_audit WHERE operation='admin_refund_ticket'`,
+            ),
+          ]);
+          data = { records, total: count[0].total };
+          break;
+        }
+        case "admin_refund_record": {
+          const audit = await prisma.$queryRawUnsafe<any[]>(
+            `SELECT id,parameters,"staffName","createdAt" FROM staff_admin_audit WHERE id=$1::uuid AND operation='admin_refund_ticket'`,
+            p.id,
+          );
+          if (!audit.length)
+            throw fail("Original corporate refund was not found", 404);
+          const receipt = await store.get(p.id);
+          if (!receipt)
+            throw fail("Original corporate receipt was not found", 404);
+          data = {
+            id: p.id,
+            ...audit[0],
+            operationState: receipt.state,
+            responseStatus: receipt.responseStatus,
+            receipt: receipt.responseBody,
+          };
+          break;
+        }
         case "admin_refund_recovery":
-          data = { records: await listRefundRecovery() };
+          data = {
+            records: (await listRefundRecovery()).map(
+              ({ action, ...record }) => ({ ...record, id: record.ticketId }),
+            ),
+          };
           break;
         case "admin_operation_receipt":
-          data = await store.get(p.id);
+          data = await store.get(p.operationId);
           if (!data)
             throw fail("Original corporate receipt was not found", 404);
           break;
@@ -457,16 +507,7 @@ export function createCorporateAdminRouter(
           throw fail("Unknown Tickets administration operation", 404);
       }
       if (req.method !== "GET")
-        await prisma.$executeRawUnsafe(
-          'INSERT INTO staff_admin_audit(id,"staffId","staffName","staffEmail",operation,"targetKey",parameters) VALUES($1::uuid,$2,$3,$4,$5,$6,$7::jsonb)',
-          req.get("Idempotency-Key"),
-          actor.id,
-          actor.name ?? null,
-          actor.email ?? null,
-          name,
-          targetKey(name, p),
-          JSON.stringify(redact(p)),
-        );
+        await recordStaffOperation(verifiedStaffOperation(req));
       res.json({ success: true, data });
     } catch (error) {
       next(error);

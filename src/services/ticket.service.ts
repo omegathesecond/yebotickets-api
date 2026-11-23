@@ -1,7 +1,10 @@
 import { assertEventVisible, eventOwnershipFilter, EventViewer } from '../utils/eventVisibility';
 import { assertDateInterval } from '../utils/dateInterval';
 import type { Prisma } from '@prisma/client';
-import prisma from '../config/prisma';
+import prisma, { staffAdminScope } from '../config/prisma';
+import type { StaffOperationContext } from '../staffAdmin/audit';
+import { prepareCorporateRefund, finishCorporateRefund, failCorporateRefund } from '../staffAdmin/refundReceipt';
+import { ticketRefundTerms } from './ticket-refund-terms';
 import { 
   ITicket, 
   ITicketType, 
@@ -1696,7 +1699,7 @@ type CheckInRequester = { id: string; role: string };
  */
 const assertEventAccess = async (
   eventId: string,
-  requester: CheckInRequester
+  requester: CheckInRequester | undefined
 ): Promise<void> => {
   const event = await prisma.event.findUnique({
     where: { id: eventId },
@@ -1707,7 +1710,7 @@ const assertEventAccess = async (
     throw new ApiError('Event not found', 404);
   }
 
-  if (requester.role !== 'admin' && event.organizerId !== requester.id) {
+  if (!staffAdminScope.actor() && (!requester || requester.role !== 'admin' && event.organizerId !== requester.id)) {
     throw new ApiError('You do not have permission to check in tickets for this event', 403);
   }
 };
@@ -2073,32 +2076,56 @@ const notifyHolderOfCancellation = async (
  */
 const refundAndCancelTicket = async (
   ticket: any,
-  reason: string
+  reason: string,
+  operation?: StaffOperationContext
 ): Promise<TicketRefundOutcome> => {
   const base = { ticketId: ticket.id, uniqueCode: ticket.uniqueCode };
+  if (staffAdminScope.actor() && !operation) {
+    throw new ApiError('A saved corporate refund operation is required', 401);
+  }
 
   // --- Idempotent short-circuit: already cancelled/refunded. ---------------
   if (ticket.status === 'cancelled' || ticket.paymentStatus === 'REFUNDED') {
+    if (operation) {
+      await prepareCorporateRefund(operation, ticket, async () => {
+        throw new ApiError('The original ticket changed; inspect its saved refund receipt', 409);
+      });
+    }
     return { ...base, result: 'already_handled', notified: false };
   }
 
-  const paid =
-    !!ticket.paymentRef &&
-    ticket.paymentStatus !== 'FREE' &&
-    (ticket.amountPaid ?? 0) > 0;
-
+  let terms: { paid: boolean; amount: number };
+  try {
+    terms = ticketRefundTerms(ticket);
+  } catch (error) {
+    if (operation) {
+      await prepareCorporateRefund(operation, ticket, async () => { throw error; });
+    }
+    return { ...base, result: 'refund_failed', notified: false, error: errorMessage(error) };
+  }
+  const paid = terms.paid;
   // --- Free ticket: nothing to refund, just void + notify. -----------------
   if (!paid) {
-    const claimed = await prisma.ticket.updateMany({
-      where: { id: ticket.id, status: { not: 'cancelled' } },
-      data: {
-        status: 'cancelled',
-        cancelledAt: new Date(),
-        // Clear any pending buyer refund request — it's now handled.
-        refundRequestedAt: null,
-        refundRequestReason: null,
-      },
-    });
+    const cancel = async (client: Prisma.TransactionClient) => {
+      const claimed = await client.ticket.updateMany({
+        where: { id: ticket.id, status: { not: 'cancelled' } },
+        data: {
+          status: 'cancelled',
+          cancelledAt: new Date(),
+          // Clear any pending buyer refund request — it's now handled.
+          refundRequestedAt: null,
+          refundRequestReason: null,
+        },
+      });
+    if (operation) {
+        const saved = await client.ticket.findUniqueOrThrow({ where: { id: ticket.id } });
+        await finishCorporateRefund(client, operation.id, saved, 'CANCELLED_FREE');
+      }
+      return claimed;
+    };
+    const claimed = operation
+      ? await prepareCorporateRefund(operation, ticket, cancel)
+      : await cancel(prisma);
     if (claimed.count === 0) {
       return { ...base, result: 'already_handled', notified: false };
     }
@@ -2125,18 +2152,23 @@ const refundAndCancelTicket = async (
 
   // A unique DB key, not a process-local mutex: protects concurrent workers and
   // different tickets on the same charge, including after a process restart.
-  const attemptId = crypto.randomUUID();
+  const attemptId = operation?.id ?? crypto.randomUUID();
   try {
-    await prisma.$transaction(async tx => {
+    const claim = async (tx: Prisma.TransactionClient) => {
       // Serialize refund dispatch admission with delivery. Once this durable
       // refund claim exists, delivery defers until it has been reconciled.
       if (ticket.deliveryOrderId) {
         await tx.$queryRaw`SELECT "id" FROM "TicketOrderDelivery" WHERE "id" = ${ticket.deliveryOrderId} FOR UPDATE`;
       }
       await tx.ticketRefundLock.create({
-        data: { chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED' },
+        data: {
+          chargeId: ticket.paymentRef, ticketId: ticket.id, amount, attemptId, phase: 'PREPARED',
+          ...(operation ? { corporateOperationId: operation.id } : {}),
+        },
       });
-    });
+    };
+    if (operation) await prepareCorporateRefund(operation, ticket, claim);
+    else await prisma.$transaction(claim);
   } catch (error) {
     if ((error as { code?: string }).code === 'P2002') {
       return failed('another refund is in progress or requires reconciliation for this charge');
@@ -2191,12 +2223,17 @@ const refundAndCancelTicket = async (
     // These gateway responses reject BEFORE processor dispatch. A 409 is a
     // rejection, never evidence that THIS ticket's refund succeeded.
     const rejected = error instanceof YeboPayHttpError && error.rejectedBeforeDispatch;
-    if (dispatched && rejected) {
-      await prisma.ticketRefundLock.update({ where: { chargeId: ticket.paymentRef, attemptId },
-        data: { phase: 'REJECTED', detail: errorMessage(error) } });
-    }
     if (!dispatched || rejected) {
-      await prisma.ticketRefundLock.deleteMany({ where: { chargeId: ticket.paymentRef, attemptId } });
+      await prisma.$transaction(async tx => {
+        const lock = await tx.ticketRefundLock.findUnique({ where: { chargeId: ticket.paymentRef } });
+        if (lock?.attemptId !== attemptId) return;
+        const removed = await tx.ticketRefundLock.deleteMany({
+          where: { chargeId: ticket.paymentRef, attemptId, phase: { not: 'CONFIRMED' } },
+        });
+        if (removed.count === 1 && lock.corporateOperationId) {
+          await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId, errorMessage(error));
+        }
+      });
     }
     console.error('YeboPay refund failed for ticket', ticket.id, error);
     return failed(`${errorMessage(error)}${dispatched && !rejected ? '; charge blocked pending reconciliation' : ''}`);
@@ -2228,8 +2265,9 @@ const refundAndCancelTicket = async (
  */
 export const refundTicket = async (
   ticketId: string,
-  requester: CheckInRequester,
-  reason?: string
+  requester: CheckInRequester | undefined,
+  reason?: string,
+  operation?: StaffOperationContext
 ): Promise<TicketRefundOutcome> => {
   try {
     const ticket = await prisma.ticket.findUnique({
@@ -2246,7 +2284,8 @@ export const refundTicket = async (
 
     const outcome = await refundAndCancelTicket(
       ticket,
-      reason || `Ticket ${ticket.uniqueCode} refunded by organizer`
+      reason || `Ticket ${ticket.uniqueCode} refunded by organizer`,
+      operation
     );
 
     if (outcome.result === 'refund_failed') {
@@ -2547,7 +2586,7 @@ const finalizeRefundAttempt = async (
     });
     if (released.count !== 1)
       throw new ApiError('Refund recovery already in progress', 409);
-    await tx.ticket.update({
+    const finalized = await tx.ticket.update({
       where: { id: lock.ticketId },
       data: {
         status: 'cancelled',
@@ -2561,6 +2600,9 @@ const finalizeRefundAttempt = async (
         refundRequestReason: null,
       },
     });
+    if (lock.corporateOperationId) {
+      await finishCorporateRefund(tx, lock.corporateOperationId, finalized, 'REFUNDED');
+    }
   });
 };
 
@@ -2595,14 +2637,16 @@ export const reconcileRefundAttempt = async (
   if (!lock || lock.attemptId !== attemptId)
     throw new ApiError('Refund attempt changed; reload recovery status', 409);
   if (['PREPARED', 'REJECTED'].includes(lock.phase)) {
-    const released = await prisma.ticketRefundLock.deleteMany({
-      where: { chargeId, attemptId, phase: lock.phase },
+    await prisma.$transaction(async tx => {
+      const released = await tx.ticketRefundLock.deleteMany({
+        where: { chargeId, attemptId, phase: lock.phase },
+      });
+      if (released.count !== 1) throw new ApiError('Refund dispatch started; reload recovery status', 409);
+      if (lock.corporateOperationId) {
+        await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId,
+          'The original refund was not dispatched. The paid ticket is unchanged.');
+      }
     });
-    if (released.count !== 1)
-      throw new ApiError(
-        'Refund dispatch started; reload recovery status',
-        409,
-      );
     return { status: 'RETRYABLE', ticketId: lock.ticketId };
   }
   const charge = await getCharge(chargeId);
@@ -2633,14 +2677,16 @@ export const reconcileRefundAttempt = async (
     return { status: 'FINALIZED', ticketId: lock.ticketId };
   }
   if (state === 'FAILED') {
-    const released = await prisma.ticketRefundLock.deleteMany({
-      where: { chargeId, attemptId, phase: { not: 'CONFIRMED' } },
+    await prisma.$transaction(async tx => {
+      const released = await tx.ticketRefundLock.deleteMany({
+        where: { chargeId, attemptId, phase: { not: 'CONFIRMED' } },
+      });
+      if (released.count !== 1) throw new ApiError('Refund confirmation changed; reload recovery status', 409);
+      if (lock.corporateOperationId) {
+        await failCorporateRefund(tx, lock.corporateOperationId, lock.ticketId,
+          'The original provider refund failed; the paid ticket was not cancelled.');
+      }
     });
-    if (released.count !== 1)
-      throw new ApiError(
-        'Refund confirmation changed; reload recovery status',
-        409,
-      );
     return {
       status: 'RETRYABLE',
       ticketId: lock.ticketId,

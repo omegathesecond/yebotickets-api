@@ -49,9 +49,41 @@ corporate staff separately from product-admin foreign keys.
 
 Payout approval reserves an existing request. Recording paid requires a reference
 for an external transfer already completed; it sends no payment. Terminal paid
-requests cannot be rejected. Native refund recovery is currently a read-only
-work queue; executing an exact refund/check or event cancellation through the
-CEO boundary remains open.
+requests cannot be rejected.
+
+Finance staff can select a purchase and prepare a refund for that exact ticket.
+The amount comes from its recorded allocation, with original gateway currency,
+mode, request and cumulative proof verified before local cancellation. Explicit
+FREE/zero/unreferenced tickets can be cancelled without a payment. Incomplete or
+unconfirmed payment evidence fails in both native and existing organiser flows.
+
+Corporate requests reuse the existing charge-wide refund lock and attempt. A
+new immutable corporate-operation association links the original approval to
+that existing attempt. Initial intent/audit/claim commit before dispatch; final
+financial audit, ticket cancellation, hold release and original receipt commit
+together after verified proof. A failed critical write retains the original
+hold for recovery. Late replies cannot overwrite terminal receipts.
+
+Refund recovery prepares a check bound to the selected ticket and original
+attempt. Checking proof never sends a new refund. It can safely fence a prepared
+sender before dispatch, retain pending payment, close proven failure or finalize
+the exact success. Its provider calls read original proof; the local check,
+audit, ticket accounting and receipt use the existing local transaction boundary.
+Read failures fail the check and preserve the original payment hold.
+
+The shared CEO adapter recognises the explicit capability
+`reconcilesOriginalReceipt: true` on writes. The owning check returns
+`originalOperationId` and `originalOperationState`; terminal states trigger the
+existing authoritative receipt lookup and refresh the original central decision.
+Non-corporate originals explicitly return null identities; no corporate approval
+history is manufactured. The receipt capability uses the existing canonical
+`operationId` parameter, with no alternate alias.
+
+Financial completion and holder notifications remain separate outcomes. Immediate
+notification failures are returned explicitly; proof checks send no notice and
+financial receipts make no delivery claim. Durable notice tracking/recovery
+remains part of the outstanding delivery work. Reviewed event cancellation
+batches remain unimplemented.
 
 ## Reuse inventory
 
@@ -100,34 +132,43 @@ invented gateway history. See [recovery](refund-recovery.md) and
 
 ## Local evidence
 
-- Product build and 524 tests across 33 suites passed. The tests include workload
+- Product build and 537 tests across 34 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- Twenty-five actual native Tickets/CEO HTTP/PostgreSQL checks passed with a
+- Forty-one actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
-  original receipts.
-- The separate actual Tickets/YeboPay refund fixture verifies original proof and
-  reconciliation. Payment and notification transports are simulated; no real
-  payment or message is sent.
+  original receipts, exact native refund/recovery, failure/timeout races,
+  financial audit/receipt rollback and automatic central receipt synchronization.
+- The separate actual Tickets/YeboPay refund fixture passed eleven checks for
+  existing organiser refunds and original-proof reconciliation. Payment and
+  notification transports are simulated; no real payment or message is sent.
 - CEO guarded build and focused native permission tests passed; 326 frontend
-  tests and the guarded frontend build passed.
+  tests and the guarded frontend build passed. Existing Jobs (38) and Learn (23)
+  actual HTTP/PostgreSQL suites passed against the changed shared adapter.
 - Disposable local desktop/mobile browser review verified a finance request,
   named organiser selection, CEO-only execution, saved corporate attribution and
   related ticket records. A second browser journey verified ticket-only named
-event/tier selection, a two-seat generation request, CEO execution, saved count,
-remaining inventory and full event creation with structured address/date fields.
-The 390px document fit its viewport. Sign-in uses the
-  explicitly isolated fixture identity, not production authentication. An
+  event/tier selection, a two-seat generation request, CEO execution, saved count,
+  remaining inventory and full event creation with structured address/date fields.
+  The refund journey verified a recorded SZL50 ticket despite its edited SZL999
+  tier price, CEO-approved pending refund, selected original-proof check, both
+  central receipts completing, saved financial history and the other ticket on
+  the same charge staying sold. The 390px document fit its viewport. Sign-in uses
+  the explicitly isolated fixture identity, not production authentication. An
   unrelated YeboShops review warning is visible because that route is absent
   from this local fixture; no successful data substitutes for it.
 - Proof migration history was replayed from scratch locally. The additional
-  corporate administration migration has been applied to the named localhost
-  fixture only; production migration remains pending.
+  corporate administration and corporate-refund association migrations were
+  applied to named localhost fixtures only. The complete history, including the
+  new refund association, replayed successfully on a fresh
+  `yebotickets_refund_schema_fixture_20261123` database. Production migration
+  remains pending.
 
-Run the shared fixture from the CEO API checkout after building both APIs:
+Run the existing organiser-refund fixture from the CEO API checkout after
+building both APIs:
 
 ```sh
 YEBOTICKETS_TEST_SOURCE=/path/to/yebotickets-api \
@@ -137,16 +178,21 @@ YEBOPAY_ADMIN_TEST_DATABASE_URL=postgresql://admin@127.0.0.1:55463/yebopay_admin
 node --import tsx scripts/test-yebotickets-refunds.mjs
 ```
 
+For the complete native suite, use the same source/database settings, also set
+`PRODUCT_ADMIN_TEST_DATABASE_URL` to the named local CEO fixture and
+`YEBOTICKETS_TEST_REFUNDS=1`, then run
+`node --import tsx scripts/test-yebotickets-admin.mjs`.
+
 The script reuses the CEO repository's guarded gateway fixture. It accepts only
 named localhost databases and blocks external HTTP transports. It exercises the
 existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining source inventory and native workflows: exact refund
-execution/original-proof checks, event cancellation with its reviewed child
-refund set, admission, delivery
-and purchase recovery, and configuration where the owning product supports it.
+Complete the remaining source inventory and native workflows: event cancellation
+with its reviewed child refund set, admission, durable cancellation-notice
+tracking/delivery recovery, purchase recovery, account workflows and configuration
+where the owning product supports it.
 Add explicit environment selection, environment-scoped grants and
 environment-bound approvals before claiming both environments are manageable.
 Current connection registration targets production only.
@@ -160,7 +206,10 @@ match its actual prod/dev `K_SERVICE`. No trigger or runtime was updated.
 CEO migration 129 uses the existing workload-auth registry contract and preserves
 an explicitly disabled connection. Product migration
 `20261123160000_corporate_administration` adds the shared operation store,
-critical audit and separate corporate-reviewer fields.
+critical audit and separate corporate-reviewer fields. Migration
+`20261123180000_corporate_refund_receipts` adds the immutable original association
+and unique attempt identity. Preflight duplicate attempt identities before release;
+never rewrite history to make the migration pass.
 
 Read-only runtime check on 23 November 2026 identified domain mappings for
 `yebotickets-api-prod` and `yebotickets-api-dev`, both running as

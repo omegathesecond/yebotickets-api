@@ -56,7 +56,8 @@ const eventFields = {
       city: text,
       country: text,
       coordinates: {
-        description: "Optional. Leave both coordinates blank to use the address.",
+        description:
+          "Optional. Leave both coordinates blank to use the address.",
         type: "object",
         properties: { lat: { type: "number" }, lng: { type: "number" } },
         required: ["lat", "lng"],
@@ -344,6 +345,47 @@ export const operations: Record<string, any> = {
     },
     ["reference"],
   ),
+  admin_ticket_record: read(
+    "Ticket payment and refund details",
+    "/tickets/:id",
+    "money",
+    { id },
+  ),
+  admin_refund_ticket: {
+    ...change(
+      "Refund this exact ticket",
+      "/tickets/:id/refund",
+      "money",
+      "ticket",
+      {},
+      [],
+    ),
+    method: "POST",
+    external: true,
+  },
+  admin_check_refund: {
+    reconcilesOriginalReceipt: true,
+    title: "Check the original refund",
+    path: "/tickets/:id/refunds/:attemptId/check",
+    area: "money",
+    method: "POST",
+    properties: { id, attemptId: id, reason },
+    required: ["id", "attemptId", "reason"],
+    target: { model: "refundAttempt", field: "attemptId" },
+  },
+  admin_refunds: read(
+    "Corporate ticket refunds",
+    "/refunds",
+    "money",
+    { ...pagination },
+    paged,
+  ),
+  admin_refund_record: read(
+    "Original corporate refund receipt",
+    "/refunds/:id",
+    "money",
+    { id },
+  ),
   admin_refund_recovery: read(
     "Unresolved original refunds",
     "/refund-recovery",
@@ -360,8 +402,8 @@ export const operations: Record<string, any> = {
   ),
   admin_operation_receipt: read(
     "Original corporate operation receipt",
-    "/operations/:id",
+    "/operations/:operationId",
     "approve",
-    { id },
+    { operationId: id },
   ),
 };
