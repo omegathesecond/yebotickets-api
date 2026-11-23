@@ -6,7 +6,7 @@ import type { StaffOperationContext } from '../staffAdmin/audit';
 import { prepareCorporateRefund, finishCorporateRefund, failCorporateRefund } from '../staffAdmin/refundReceipt';
 import { ticketRefundTerms } from './ticket-refund-terms';
 import { sumTicketRevenue } from './settlement.service';
-import { lockPurchaseIdentity } from '../utils/purchaseIdentity';
+import { lockTransactionIdentity } from '../utils/transactionIdentity';
 import { sendDeliveryMessage } from './delivery-message.service';
 import { formatPhone } from '../utils/phone';
 import { enqueueCancellationNotice } from './cancellation-notice-state.service';
@@ -1494,7 +1494,7 @@ export const purchaseTicket = async (
     const allocation = await prisma.$transaction(async tx => {
       // Global key ownership also rejects reuse by a different principal.
       // This lock ends before any gateway or delivery call.
-      await lockPurchaseIdentity(tx, key);
+      await lockTransactionIdentity(tx, key);
       const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
       if (prior) {
         if (prior.userId !== userId || prior.fingerprint !== fingerprint) {
@@ -1637,7 +1637,7 @@ export const recoverPurchaseAttempt = async (key: string, userId: string | undef
   if (!corporate && !userId) throw new ApiError('A verified buyer or corporate recovery actor is required', 401);
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new ApiError('Invalid purchase key', 400);
   const attempt = await prisma.$transaction(async tx => {
-    await lockPurchaseIdentity(tx, key);
+    await lockTransactionIdentity(tx, key);
     const prior = await tx.ticketPurchaseAttempt.findUnique({ where: { key } });
     if (prior) {
       if (!corporate && prior.userId !== userId) throw new ApiError('Purchase attempt not found', 404);
@@ -2047,7 +2047,7 @@ export const confirmCheckIn = async (
     return await prisma.$transaction(async tx => {
       // Serialize the key globally, including attempts to reuse it on a different
       // event. The transaction lock is released only after the receipt commits.
-      await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended(${opId}, 0))`;
+      await lockTransactionIdentity(tx, opId);
       const receipt = await tx.ticketAdmissionReceipt.findUnique({ where: { opId } });
       if (receipt) {
         if (receipt.operatorKind !== operatorKind || receipt.operatorId !== operatorId || receipt.eventId !== eventId || receipt.ticketId !== ticket?.id) {

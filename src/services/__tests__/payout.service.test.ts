@@ -29,9 +29,12 @@ const ADMIN = 'admin-1';
 const FINISHED = new Date('2020-01-02T00:00:00Z');
 const UPCOMING = new Date('2099-01-02T00:00:00Z');
 
-const originalFeePercent = process.env.PLATFORM_FEE_PERCENT;
+const setFee = (feePercent: number) => prismaMock.platformSettings.findUnique.mockResolvedValue({
+  id: '00000000-0000-4000-8000-000000000001', feePercent, revision: 0,
+} as any);
 
 const BANK_METHOD = {
+  isActive: true,
   payoutMethod: 'bank_transfer' as const,
   payoutBankName: 'Standard Bank',
   payoutBankAccountName: 'Sipho Dlamini',
@@ -122,14 +125,10 @@ const wireMethod = (method: any = BANK_METHOD) => {
 beforeEach(() => {
   mockReset(prismaMock);
   store = [];
-  delete process.env.PLATFORM_FEE_PERCENT;
+  setFee(0);
+  prismaMock.$transaction.mockImplementation(async (fn: any) => fn(prismaMock));
   wirePayoutTable();
   wireMethod();
-});
-
-afterAll(() => {
-  if (originalFeePercent === undefined) delete process.env.PLATFORM_FEE_PERCENT;
-  else process.env.PLATFORM_FEE_PERCENT = originalFeePercent;
 });
 
 describe('createPayoutRequest — guarding the balance', () => {
@@ -153,7 +152,7 @@ describe('createPayoutRequest — guarding the balance', () => {
   });
 
   it('rejects a request for the pre-fee gross once a commission is set', async () => {
-    process.env.PLATFORM_FEE_PERCENT = '10';
+    setFee(10);
     wireSales(1000);
 
     // 1000 gross, 100 fee — only 900 is withdrawable.
@@ -259,7 +258,7 @@ describe('createPayoutRequest — guarding the balance', () => {
   });
 
   it('FREEZES the fee on the row so a later rate change cannot restate it', async () => {
-    process.env.PLATFORM_FEE_PERCENT = '10';
+    setFee(10);
     wireSales(1000);
 
     const request = await createPayoutRequest(ORG, 900);
@@ -272,7 +271,7 @@ describe('createPayoutRequest — guarding the balance', () => {
     });
 
     // The business doubles its commission afterwards; the settled row is unmoved.
-    process.env.PLATFORM_FEE_PERCENT = '20';
+    setFee(20);
     expect(store[0]).toMatchObject({ feePercent: 10, feeAmount: 100, grossAmount: 1000 });
   });
 });

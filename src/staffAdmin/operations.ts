@@ -1,4 +1,5 @@
 import { profileFields } from "../validators/profile.validator";
+import { PLATFORM_SETTINGS_ID } from "../config/platform";
 import { TicketType } from "../interfaces/ticket.interface";
 const id = {
   type: "string",
@@ -115,6 +116,25 @@ const messageRetryFields = {
 };
 const paged = { collection: "records", total: "total" };
 export const operations: Record<string, any> = {
+  admin_platform_settings: read("Platform commission", "/settings", "money"),
+  admin_update_platform_settings: change(
+    "Change platform commission",
+    "/settings/:id",
+    "money",
+    "platformSettings",
+    {
+      id: { type: "string", enum: [PLATFORM_SETTINGS_ID] },
+      feePercent: {
+        type: "number",
+        minimum: 0,
+        exclusiveMaximum: 100,
+        title: "Platform commission (%)",
+        description:
+          "Applies only to eligible gross revenue not yet consumed by a payout. Reserved/paid payout fees remain frozen. This sends no money.",
+      },
+    },
+    ["feePercent"],
+  ),
   admin_stats: read(
     "Platform overview",
     "/stats",

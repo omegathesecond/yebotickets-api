@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 
-/** Return a supported scalar while holding the original purchase identity lock. */
-export const lockPurchaseIdentity = (
+/** Hold one transaction-scoped source identity lock and return a supported scalar. */
+export const lockTransactionIdentity = (
   client: Pick<Prisma.TransactionClient, "$queryRaw">,
   key: string,
 ) =>

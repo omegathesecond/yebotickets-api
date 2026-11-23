@@ -321,13 +321,89 @@ services already bind their separate access and refresh secrets and use
 `yebotickets-runtime@hiyebo.iam.gserviceaccount.com`; no binding/IAM was changed.
 Apply `20261124010000_organizer_account_access` via Neon DIRECT before serving code.
 
+## Platform commission
+
+Platform commission is now a source-owned singleton setting in PostgreSQL. The
+existing settlement calculation reads that setting; the retired environment
+variable is never used as a runtime fallback. Missing configuration returns503,
+failed database reads propagate, and the actual server refuses startup before
+listening when the setting has not been imported. Currency remains fixed SZL;
+this screen cannot change payment providers, credentials or ticket currency.
+
+Finance staff can read the rate and prepare an exact change in the existing
+workspace. The CEO alone executes it through the central decision queue. The
+review binds the actual settings version and describes the effect on unconsumed
+eligible gross. Source configuration, revision, corporate actor, critical audit
+and original receipt commit atomically. Replays do not increment the revision
+again, stale/revoked requests fail, and a failed critical audit restores the rate.
+
+Payout reservation now shares one source transaction for the settings read,
+organiser approval/destination, available balance and frozen payout amounts.
+Its lock order is settings SHARE → User UPDATE; CEO configuration changes lock
+the settings row UPDATE. Actual PostgreSQL probes verified both race orders.
+A waiting payout uses the new committed rate; a payout reserved first freezes
+its earlier rate. A payout queued behind CEO account suspension rechecks the
+locked User and cannot create a request. Existing paid/reserved gross, fee, net and currency never get
+rewritten by a settings change. No money is sent by this operation.
+
+The shared native renderer now places singleton actions inside the loaded record
+view, reusing RecordDetail and nativeBindings. The actual returned identity is
+bound automatically; staff do not select/type a singleton UUID. A failed/pending
+read offers no record action. Explicit related-parent context bindings remain
+preserved. No product-specific renderer or compatibility alias was added.
+
+### Reviewed configuration import and release order
+
+Migration `20261124020000_platform_settings` creates the constrained table without
+inventing a rate. Before serving the new API, migrate the selected environment via
+its Neon DIRECT connection and import its reviewed deployed rate. The CLI starts
+in read-only mode, reads actual Cloud Run service/revision/traffic/database binding,
+and rejects an unexpected environment, pending/split revision or changed rate:
+
+```sh
+npm ci
+npx prisma generate
+npm run build
+node scripts/import-platform-settings.cjs \
+  --environment prod \
+  --expected-revision <reviewed-latest-ready-revision> \
+  --expected-fee-percent <reviewed-deployed-rate>
+```
+
+After explicit release approval and migration, repeat that exact reviewed command
+with `--apply`, separately for prod/dev. It fetches the selected DIRECT and pooled
+connection credentials in memory using the deployer configuration, verifies they
+refer to the same environment/database, rechecks the deployment, and imports under
+the existing transaction identity lock. It prints no credentials. Keep deployments
+and environment changes stopped during this one-time import; no distributed GCP/SQL
+lock is claimed. Concurrent identical imports replay the same initial row. An
+existing or CEO-changed row cannot be overwritten by an import. All subsequent
+commission decisions belong to the CEO dashboard.
+
+Read-only checks on 23 November verified prod revision
+`yebotickets-api-prod-hn1029-5b4a0f` at 0%, and dev revision
+`yebotickets-api-dev-hn1029-5bbfde` with the old source's deliberate unset=0%
+semantics. These are historical import evidence, not authority to reuse a stale
+revision at release. Both DIRECT secret names exist. No production import was run.
+The deployment file removes only obsolete `PLATFORM_FEE_PERCENT`; all other
+existing env/secret bindings are preserved additively. Existing tokens require
+fresh sign-in after the separate account-access contract cutover described above.
+
+Both Dockerfile stages now copy the existing vendored SDK before installing it.
+An isolated Cloud Build Dockerfile check passed (build
+`4d4736eb-2ac9-4aba-878a-84019350ed7f`), producing local build image
+`sha256:9f29549d04067017e1f566cc17dc838df29f39ca137936bac51505c95b5948a3`.
+It pushed no image and deployed nothing. This verifies packaging of that uploaded
+source snapshot, not a production revision or Google workload authentication.
+Upload exclusions cover env files, keys, dependencies and logs.
+
 ## Local evidence
 
-- Product build and 548 tests across 35 suites passed. The tests include workload
+- Product build and 560 tests across 36 suites passed. The tests include workload
   audience/caller rejection and the shared workspace label/binding contract.
   Google token verification is mocked in the unit tests; this is not live OIDC
   acceptance.
-- 145 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
+- 153 actual native Tickets/CEO/Pay HTTP/PostgreSQL checks passed with a
   non-superuser Tickets role: grants, private context, exact pagination, original
   paid amounts, central review, stale targets, revoked grants, separate corporate
   reviewers, atomic audit rollback, payout transitions, scope isolation and
@@ -367,9 +443,12 @@ Apply `20261124010000_organizer_account_access` via Neon DIRECT before serving c
 - The separate actual Tickets/YeboPay refund fixture passed eleven checks for
   existing organiser refunds and original-proof reconciliation. Payment and
   notification transports are simulated; no real payment or message is sent.
-- CEO guarded build passed. Earlier focused native permission, 326 frontend
-  tests/build and Jobs (38)/Learn (23) actual HTTP/PostgreSQL regressions remain
-  applicable: this batch changes no shared CEO adapter or frontend logic.
+- CEO guarded build and 329 frontend tests/build passed, including actual React
+  singleton record submission, no actions on failed/pending reads and preserved
+  related-parent target context. The shared source adapter is unchanged; earlier
+  focused native permission and Jobs(38)/Learn(23) HTTP/PostgreSQL checks remain
+  applicable. Source workspace inspection confirmed the related Learn quote,
+  discount, recipients and singleton settings contracts use object records.
 - Disposable local desktop/mobile browser review verified a finance request,
   named organiser selection, CEO-only execution, saved corporate attribution and
   related ticket records. A second browser journey verified ticket-only named
@@ -445,7 +524,9 @@ Apply `20261124010000_organizer_account_access` via Neon DIRECT before serving c
   The complete final history through account access replayed from scratch on
   `yebotickets_access_schema_fixture_20261123`. An upgrade from the prior notice-
   retry schema preserved an existing synthetic organiser and assigned active/version0.
-  Production migration remains pending.
+  The complete history through platform settings also replayed on a fresh
+  `yebotickets_settings_schema_fixture_20261123` database, with no settings row
+  invented. Production migration/import remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
 building both APIs:
@@ -469,12 +550,10 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete actual supported runtime configuration. Native organiser profiles, guarded
-unused-account deletion and real source account access/suspension are implemented
-with current route validation/ownership, durable session revocation and source
-history retention verified. Authentication configuration now fails closed.
-Currency/commission currently live in environment configuration; the inspected
-source has no runtime settings API. Do not present fictional working settings.
+Native organiser profiles, guarded unused-account deletion, real source account
+access and source commission settings are implemented. Authentication/configuration
+failures are explicit. Commission still requires its reviewed one-time import at
+release; currency is fixed SZL and no additional runtime settings are invented.
 Notice tracking, initial recovery, explicit reviewed retries and original proof
 checks are implemented; this does not claim whole-product acceptance.
 Add explicit environment selection, environment-scoped grants and

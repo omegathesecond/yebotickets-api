@@ -20,6 +20,7 @@ import { errorHandler, notFound } from './middleware/error.middleware';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
 import prisma from './config/prisma';
+import { getPlatformSettings } from './config/platform';
 import { createCorporateAdminRouter } from './staffAdmin/router';
 
 // Load environment variables
@@ -91,6 +92,7 @@ const startServer = async () => {
   try {
     // Test database connection
     await prisma.$connect();
+    await getPlatformSettings();
     console.log('PostgreSQL Connected');
     
     app.listen(PORT, () => {

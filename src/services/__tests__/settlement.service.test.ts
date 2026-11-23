@@ -21,12 +21,9 @@ const UPCOMING = new Date('2026-12-01T23:00:00Z');
 
 const ORG = 'org-1';
 
-const originalFeePercent = process.env.PLATFORM_FEE_PERCENT;
-
-const setFee = (value?: string) => {
-  if (value === undefined) delete process.env.PLATFORM_FEE_PERCENT;
-  else process.env.PLATFORM_FEE_PERCENT = value;
-};
+const setFee = (value = '0') => prismaMock.platformSettings.findUnique.mockResolvedValue({
+  id: '00000000-0000-4000-8000-000000000001', feePercent: Number(value), revision: 0,
+} as any);
 
 const event = (id: string, endDate: Date, over: Partial<any> = {}) => ({
   id,
@@ -77,9 +74,6 @@ beforeEach(() => {
   setFee(undefined);
 });
 
-afterAll(() => {
-  setFee(originalFeePercent);
-});
 
 describe('getOrganizerStatement — what the organizer is owed', () => {
   it.each([NaN,Infinity,-1,1.001])('refuses an invalid recorded allocation %s',amountPaid=>{
@@ -200,7 +194,7 @@ describe('getOrganizerStatement — what the organizer is owed', () => {
     expect(statement.availableBalance).toBe(900);
   });
 
-  it('charges no fee when PLATFORM_FEE_PERCENT is unset (unchanged behaviour)', async () => {
+  it('uses an explicitly configured zero commission', async () => {
     wire([event('e1', FINISHED)], [ticket('e1', 'sold', 1000)]);
 
     const statement = await getOrganizerStatement(ORG, NOW);
@@ -214,7 +208,7 @@ describe('getOrganizerStatement — what the organizer is owed', () => {
     setFee('not-a-number');
     wire([event('e1', FINISHED)], [ticket('e1', 'sold', 1000)]);
 
-    await expect(getOrganizerStatement(ORG, NOW)).rejects.toThrow(/PLATFORM_FEE_PERCENT/);
+    await expect(getOrganizerStatement(ORG, NOW)).rejects.toThrow(/Platform commission/);
   });
 
   it('subtracts money already paid out and money reserved by an open request', async () => {

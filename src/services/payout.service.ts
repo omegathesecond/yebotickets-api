@@ -2,7 +2,8 @@ import prisma from '../config/prisma';
 import type { Prisma } from '@prisma/client';
 import { ApiError } from '../middleware/error.middleware';
 import { reviewActor, ReviewActor } from './review-actor';
-import { CURRENCY, getPlatformFeePercent } from '../config/platform';
+import { assertAccountActive } from './auth-state';
+import { CURRENCY, getPlatformFeePercent, getPlatformSettings } from '../config/platform';
 import {
   getOrganizerStatement,
   splitPayoutFee,
@@ -31,6 +32,7 @@ import {
  */
 
 const PAYOUT_METHOD_SELECT = {
+  isActive: true,
   payoutMethod: true,
   payoutBankName: true,
   payoutBankAccountName: true,
@@ -49,8 +51,8 @@ const PRISMA_UNIQUE_VIOLATION = 'P2002';
 export const getOrganizerBalance = async (organizerId: string): Promise<OrganizerStatement> =>
   getOrganizerStatement(organizerId);
 
-export const getPayoutMethod = async (organizerId: string) => {
-  const user = await prisma.user.findUnique({
+export const getPayoutMethod = async (organizerId: string, client: Prisma.TransactionClient = prisma) => {
+  const user = await client.user.findUnique({
     where: { id: organizerId },
     select: PAYOUT_METHOD_SELECT,
   });
@@ -141,62 +143,72 @@ export const createPayoutRequest = async (organizerId: string, amount: number) =
     throw new ApiError('Amount must be a positive number', 400);
   }
 
-  const method = await getPayoutMethod(organizerId);
+  return prisma.$transaction(async (tx) => {
+    // Lock settings before the User: a CEO fee update and a payout reservation
+    // serialize at the same source configuration row, then use one exact rate.
+    await getPlatformSettings(tx, 'share');
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id=${organizerId} FOR UPDATE`;
+    const method = await getPayoutMethod(organizerId, tx);
+    assertAccountActive(method);
 
-  // Staff review gate — deliberately independent of User.isVerified, which is
-  // set automatically by phone-OTP with no human review. See the schema
-  // comment on PayoutApprovalStatus.
-  if (method.payoutApprovalStatus !== 'approved') {
-    throw new ApiError('Your organizer account is pending approval before you can request a payout', 403);
-  }
+    // Staff review gate — deliberately independent of User.isVerified, which is
+    // set automatically by phone-OTP with no human review. See the schema
+    // comment on PayoutApprovalStatus.
+    if (method.payoutApprovalStatus !== 'approved') {
+      throw new ApiError(
+        'Your organizer account is pending approval before you can request a payout',
+        403
+      );
+    }
 
-  if (!method.payoutMethod) {
-    throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
-  }
+    if (!method.payoutMethod) {
+      throw new ApiError('Set up a payout method before requesting a withdrawal', 400);
+    }
 
-  // One open request at a time: an organizer with two open requests could
-  // request the same balance twice before either is settled.
-  const open = await prisma.payoutRequest.findFirst({
-    where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
-    select: { id: true, status: true },
-  });
-  if (open) {
-    throw new ApiError(
-      'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
-      409
-    );
-  }
-
-  const statement = await getOrganizerStatement(organizerId);
-  if (amount > statement.availableBalance) {
-    throw new ApiError(
-      `Amount exceeds your available balance of ${statement.currency} ${statement.availableBalance.toFixed(2)}`,
-      400
-    );
-  }
-
-  try {
-    return await prisma.payoutRequest.create({
-      data: {
-        organizerId,
-        ...splitPayoutFee(amount, statement.feePercent),
-        currency: statement.currency,
-        status: 'pending',
-        ...destinationSnapshot(method),
-      },
+    // One open request at a time: an organizer with two open requests could
+    // request the same balance twice before either is settled.
+    const open = await tx.payoutRequest.findFirst({
+      where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
+      select: { id: true, status: true }
     });
-  } catch (error: any) {
-    // Lost the race against a concurrent request: the partial unique index
-    // rejected the second insert. Surface the same conflict the check above
-    // would have produced rather than a raw 500.
-    if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+    if (open) {
       throw new ApiError(
         'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
         409
       );
     }
-    throw error;
-  }
+
+    const statement = await getOrganizerStatement(organizerId, new Date(), tx);
+    if (amount > statement.availableBalance) {
+      throw new ApiError(
+        `Amount exceeds your available balance of ${statement.currency} ${statement.availableBalance.toFixed(2)}`,
+        400
+      );
+    }
+
+    try {
+      return await tx.payoutRequest.create({
+        data: {
+          organizerId,
+          ...splitPayoutFee(amount, statement.feePercent),
+          currency: statement.currency,
+          status: 'pending',
+          ...destinationSnapshot(method)
+        }
+      });
+    } catch (error: any) {
+      // Lost the race against a concurrent request: the partial unique index
+      // rejected the second insert. Surface the same conflict the check above
+      // would have produced rather than a raw 500.
+      if (error?.code === PRISMA_UNIQUE_VIOLATION) {
+        throw new ApiError(
+          'You already have a payout request awaiting processing. Wait for it to be settled before requesting another.',
+          409
+        );
+      }
+      throw error;
+    }
+  });
 };
 
 export const getOrganizerPayoutRequests = async (organizerId: string) =>

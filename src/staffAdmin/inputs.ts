@@ -3,6 +3,7 @@ import type { ValidationChain } from "express-validator";
 import { assertValidRequest } from "../middleware/validate.middleware";
 import { validateProfileInput } from "../validators/profile.validator";
 import { ApiError } from "../middleware/error.middleware";
+import { assertPlatformFeePercent } from "../config/platform";
 import {
   createEventValidator,
   updateEventValidator,
@@ -30,6 +31,8 @@ export async function validateOperationInput(
   name: string,
   parameters: Record<string, any>,
 ) {
+  if (name === "admin_update_platform_settings")
+    assertPlatformFeePercent(parameters.feePercent);
   if (
     ["admin_update_event", "admin_update_ticket_type"].includes(name) &&
     !Object.keys(operationInput(parameters)).length

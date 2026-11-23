@@ -55,6 +55,16 @@ enum PayoutApprovalStatus {
   rejected
 }
 
+model PlatformSettings {
+  id                      String   @id @db.Uuid
+  feePercent              Float
+  revision                Int      @default(0)
+  initializedFromRevision String
+  updatedByStaff          String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
 model User {
   id          String   @id @default(uuid())
   name        String
@@ -166,7 +176,7 @@ model PayoutRequest {
   currency      String               @default("SZL")
 
   // Platform fee frozen at request time. Storing the rate AND the money means a
-  // later change to PLATFORM_FEE_PERCENT never restates a historic payout:
+  // later commission change never restates a historic payout:
   // grossAmount = amount + feeAmount is the ticket revenue this payout consumed.
   feePercent    Float                @default(0)
   feeAmount     Float                @default(0)

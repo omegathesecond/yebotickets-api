@@ -8,6 +8,7 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY vendor ./vendor/
 COPY prisma ./prisma/
 COPY prisma.config.ts ./
 
@@ -34,6 +35,7 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY vendor ./vendor/
 COPY prisma ./prisma/
 COPY prisma.config.ts ./
 

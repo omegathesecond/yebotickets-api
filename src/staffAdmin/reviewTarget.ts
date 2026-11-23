@@ -1,4 +1,8 @@
 import {
+  commissionChangeEvidence,
+  COMMISSION_POLICY,
+} from "../services/platform-settings.service";
+import {
   organizerDeletionEvidence,
   assertOrganizerDeletion,
 } from "../services/organizer-admin.service";
@@ -78,6 +82,25 @@ export async function review(
   lock = false,
 ) {
   const op = checked(name, parameters);
+  if (name === "admin_update_platform_settings") {
+    const settings = await commissionChangeEvidence(
+      parameters.id,
+      parameters.feePercent,
+      lock,
+    );
+    return {
+      version: hashIntent({ name, parameters, settings }),
+      workspace: {
+        id: settings.id,
+        name: "Platform commission",
+        currentCommissionPercent: settings.feePercent,
+        requestedCommissionPercent: parameters.feePercent,
+        currency: CURRENCY,
+        policy: COMMISSION_POLICY,
+      },
+    };
+  }
+
   if (name === "admin_retry_cancellation_notice") {
     const evidence = await noticeReviewEvidence(parameters.id, lock);
     const policy = assertNoticeReview(

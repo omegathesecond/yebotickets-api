@@ -28,6 +28,10 @@ import {
   getEventPurchases,
 } from "../services/organizer-event.service";
 import { updateProfile } from "../services/auth.service";
+import {
+  platformSettingsView,
+  setPlatformCommission,
+} from "../services/platform-settings.service";
 import * as payouts from "../services/payout.service";
 import {
   listRefundRecovery,
@@ -190,6 +194,12 @@ export function createCorporateAdminRouter(
         throw fail("A verified corporate staff actor is required", 401);
       let data: any;
       switch (name) {
+        case "admin_platform_settings":
+          data = await platformSettingsView();
+          break;
+        case "admin_update_platform_settings":
+          data = await setPlatformCommission(p.id, p.feePercent);
+          break;
         case "admin_stats":
           data = await getDashboardMetrics();
           break;

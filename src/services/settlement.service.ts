@@ -17,7 +17,7 @@ import { CURRENCY, getPlatformFeePercent, roundMoney } from '../config/platform'
  *   grossSales      Σ what was actually charged for every SOLD ticket
  *   − refundedSales tickets refunded/cancelled — money already returned to the buyer
  *   = eligibleGross ... but only for events that have FINISHED (see below)
- *   − platformFee   eligibleGross × PLATFORM_FEE_PERCENT
+ *   − platformFee   eligibleGross × current commission
  *   = netEarned     what the organizer has actually earned
  *   − paidOut       payouts already settled
  *   − reserved      payouts requested or approved but not yet settled
@@ -120,11 +120,12 @@ const holdReasonFor = (event: { endDate: Date; isCancelled: boolean }, now: Date
  */
 export const getOrganizerStatement = async (
   organizerId: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  client: Prisma.TransactionClient = prisma
 ): Promise<OrganizerStatement> => {
-  const feePercent = getPlatformFeePercent();
+  const feePercent = await getPlatformFeePercent(client);
 
-  const events = await prisma.event.findMany({
+  const events = await client.event.findMany({
     where: { organizerId },
     select: { id: true, title: true, endDate: true, isCancelled: true },
     orderBy: { endDate: 'desc' },
@@ -134,7 +135,7 @@ export const getOrganizerStatement = async (
   // Pull sold AND cancelled rows together: the split between "earned" and
   // "refunded" is made below in code, not by the query.
   const tickets = eventIds.length
-    ? await prisma.ticket.findMany({
+    ? await client.ticket.findMany({
         where: { eventId: { in: eventIds }, status: { in: [...SETTLEABLE_TICKET_STATUSES] } },
         select: {
           eventId: true,
@@ -191,11 +192,11 @@ export const getOrganizerStatement = async (
     .reduce((sum, l) => sum + l.grossSales, 0);
 
   const [paidAgg, reservedAgg] = await Promise.all([
-    prisma.payoutRequest.aggregate({
+    client.payoutRequest.aggregate({
       where: { organizerId, status: 'paid' },
       _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
-    prisma.payoutRequest.aggregate({
+    client.payoutRequest.aggregate({
       where: { organizerId, status: { in: [...RESERVED_PAYOUT_STATUSES] } },
       _sum: { amount: true, grossAmount: true, feeAmount: true },
     }),
@@ -206,7 +207,7 @@ export const getOrganizerStatement = async (
 
   // Gross already consumed by payouts settled (or reserved) at their OWN
   // frozen rate — re-taxing it at today's rate would restate history the
-  // moment PLATFORM_FEE_PERCENT changes (see splitPayoutFee). Only the
+  // moment the platform commission changes (see splitPayoutFee). Only the
   // remaining, never-consumed gross is fee'd at the current rate.
   const consumedGross = roundMoney((paidAgg._sum?.grossAmount || 0) + (reservedAgg._sum?.grossAmount || 0));
   const consumedFee = roundMoney((paidAgg._sum?.feeAmount || 0) + (reservedAgg._sum?.feeAmount || 0));

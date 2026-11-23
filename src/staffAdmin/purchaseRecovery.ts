@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import prisma, { staffAdminScope } from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
-import { lockPurchaseIdentity } from "../utils/purchaseIdentity";
+import { lockTransactionIdentity } from "../utils/transactionIdentity";
 import { CURRENCY } from "../config/platform";
 import { sumTicketRevenue } from "../services/settlement.service";
 import { ticketRefundTerms } from "../services/ticket-refund-terms";
@@ -22,7 +22,7 @@ const page = (p: Record<string, any>) => ({
 
 export async function purchaseEvidence(key: string, lock = false) {
   if (lock) {
-    await lockPurchaseIdentity(prisma, key);
+    await lockTransactionIdentity(prisma, key);
     await prisma.$queryRawUnsafe(
       'SELECT key FROM "TicketPurchaseAttempt" WHERE key=$1 FOR UPDATE',
       key,

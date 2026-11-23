@@ -66,6 +66,13 @@ export default {
   decisions: true,
   activity: true,
   sections: [
+    {
+      id: "settings",
+      label: "Platform commission",
+      operation: "admin_platform_settings",
+      bind: { id: "id" },
+      actions: ["admin_update_platform_settings"],
+    },
     { id: "overview", label: "Overview", operation: "admin_stats" },
     {
       id: "organizers",
