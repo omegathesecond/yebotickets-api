@@ -79,8 +79,14 @@ export async function deliveryRecord(id: string) {
   };
 }
 
-export async function listDeliveryMessages(p: Record<string, any>) {
-  const where = { deliveryOrderId: p.id };
+export async function listDeliveryMessages(
+  p: Record<string, any>,
+  kind: "order" | "cancellation" = "order",
+) {
+  const where =
+    kind === "order"
+      ? { deliveryOrderId: p.id }
+      : { cancellationNoticeId: p.id };
   const [rows, total] = await Promise.all([
     prisma.ticketDeliveryMessage.findMany({
       where,

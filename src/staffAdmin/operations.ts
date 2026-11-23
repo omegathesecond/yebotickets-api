@@ -565,6 +565,32 @@ export const operations: Record<string, any> = {
     { id: { type: "string", minLength: 1, maxLength: 512 }, ...pagination },
     { ...paged, required: ["id"] },
   ),
+  admin_cancellation_notices: read(
+    "Cancellation notices",
+    "/cancellation-notices",
+    "tickets",
+    {
+      ...pagination,
+      status: {
+        type: "string",
+        enum: ["pending", "sending", "sent", "failed", "unknown"],
+      },
+    },
+    paged,
+  ),
+  admin_cancellation_notice: read(
+    "Original cancellation notice",
+    "/cancellation-notices/:id",
+    "tickets",
+    { id },
+  ),
+  admin_cancellation_notice_messages: read(
+    "Original cancellation message attempts",
+    "/cancellation-notices/:id/messages",
+    "tickets",
+    { id, ...pagination },
+    paged,
+  ),
   admin_delivery_message: read(
     "Original message receipt",
     "/ticket-delivery-messages/:id",

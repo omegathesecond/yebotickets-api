@@ -13,6 +13,11 @@ jest.mock('../../config/prisma', () => ({
   default: mockDeep<PrismaClient>(),
 }));
 
+// Financial unit scenarios isolate the durable notification collaborator.
+// Its real transaction/transport behavior is exercised by the PostgreSQL/HTTP fixture.
+jest.mock('../cancellation-notice-state.service', () => ({ enqueueCancellationNotice: jest.fn() }));
+jest.mock('../cancellation-notice.service', () => ({ dispatchCancellationNoticeForTicket: jest.fn() }));
+
 // --- Mock the side-effecting collaborators ---------------------------------
 // purchaseTicket generates a QR and delivers the ticket over YeboLink (WhatsApp,
 // with email as a fallback channel). We stub the QR + comms collaborators so the
@@ -63,6 +68,8 @@ import {
   getTicketTypes,
   getUserTickets,
 } from '../ticket.service';
+import { dispatchCancellationNoticeForTicket } from '../cancellation-notice.service';
+import { enqueueCancellationNotice } from '../cancellation-notice-state.service';
 import { sendTextMessage, sendEmailMessage } from '../comms.service';
 import { createCharge, getCharge, refundCharge, reconcileRefund, YeboPayHttpError } from '../yebopay.service';
 import { TicketStatus } from '../../interfaces/ticket.interface';
@@ -88,6 +95,8 @@ beforeEach(() => {
   // clears call records, not the implementations jest-mock-extended installs).
   mockReset(prismaMock);
   prismaMock.ticketDeliveryMessage.findMany.mockResolvedValue([]);
+  (enqueueCancellationNotice as jest.Mock).mockReset();
+  (dispatchCancellationNoticeForTicket as jest.Mock).mockReset().mockResolvedValue({ status: 'sent', error: null });
   recoveryLock = null;
   prismaMock.ticketPurchaseAttempt.findUnique.mockResolvedValue(null);
   prismaMock.ticketPurchaseAttempt.create.mockImplementation(async ({data}: any) => ({...data}));
@@ -1079,7 +1088,7 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
       refundRef: 'rfnd_1',
       notified: true,
     });
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(1);
   });
 
   it('is idempotent: an already-cancelled ticket is a no-op (no YeboPay refund, no write)', async () => {
@@ -1131,7 +1140,7 @@ describe('refundTicket (single-ticket refund + cancel)', () => {
     const writeArg = prismaMock.ticket.updateMany.mock.calls[0][0];
     expect(writeArg.data).toMatchObject({ status: 'cancelled' });
     expect(writeArg.data.paymentStatus).toBeUndefined(); // free: no REFUNDED marker
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(1);
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a refund for an event the organizer does not own (403) — no refund, no write', async () => {
@@ -1325,8 +1334,8 @@ describe('cancelEvent (refund all sold tickets + cancel)', () => {
       cancelledFree: 1,
       failed: 0,
     });
-    // Both holders notified.
-    expect(sendTextMessageMock).toHaveBeenCalledTimes(2);
+    // Both durable notices dispatched after financial completion.
+    expect(dispatchCancellationNoticeForTicket).toHaveBeenCalledTimes(2);
   });
 
   it('enforces ownership: a non-owner organizer cannot cancel (403) and the event is NOT flagged', async () => {

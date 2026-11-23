@@ -380,7 +380,8 @@ model TicketOrderDelivery {
 // Persist before dispatch; never invent message IDs for old or interrupted sends.
 model TicketDeliveryMessage {
   id String @id @default(uuid())
-  deliveryOrderId String
+  deliveryOrderId String?
+  cancellationNoticeId String?
   dispatchAttemptId String
   channel String
   recipient String
@@ -400,6 +401,7 @@ model TicketDeliveryMessage {
   updatedAt DateTime @updatedAt
   @@unique([dispatchAttemptId, channel])
   @@index([deliveryOrderId, createdAt])
+  @@index([cancellationNoticeId, createdAt])
 }
 
 // Immutable admission receipt. Deliberately retained independently of mutable
@@ -425,4 +427,30 @@ model TicketPurchaseAttempt {
   chargeId String? @unique
   failure String?
   createdAt DateTime @default(now())
+}
+
+// Original cancellation intent and independent notification work. Retain without
+// parent foreign keys: account/ticket deletion must not erase external-send proof.
+model TicketCancellationNotice {
+  id String @id @default(uuid())
+  ticketId String @unique
+  eventId String
+  userId String?
+  ticketCode String
+  eventTitle String
+  recipient String?
+  refunded Boolean
+  amount Float
+  currency String
+  refundAttemptId String? @unique
+  refundGatewayRequestId String? @unique
+  content String
+  status String @default("pending")
+  attemptId String?
+  attemptedAt DateTime?
+  sentAt DateTime?
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status, createdAt])
 }

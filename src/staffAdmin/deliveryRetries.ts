@@ -242,6 +242,8 @@ export async function reconcileDeliveryRetryForMessage(messageId: string) {
     where: { id: messageId },
   });
   if (!message) throw fail("The original delivery message was not found", 404);
+  if (!message.deliveryOrderId)
+    return { originalOperationId: null, originalOperationState: null };
   const [audit] = await prisma.$queryRawUnsafe<any[]>(
     `SELECT id FROM staff_admin_audit WHERE operation='admin_retry_delivery' AND parameters->'reviewedEffect'->>'dispatchAttemptId'=$1 AND parameters->'reviewedEffect'->>'deliveryOrderId'=$2`,
     message.dispatchAttemptId,

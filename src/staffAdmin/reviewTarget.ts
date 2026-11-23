@@ -20,6 +20,7 @@ import {
   assertDeliveryReview,
   lockOrderDelivery,
 } from "../services/delivery-state.service";
+import { lockCancellationNotice } from "../services/cancellation-notice-state.service";
 import { deliveryRetryView } from "./deliveryRetries";
 const tables: Record<string, string> = {
   user: "User",
@@ -110,7 +111,11 @@ export async function review(
     });
     if (!message) throw fail("Original message attempt was not found", 404);
     if (lock) {
-      await lockOrderDelivery(prisma, message.deliveryOrderId);
+      if (message.deliveryOrderId)
+        await lockOrderDelivery(prisma, message.deliveryOrderId);
+      else if (message.cancellationNoticeId)
+        await lockCancellationNotice(prisma, message.cancellationNoticeId);
+      else throw fail("Original message has no owning work identity", 409);
       await prisma.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${parameters.id} FOR UPDATE`;
       message = await prisma.ticketDeliveryMessage.findUniqueOrThrow({
         where: { id: parameters.id },

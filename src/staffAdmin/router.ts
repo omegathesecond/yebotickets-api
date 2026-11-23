@@ -58,6 +58,10 @@ import {
   listDeliveryMessages,
   deliveryMessageRecord,
 } from "./deliveryRecords";
+import {
+  cancellationNoticeRecord,
+  cancellationNoticeView,
+} from "../services/cancellation-notice-state.service";
 import { checkDeliveryMessage } from "../services/delivery-message.service";
 import {
   retryCorporateDelivery,
@@ -681,6 +685,30 @@ export function createCorporateAdminRouter(
           break;
         case "admin_delivery_messages":
           data = await listDeliveryMessages(p);
+          break;
+        case "admin_cancellation_notices": {
+          const { page: pg, limit } = page(p);
+          const where = p.status ? { status: p.status } : {};
+          const [rows, total] = await Promise.all([
+            prisma.ticketCancellationNotice.findMany({
+              where,
+              orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+              skip: (pg - 1) * limit,
+              take: limit,
+            }),
+            prisma.ticketCancellationNotice.count({ where }),
+          ]);
+          data = {
+            records: rows.map(cancellationNoticeView),
+            total,
+          };
+          break;
+        }
+        case "admin_cancellation_notice":
+          data = await cancellationNoticeRecord(p.id);
+          break;
+        case "admin_cancellation_notice_messages":
+          data = await listDeliveryMessages(p, "cancellation");
           break;
         case "admin_delivery_message":
           data = await deliveryMessageRecord(p.id);

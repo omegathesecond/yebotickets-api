@@ -119,8 +119,30 @@ from gateway delivered/read, and rejects conflicting or regressive evidence.
 Critical local audit and receipt progress commit together. Reads dispatch no
 message. Historical or interrupted sends without a saved message identity get
 no invented receipt. Existing permitted buyer retries append history; native
-CEO-reviewed retries now reuse that same claim and dispatcher. Durable
-cancellation-notice tracking remains outstanding.
+CEO-reviewed retries now reuse that same claim and dispatcher.
+
+Cancellation and refund finalization now save one immutable cancellation-notice
+intent in the same database transaction. It retains the actual ticket, holder,
+event, recorded refund allocation/currency and original refund identities;
+missing evidence cannot create a fictional notice. Original recipient and
+content remain fixed after later contact/event edits. The financial receipt
+links its real notice identity and makes no message-delivery claim.
+
+Notice dispatch reuses the same communications client, per-channel history and
+exact original receipt check, with exactly one owning delivery-order or
+cancellation-notice identity. The existing delivery recovery timer resumes only
+never-started notices. Sending interruptions become unknown; failed or unknown
+notices are not automatically replaced. Original acknowledgement/history survives
+work-result failure, and a CEO-reviewed proof read can repair only that original
+notice generation. Proof reads send no notice or money. Intent/history survives
+parent ticket deletion. No historical notice is invented or backfilled.
+
+The native Cancellation notices section reuses the shared workspace and central
+proof actions. Original recipient and free-form message content are omitted from
+read models; ticket-only access cannot bypass financial redaction through message
+text. Useful interruption errors are visible without exposing database internals.
+Explicit CEO-reviewed retry/reconciliation of failed or unknown notices remains
+a separate unfinished workflow.
 
 Retry requests bind the exact current work generation as well as the reviewed
 order. A genuinely unattempted order has no fabricated attempt record. The
@@ -317,6 +339,11 @@ invented gateway history. See [recovery](refund-recovery.md) and
   receipts are saved. The older unknown history remains visible beside the new
   queued acknowledgement. The 390px document fits its viewport. The message
   gateway remains the owning local route-contract fixture, not a real provider.
+  The cancellation-notice journey verified ticket-only staff opening retained
+  notice/message history, preparing a proof-only request, CEO execution and a
+  saved completed result with separate queued and delivered evidence. Mobile
+  status filtering fit the 390px viewport; original recipients/message text were
+  absent from the ticket-staff read view. No message was sent by the proof read.
 - Proof migration history was replayed from scratch locally. The additional
   corporate administration and corporate-refund association migrations were
   applied to named localhost fixtures only. The complete history, including the
@@ -331,6 +358,8 @@ invented gateway history. See [recovery](refund-recovery.md) and
   `yebotickets_delivery_schema_fixture_20261123`.
   The complete history through corporate delivery retry intent replayed on fresh
   `yebotickets_retry_schema_fixture_20261123`.
+  The complete final history through cancellation-notice work replayed on fresh
+  `yebotickets_notice_schema_fixture_20261123`.
   Production migration remains pending.
 
 Run the existing organiser-refund fixture from the CEO API checkout after
@@ -355,10 +384,10 @@ existing organiser business service, not an invented corporate admin identity.
 
 ## Remaining before whole-product acceptance
 
-Complete the remaining source inventory and native workflows: durable
-cancellation-notice tracking and recovery, account
-workflows and configuration
-where the owning product supports it.
+Complete the remaining source inventory and native workflows: explicit CEO-reviewed
+failed/unknown cancellation-notice retries, account workflows and configuration
+where the owning product supports it. Initial durable notice tracking, never-started
+recovery and original proof checks are implemented; this does not claim whole-product acceptance.
 Add explicit environment selection, environment-scoped grants and
 environment-bound approvals before claiming both environments are manageable.
 Current connection registration targets production only.

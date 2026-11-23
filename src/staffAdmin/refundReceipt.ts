@@ -66,6 +66,11 @@ export async function finishCorporateRefund(
     intent.currency !== CURRENCY
   )
     throw fail("The original reviewed refund terms changed");
+  const notice = await client.ticketCancellationNotice.findUnique({
+    where: { ticketId: ticket.id },
+  });
+  if (!notice)
+    throw fail("The finalized cancellation has no saved notice intent");
   const data = {
     ticketId: ticket.id,
     uniqueCode: ticket.uniqueCode,
@@ -76,6 +81,7 @@ export async function finishCorporateRefund(
     refundAttemptId: ticket.refundAttemptId ?? null,
     gatewayRequestId: ticket.refundGatewayRequestId ?? null,
     refundRef: ticket.refundRef ?? null,
+    cancellationNoticeId: notice.id,
     note: "This receipt proves the ticket/refund outcome. It does not claim holder-notification delivery.",
   };
   if (status === "REFUNDED")

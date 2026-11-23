@@ -9,6 +9,8 @@ import { sumTicketRevenue } from './settlement.service';
 import { lockPurchaseIdentity } from '../utils/purchaseIdentity';
 import { sendDeliveryMessage } from './delivery-message.service';
 import { formatPhone } from '../utils/phone';
+import { enqueueCancellationNotice } from './cancellation-notice-state.service';
+import { dispatchCancellationNoticeForTicket } from './cancellation-notice.service';
 import { PURCHASE_INCLUDE } from './ticket-includes';
 import { deliveryDispatchState, deliveryDispatchPolicy, deliveryAttemptOutcome, lockOrderDelivery } from './delivery-state.service';
 import { 
@@ -584,7 +586,7 @@ const deliverOrderToBuyer = async (tickets: any[], dispatchAttemptId: string): P
   // Primary channel: WhatsApp via YeboLink.
   if (phoneNumber) {
     try {
-      await sendDeliveryMessage(first.deliveryOrderId, dispatchAttemptId, 'whatsapp', formatPhone(phoneNumber),
+      await sendDeliveryMessage({ deliveryOrderId: first.deliveryOrderId }, dispatchAttemptId, 'whatsapp', formatPhone(phoneNumber),
         metadata => sendTextMessage(phoneNumber, text, metadata));
       return { channel: 'whatsapp', status: 'sent' };
     } catch (error) {
@@ -602,7 +604,7 @@ const deliverOrderToBuyer = async (tickets: any[], dispatchAttemptId: string): P
   if (email) {
     try {
       const html = await buildOrderEmailHtml(tickets);
-      await sendDeliveryMessage(first.deliveryOrderId, dispatchAttemptId, 'email', email, metadata => sendEmailMessage(
+      await sendDeliveryMessage({ deliveryOrderId: first.deliveryOrderId }, dispatchAttemptId, 'email', email, metadata => sendEmailMessage(
         email,
         tickets.length > 1
           ? `Your ${tickets.length} tickets for ${first.event?.title ?? 'your event'}`
@@ -2163,42 +2165,17 @@ export interface TicketRefundOutcome {
   result: 'refunded' | 'cancelled_free' | 'already_handled' | 'refund_failed' | 'pending';
   amountRefunded?: number;
   refundRef?: string | null;
-  /** Whether the holder was notified (a notify failure does NOT undo a refund). */
+  /** Whether the notice command was accepted; this does not prove holder receipt. A notification failure cannot undo a refund. */
   notified: boolean;
   notifyError?: string;
   error?: string;
 }
 
-/** Compose the cancellation/refund notice sent to the ticket holder. */
-const buildCancellationMessage = (ticket: any, refunded: boolean, amount?: number): string => {
-  const eventTitle = ticket.event?.title ?? 'your event';
-  const lines = [`❌ Your ticket for ${eventTitle} has been cancelled.`];
-  if (refunded) {
-    const amt = typeof amount === 'number' ? ` of ${amount.toFixed(2)} ${TICKET_CURRENCY}` : '';
-    lines.push(`💸 A refund${amt} has been issued to your original payment method.`);
-  }
-  lines.push(`🔑 Ticket code: ${ticket.uniqueCode}`);
-  return lines.join('\n');
-};
-
-/**
- * Notify the holder that their ticket was cancelled/refunded. Best-effort:
- * returns the failure rather than throwing, because by this point the money has
- * ALREADY been returned and we must not roll a successful refund back over a
- * messaging hiccup — but the failure is surfaced (not swallowed) in the outcome.
- */
-const notifyHolderOfCancellation = async (
-  ticket: any,
-  refunded: boolean,
-  amount?: number
-): Promise<{ notified: boolean; notifyError?: string }> => {
-  const phone = ticket.user?.phoneNumber;
-  if (!phone) {
-    return { notified: false, notifyError: 'Holder has no phone number on file' };
-  }
+/** Money is already final; expose the independently durable notification outcome. */
+const notifyHolderOfCancellation = async (ticket: any) => {
   try {
-    await sendTextMessage(phone, buildCancellationMessage(ticket, refunded, amount));
-    return { notified: true };
+    const notice = await dispatchCancellationNoticeForTicket(ticket.id);
+    return { notified: notice.status === 'sent', notifyError: notice.error ?? undefined };
   } catch (error) {
     console.error('Failed to notify holder of cancellation:', ticket.id, error);
     return { notified: false, notifyError: errorMessage(error) };
@@ -2268,7 +2245,8 @@ const refundAndCancelTicket = async (
           refundRequestReason: null,
         },
       });
-    if (operation) {
+      if (claimed.count) await enqueueCancellationNotice(client, ticket.id);
+      if (operation) {
         const saved = await client.ticket.findUniqueOrThrow({ where: { id: ticket.id } });
         await finishCorporateRefund(client, operation.id, saved, 'CANCELLED_FREE');
       }
@@ -2276,11 +2254,11 @@ const refundAndCancelTicket = async (
     };
     const claimed = operation
       ? await prepareCorporateRefund(operation, ticket, cancel)
-      : await cancel(prisma);
+      : await prisma.$transaction(cancel);
     if (claimed.count === 0) {
       return { ...base, result: 'already_handled', notified: false };
     }
-    const notify = await notifyHolderOfCancellation(ticket, false);
+    const notify = await notifyHolderOfCancellation(ticket);
     return {
       ...base,
       result: 'cancelled_free',
@@ -2390,7 +2368,7 @@ const refundAndCancelTicket = async (
     return failed(`${errorMessage(error)}${dispatched && !rejected ? '; charge blocked pending reconciliation' : ''}`);
   }
 
-  const notify = await notifyHolderOfCancellation(ticket, true, refund.amount);
+  const notify = await notifyHolderOfCancellation(ticket);
   return {
     ...base,
     result: 'refunded',
@@ -2754,6 +2732,7 @@ const finalizeRefundAttempt = async (
         refundRequestReason: null,
       },
     });
+    await enqueueCancellationNotice(tx, lock.ticketId);
     if (lock.corporateOperationId) {
       await finishCorporateRefund(tx, lock.corporateOperationId, finalized, 'REFUNDED');
     }

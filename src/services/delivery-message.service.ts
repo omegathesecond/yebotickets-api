@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import prisma from "../config/prisma";
 import { ApiError } from "../middleware/error.middleware";
+import { lockCancellationNotice } from "./cancellation-notice-state.service";
 import { lockOrderDelivery } from "./delivery-state.service";
 import {
   YeboLinkClient,
@@ -11,7 +12,9 @@ import {
 
 /** Separate durable send history; no invented receipt or automatic resend after lost acknowledgement. */
 export async function sendDeliveryMessage(
-  deliveryOrderId: string,
+  owner:
+    | { deliveryOrderId: string; cancellationNoticeId?: never }
+    | { cancellationNoticeId: string; deliveryOrderId?: never },
   dispatchAttemptId: string,
   channel: "whatsapp" | "email",
   recipient: string,
@@ -21,14 +24,16 @@ export async function sendDeliveryMessage(
   // Intentionally use the owning client outside the Event/Ticket transaction:
   // the original intent survives rollback after the gateway accepted a send.
   await prisma.ticketDeliveryMessage.create({
-    data: { id, deliveryOrderId, dispatchAttemptId, channel, recipient },
+    data: { id, ...owner, dispatchAttemptId, channel, recipient },
   });
   let accepted: YeboLinkMessageResult;
   try {
     accepted = await send({
       product: "yebotickets",
       ticketDeliveryMessageId: id,
-      ticketDeliveryOrderId: deliveryOrderId,
+      ...(owner.deliveryOrderId
+        ? { ticketDeliveryOrderId: owner.deliveryOrderId }
+        : { ticketCancellationNoticeId: owner.cancellationNoticeId! }),
       dispatchAttemptId,
     });
     assertMessageAcceptance(accepted);
@@ -76,6 +81,7 @@ const progress: Record<string, number> = {
 export const deliveryMessageView = (row: any) => ({
   id: row.id,
   deliveryOrderId: row.deliveryOrderId,
+  cancellationNoticeId: row.cancellationNoticeId,
   dispatchAttemptId: row.dispatchAttemptId,
   channel: row.channel,
   state: row.state,
@@ -112,7 +118,12 @@ export async function checkDeliveryMessage(id: string) {
     receipt.recipient !== original.recipient ||
     receipt.metadata.product !== "yebotickets" ||
     receipt.metadata.ticketDeliveryMessageId !== id ||
-    receipt.metadata.ticketDeliveryOrderId !== original.deliveryOrderId ||
+    (original.deliveryOrderId
+      ? receipt.metadata.ticketDeliveryOrderId !== original.deliveryOrderId ||
+        receipt.metadata.ticketCancellationNoticeId !== undefined
+      : receipt.metadata.ticketCancellationNoticeId !==
+          original.cancellationNoticeId ||
+        receipt.metadata.ticketDeliveryOrderId !== undefined) ||
     receipt.metadata.dispatchAttemptId !== original.dispatchAttemptId
   )
     throw new ApiError(
@@ -127,7 +138,12 @@ export async function checkDeliveryMessage(id: string) {
   };
   // A stale provider read must never erase a stronger confirmed outcome.
   return prisma.$transaction(async (tx) => {
-    await lockOrderDelivery(tx, original.deliveryOrderId);
+    if (original.deliveryOrderId)
+      await lockOrderDelivery(tx, original.deliveryOrderId);
+    else if (original.cancellationNoticeId)
+      await lockCancellationNotice(tx, original.cancellationNoticeId);
+    else
+      throw new ApiError("Original message has no owning work identity", 409);
     await tx.$queryRaw`SELECT id FROM "TicketDeliveryMessage" WHERE id=${id} FOR UPDATE`;
     const current = await tx.ticketDeliveryMessage.findUniqueOrThrow({
       where: { id },
@@ -179,22 +195,39 @@ export async function checkDeliveryMessage(id: string) {
         "read",
         "dispatching",
       ].includes(receipt.status)
-    )
-      await tx.ticketOrderDelivery.updateMany({
-        where: {
-          id: current.deliveryOrderId,
-          attemptId: current.dispatchAttemptId,
-          status: { in: ["unknown", "sending"] },
-        },
-        data: {
-          status: "sent",
-          channel: current.channel,
-          error: null,
-          ...(timestamps.gatewaySentAt
-            ? { sentAt: timestamps.gatewaySentAt }
-            : {}),
-        },
-      });
+    ) {
+      if (current.deliveryOrderId)
+        await tx.ticketOrderDelivery.updateMany({
+          where: {
+            id: current.deliveryOrderId,
+            attemptId: current.dispatchAttemptId,
+            status: { in: ["unknown", "sending"] },
+          },
+          data: {
+            status: "sent",
+            channel: current.channel,
+            error: null,
+            ...(timestamps.gatewaySentAt
+              ? { sentAt: timestamps.gatewaySentAt }
+              : {}),
+          },
+        });
+      else if (current.cancellationNoticeId)
+        await tx.ticketCancellationNotice.updateMany({
+          where: {
+            id: current.cancellationNoticeId,
+            attemptId: current.dispatchAttemptId,
+            status: { in: ["unknown", "sending"] },
+          },
+          data: {
+            status: "sent",
+            error: null,
+            ...(timestamps.gatewaySentAt
+              ? { sentAt: timestamps.gatewaySentAt }
+              : {}),
+          },
+        });
+    }
     return deliveryMessageView(row);
   });
 }
